@@ -5,10 +5,22 @@ pub enum Key {
     Character(u8),
     Enter,
     Backspace,
+    /// Переключена раскладка (Right Ctrl).
+    LayoutChanged,
     None,
 }
 
+/// Активная раскладка клавиатуры.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    English,
+    Russian,
+}
+
 static mut SHIFT_PRESSED: bool = false;
+static mut LAYOUT: Layout = Layout::English;
+static mut EXTENDED: bool = false;
+
 
 fn inb(port: u16) -> u8 {
     let value: u8;
@@ -87,6 +99,101 @@ fn keyboard_char(sc: u8, shift: bool) -> Option<u8> {
     Some(ch)
 }
 
+/// Активная раскладка.
+pub fn layout() -> Layout {
+    unsafe { LAYOUT }
+}
+
+pub fn is_russian() -> bool {
+    layout() == Layout::Russian
+}
+
+fn toggle_layout() {
+    unsafe {
+        LAYOUT = match LAYOUT {
+            Layout::English => Layout::Russian,
+            Layout::Russian => Layout::English,
+        };
+    }
+}
+
+/// Переводит строчную букву CP866 в заглавную.
+fn russian_upper(code: u8) -> u8 {
+    match code {
+        0xA0..=0xAF => code - 0x20, // а..п -> А..П
+        0xE0..=0xEF => code - 0x50, // р..я -> Р..Я
+        0xF1 => 0xF0,               // ё -> Ё
+        _ => code,
+    }
+}
+
+/// Символ для русской раскладки (ЙЦУКЕН), коды CP866.
+fn russian_char(sc: u8, shift: bool) -> Option<u8> {
+    // Строчные буквы, при Shift заменяются заглавными.
+    let letter = match sc {
+        0x10 => 0xA9, // й
+        0x11 => 0xE6, // ц
+        0x12 => 0xE3, // у
+        0x13 => 0xAA, // к
+        0x14 => 0xA5, // е
+        0x15 => 0xAD, // н
+        0x16 => 0xA3, // г
+        0x17 => 0xE8, // ш
+        0x18 => 0xE9, // щ
+        0x19 => 0xA7, // з
+        0x1A => 0xE5, // х
+        0x1B => 0xEA, // ъ
+        0x1E => 0xE4, // ф
+        0x1F => 0xEB, // ы
+        0x20 => 0xA2, // в
+        0x21 => 0xA0, // а
+        0x22 => 0xAF, // п
+        0x23 => 0xE0, // р
+        0x24 => 0xAE, // о
+        0x25 => 0xAB, // л
+        0x26 => 0xA4, // д
+        0x27 => 0xA6, // ж
+        0x28 => 0xED, // э
+        0x29 => 0xF1, // ё
+        0x2C => 0xEF, // я
+        0x2D => 0xE7, // ч
+        0x2E => 0xE1, // с
+        0x2F => 0xAC, // м
+        0x30 => 0xA8, // и
+        0x31 => 0xE2, // т
+        0x32 => 0xEC, // ь
+        0x33 => 0xA1, // б
+        0x34 => 0xEE, // ю
+        _ => 0,
+    };
+
+    if letter != 0 {
+        return Some(if shift { russian_upper(letter) } else { letter });
+    }
+
+    // Цифры и знаки препинания.
+    let ch = match sc {
+        0x02 => if shift { b'!' } else { b'1' },
+        0x03 => if shift { b'"' } else { b'2' },
+        0x04 => if shift { 0xFC } else { b'3' }, // Shift+3 — №
+        0x05 => if shift { b';' } else { b'4' },
+        0x06 => if shift { b'%' } else { b'5' },
+        0x07 => if shift { b':' } else { b'6' },
+        0x08 => if shift { b'?' } else { b'7' },
+        0x09 => if shift { b'*' } else { b'8' },
+        0x0A => if shift { b'(' } else { b'9' },
+        0x0B => if shift { b')' } else { b'0' },
+        0x0C => if shift { b'_' } else { b'-' },
+        0x0D => if shift { b'+' } else { b'=' },
+        0x2B => if shift { b'|' } else { b'\\' },
+        0x35 => if shift { b',' } else { b'.' },
+        _ => return None,
+    };
+
+    Some(ch)
+}
+
+
 pub fn read_key() -> Key {
     if inb(0x64) & 1 == 0 {
         return Key::None;
@@ -95,6 +202,24 @@ pub fn read_key() -> Key {
     let sc = inb(0x60);
 
     unsafe {
+        // Расширенные клавиши приходят с префиксом 0xE0.
+        if sc == 0xE0 {
+            EXTENDED = true;
+            return Key::None;
+        }
+
+        if EXTENDED {
+            EXTENDED = false;
+
+            // Правый Ctrl переключает EN/RU.
+            if sc == 0x1D {
+                toggle_layout();
+                return Key::LayoutChanged;
+            }
+
+            return Key::None;
+        }
+
         match sc {
             0x2A | 0x36 => {
                 SHIFT_PRESSED = true;
@@ -120,7 +245,14 @@ pub fn read_key() -> Key {
             return Key::Backspace;
         }
 
-        match keyboard_char(sc, SHIFT_PRESSED) {
+        let shift = SHIFT_PRESSED;
+
+        let ch = match LAYOUT {
+            Layout::English => keyboard_char(sc, shift),
+            Layout::Russian => russian_char(sc, shift),
+        };
+
+        match ch {
             Some(ch) => Key::Character(ch),
             None => Key::None,
         }

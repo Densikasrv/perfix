@@ -14,6 +14,7 @@ mod idt;
 mod paging;
 mod ata;
 mod exfat;
+mod font_cp866;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memset(
@@ -82,7 +83,12 @@ idt::init();
 paging::init();
 }
 
+// Стандартный шрифт VGA не содержит кириллицы, поэтому догружаем
+// глифы CP866 в знакогенератор до первого вывода текста.
+vga::load_glyphs(&font_cp866::GLYPHS);
+
 shell::show_screen(None);
+vga::print_status(keyboard::is_russian());
 
 let mut input = [0u8; 64];
 let mut len = 0usize;
@@ -108,6 +114,10 @@ keyboard::Key::Enter => {
     }
 }
 
+
+        keyboard::Key::LayoutChanged => {
+            vga::print_status(keyboard::is_russian());
+        }
 
         keyboard::Key::Backspace => {
             if len > 0 {

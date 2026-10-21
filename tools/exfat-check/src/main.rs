@@ -6,9 +6,12 @@
 #[path = "../../../kernel/src/exfat/fs.rs"]
 mod fs;
 
+#[path = "../../../kernel/src/font_cp866.rs"]
+mod font;
+
 use fs::{
-    mount, read_file, resolve, BlockError, BlockReader, DirCursor, FsError, Volume,
-    SECTOR_SIZE,
+    fold_case, mount, read_file, resolve, utf16_to_cp866, BlockError, BlockReader,
+    DirCursor, FsError, Volume, SECTOR_SIZE,
 };
 
 const SEC: usize = SECTOR_SIZE;
@@ -165,7 +168,11 @@ impl Image {
         }
 
         // Подкаталог с непрерывным размещением кластеров.
-        write_set(&mut buffer, offset, 0x10, b"SUBDIR", 3, 0, true);
+        offset = write_set(&mut buffer, offset, 0x10, b"SUBDIR", 3, 0, true);
+
+        // Файл с кириллическим именем: в каталоге имя хранится в UTF-16.
+        let cyrillic: Vec<u16> = "привет.txt".encode_utf16().collect();
+        write_set_wide(&mut buffer, offset, 0x20, &cyrillic, 7, 3, true);
 
         self.write_cluster(self.root_cluster, &buffer);
     }
@@ -196,6 +203,8 @@ impl Image {
         self.write_cluster(4, &pattern[..1024]);
         self.write_cluster(5, &pattern[1024..]);
         self.write_cluster(6, b"hello world\n");
+        // Содержимое привет.txt в CP866: "да\n".
+        self.write_cluster(7, &[0xA4, 0xA0, b'\n']);
     }
 
     fn write_checksum_sector(&mut self) {
@@ -240,6 +249,23 @@ fn write_set(
     offset
 }
 
+fn write_set_wide(
+    buffer: &mut [u8],
+    mut offset: usize,
+    attributes: u16,
+    units: &[u16],
+    first_cluster: u32,
+    data_length: u64,
+    contiguous: bool,
+) -> usize {
+    for entry in build_set_wide(attributes, units, first_cluster, data_length, contiguous) {
+        buffer[offset..offset + 32].copy_from_slice(&entry);
+        offset += 32;
+    }
+
+    offset
+}
+
 /// Собирает набор записей 0x85 + 0xC0 + 0xC1 с корректным SetChecksum.
 fn build_set(
     attributes: u16,
@@ -249,6 +275,17 @@ fn build_set(
     contiguous: bool,
 ) -> Vec<[u8; 32]> {
     let units: Vec<u16> = name.iter().map(|&byte| byte as u16).collect();
+    build_set_wide(attributes, &units, first_cluster, data_length, contiguous)
+}
+
+/// То же, но имя задано символами UTF-16 (для кириллицы).
+fn build_set_wide(
+    attributes: u16,
+    units: &[u16],
+    first_cluster: u32,
+    data_length: u64,
+    contiguous: bool,
+) -> Vec<[u8; 32]> {
     let name_entries = units.len().div_ceil(15);
     let mut entries: Vec<[u8; 32]> = Vec::new();
 
@@ -396,10 +433,81 @@ fn lists_root_and_skips_broken_entry_sets() {
         names.push((entry.name().to_vec(), entry.is_directory()));
     }
 
-    assert_eq!(names.len(), 2, "broken.txt должен быть отброшен: {names:?}");
+    assert_eq!(names.len(), 3, "broken.txt должен быть отброшен: {names:?}");
     assert!(names.contains(&(b"readme.txt".to_vec(), false)));
     assert!(names.contains(&(b"SUBDIR".to_vec(), true)));
+    assert!(names.contains(&(b"\xAF\xE0\xA8\xA2\xA5\xE2.txt".to_vec(), false)));
     assert!(!names.iter().any(|(name, _)| name == b"broken.txt"));
+}
+
+#[test]
+fn resolves_cyrillic_names_in_cp866() {
+    let (disk, volume) = mounted();
+
+    // "привет.txt" в CP866.
+    let path = b"/\xAF\xE0\xA8\xA2\xA5\xE2.txt";
+    let entry = resolve(&disk, &volume, path).expect("cp866 path");
+
+    assert_eq!(entry.name(), b"\xAF\xE0\xA8\xA2\xA5\xE2.txt");
+    assert_eq!(entry.data_length, 3);
+    assert_eq!(collect_file(&disk, &volume, path), b"\xA4\xA0\n");
+
+    // Регистр кириллицы не важен: "ПРИВЕТ.txt" в CP866.
+    let upper = resolve(&disk, &volume, b"/\x8F\x90\x88\x82\x85\x92.txt")
+        .expect("uppercase cyrillic path");
+
+    assert_eq!(upper.name(), b"\xAF\xE0\xA8\xA2\xA5\xE2.txt");
+}
+
+#[test]
+fn maps_utf16_to_cp866_for_russian() {
+    assert_eq!(utf16_to_cp866(0x0410), Some(0x80)); // А
+    assert_eq!(utf16_to_cp866(0x044F), Some(0xEF)); // я
+    assert_eq!(utf16_to_cp866(0x0401), Some(0xF0)); // Ё
+    assert_eq!(utf16_to_cp866(0x0451), Some(0xF1)); // ё
+    assert_eq!(utf16_to_cp866(0x2116), Some(0xFC)); // №
+    assert_eq!(utf16_to_cp866(b'A' as u16), Some(b'A'));
+    assert_eq!(utf16_to_cp866(0x20AC), None);
+}
+
+#[test]
+fn folds_case_for_ascii_and_cyrillic() {
+    assert_eq!(fold_case(b'Q'), b'q');
+    assert_eq!(fold_case(0x80), 0xA0); // А -> а
+    assert_eq!(fold_case(0x9F), 0xEF); // Я -> я
+    assert_eq!(fold_case(0xF0), 0xF1); // Ё -> ё
+    assert_eq!(fold_case(b'.'), b'.');
+}
+
+#[test]
+fn font_table_covers_cp866_cyrillic() {
+    let glyphs = &font::GLYPHS;
+
+    assert_eq!(font::GLYPH_HEIGHT, 16);
+    assert_eq!(glyphs.len(), 67);
+
+    for code in 0x80..=0xAFu8 {
+        assert!(
+            glyphs.iter().any(|&(glyph_code, _)| glyph_code == code),
+            "нет глифа для CP866 {code:#04X}"
+        );
+    }
+
+    for code in 0xE0..=0xF1u8 {
+        assert!(
+            glyphs.iter().any(|&(glyph_code, _)| glyph_code == code),
+            "нет глифа для CP866 {code:#04X}"
+        );
+    }
+
+    assert!(glyphs.iter().any(|&(glyph_code, _)| glyph_code == 0xFC));
+
+    for &(code, bitmap) in glyphs {
+        assert!(
+            bitmap.iter().any(|&row| row != 0),
+            "пустой глиф для CP866 {code:#04X}"
+        );
+    }
 }
 
 #[test]

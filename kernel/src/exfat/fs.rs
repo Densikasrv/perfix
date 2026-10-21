@@ -124,6 +124,36 @@ pub fn is_exfat_boot(sector: &[u8; SECTOR_SIZE]) -> bool {
     &sector[3..11] == b"EXFAT   " && read_u16(sector, 510) == 0xAA55
 }
 
+/// Переводит символ UTF-16 в код CP866 для вывода в VGA text mode.
+///
+/// Поддерживаются ASCII, русские буквы А-я, Ё/ё и знак номера.
+/// Остальные символы вернут `None` — вызывающий код покажет `?`.
+pub fn utf16_to_cp866(code: u16) -> Option<u8> {
+    match code {
+        0x0020..=0x007E => Some(code as u8),
+        0x0410..=0x041F => Some(0x80 + (code - 0x0410) as u8), // А..П
+        0x0420..=0x042F => Some(0x90 + (code - 0x0420) as u8), // Р..Я
+        0x0430..=0x043F => Some(0xA0 + (code - 0x0430) as u8), // а..п
+        0x0440..=0x044F => Some(0xE0 + (code - 0x0440) as u8), // р..я
+        0x0401 => Some(0xF0),                                  // Ё
+        0x0451 => Some(0xF1),                                  // ё
+        0x2116 => Some(0xFC),                                  // №
+        _ => None,
+    }
+}
+
+/// Приводит байт CP866/ASCII к нижнему регистру для сравнения имён.
+pub fn fold_case(byte: u8) -> u8 {
+    match byte {
+        b'A'..=b'Z' => byte | 0x20,
+        0x80..=0x8F => byte + 0x20, // А..П -> а..п
+        0x90..=0x9F => byte + 0x50, // Р..Я -> р..я
+        0xF0 => 0xF1,               // Ё -> ё
+        _ => byte,
+    }
+}
+
+
 /// Смонтированные параметры тома exFAT.
 #[derive(Debug, Clone, Copy)]
 pub struct Volume {
@@ -486,16 +516,14 @@ impl Entry {
         }
     }
 
-    /// Сравнение имени без учёта регистра ASCII (как это делает Windows).
-    pub fn name_eq_ignore_ascii_case(&self, other: &[u8]) -> bool {
+    /// Сравнение имени без учёта регистра ASCII и кириллицы CP866.
+    pub fn name_eq_ignore_case(&self, other: &[u8]) -> bool {
         if self.name_len != other.len() {
             return false;
         }
 
         for index in 0..self.name_len {
-            if self.name[index].to_ascii_lowercase()
-                != other[index].to_ascii_lowercase()
-            {
+            if fold_case(self.name[index]) != fold_case(other[index]) {
                 return false;
             }
         }
@@ -688,13 +716,8 @@ impl<'a> DirCursor<'a> {
 
                             let code = read_u16(&secondary, 2 + index * 2);
 
-                            // VGA text mode: печатаем только ASCII.
                             entry.name[entry.name_len] =
-                                if (0x20..=0x7E).contains(&code) {
-                                    code as u8
-                                } else {
-                                    b'?'
-                                };
+                                utf16_to_cp866(code).unwrap_or(b'?');
 
                             entry.name_len += 1;
                         }
@@ -753,7 +776,7 @@ pub fn resolve(
         let mut found = None;
 
         while let Some(entry) = cursor.next_entry()? {
-            if entry.name_eq_ignore_ascii_case(component) {
+            if entry.name_eq_ignore_case(component) {
                 found = Some(entry);
                 break;
             }
