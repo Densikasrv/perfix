@@ -68,27 +68,28 @@ build/ — каталог для сборочных артефактов.
 
 4. Сборка ядра
 
-Перед сборкой должны быть доступны объектные файлы загрузчика, используемые линковщиком:
+Все шаги сборки выполняет скрипт tools/build-iso.sh: он собирает объектные файлы загрузчика через NASM, собирает ядро nightly-компилятором с -Z build-std=core и создаёт ISO через grub-mkrescue.
 
-kernel/target/boot.o
+bash tools/build-iso.sh
 
-kernel/target/boot-gdt.o
+Готовый образ появится в build/perfix-min.iso. Скрипт сам подставляет абсолютные пути в RUSTFLAGS, поэтому каталог репозитория может быть любым, а запускать его можно из любой директории.
 
-kernel/target/boot-idt.o
+Ручная сборка
 
-Они должны быть созданы предусмотренным проектом способом из соответствующих файлов в boot/.
+Соберите объектные файлы загрузчика:
 
-Из корня репозитория выполните:
+mkdir -p kernel/target
+nasm -f elf32 boot/boot.asm -o kernel/target/boot.o
+nasm -f elf32 boot/gdt.asm -o kernel/target/boot-gdt.o
+nasm -f elf32 boot/idt.asm -o kernel/target/boot-idt.o
 
-set -lx RUSTFLAGS "-C link-arg=-T/home/dzianis/perfix/kernel/linker.ld -C link-arg=-m -C link-arg=elf_i386 -C link-arg=/home/dzianis/perfix/kernel/target/boot.o -C link-arg=/home/dzianis/perfix/kernel/target/boot-gdt.o -C link-arg=/home/dzianis/perfix/kernel/target/boot-idt.o"
+Затем задайте RUSTFLAGS и соберите ядро (пример для bash, из корня репозитория):
 
-cargo +nightly build \
-    --manifest-path kernel/Cargo.toml \
-    -Z build-std=core \
-    -Z json-target-spec \
-    --target kernel/i686-perfix.json
+export RUSTFLAGS="-C link-arg=-T$PWD/kernel/linker.ld -C link-arg=-m -C link-arg=elf_i386 -C link-arg=$PWD/kernel/target/boot.o -C link-arg=$PWD/kernel/target/boot-gdt.o -C link-arg=$PWD/kernel/target/boot-idt.o"
 
-Важно: путь /home/dzianis/perfix относится к исходной среде разработки автора. Если проект находится в другом каталоге, замените абсолютные пути в RUSTFLAGS на соответствующие пути вашей системы.
+cargo +nightly build --manifest-path kernel/Cargo.toml -Z build-std=core -Z json-target-spec --target kernel/i686-perfix.json
+
+Учтите: RUSTFLAGS содержит абсолютные пути, вычисленные через $PWD, поэтому команды нужно выполнять из корня репозитория. В fish многострочная вставка без обратного слэша ломается на отдельные команды — используйте одну строку или запускайте скрипт. В свежих nightly флаг -Z json-target-spec удалён; если cargo сообщает о неизвестном флаге, уберите его.
 
 При успешной сборке ELF-файл ядра появится по пути:
 
@@ -96,15 +97,12 @@ kernel/target/i686-perfix/debug/perfix
 
 5. Создание загрузочного ISO
 
-Подготовьте каталог ISO:
+Скрипт tools/build-iso.sh выполняет это автоматически. Вручную шаги выглядят так:
 
 mkdir -p build/iso/boot/grub
-
-Скопируйте скомпилированное ядро:
-
 cp kernel/target/i686-perfix/debug/perfix build/iso/boot/perfix.elf
 
-В каталоге build/iso/boot/grub/ должен находиться grub.cfg, содержащий конфигурацию загрузки ядра через Multiboot 1. Если файл отсутствует, создайте его со следующим содержимым:
+Файл build/iso/boot/grub/grub.cfg с конфигурацией загрузки через Multiboot 1:
 
 set timeout=0
 set default=0
@@ -114,16 +112,9 @@ menuentry "Perfix" {
     boot
 }
 
-Создайте ISO:
+Создание ISO:
 
-grub-mkrescue \
-    --modules="multiboot" \
-    --fonts="" \
-    --locales="" \
-    --themes="" \
-    -o build/perfix-min.iso \
-    -d /usr/lib/grub/i386-pc \
-    build/iso
+grub-mkrescue --modules="multiboot" --fonts="" --locales="" --themes="" -o build/perfix-min.iso -d /usr/lib/grub/i386-pc build/iso
 
 Готовый образ будет находиться в build/perfix-min.iso.
 
@@ -172,11 +163,35 @@ GDT и IDT.
 
 Чтение секторов ATA PIO.
 
-Чтение основной информации из загрузочного сектора exFAT.
+Драйвер exFAT (только чтение): монтирование тома, проверка контрольной суммы загрузочного региона, FAT-цепочки и NoFatChain, обход каталогов, чтение файлов.
 
-Экспериментальное чтение записей корневого каталога exFAT.
+Определение тома как на диске целиком, так и внутри раздела MBR.
 
-Реализация файловой системы находится в разработке. Поддержка полноценного чтения файлов, длинных цепочек кластеров и записи данных пока не должна считаться завершённой.
+Команды оболочки для работы с exFAT:
+
+mount — параметры смонтированного тома (геометрия, серийный номер, флаги, контрольная сумма);
+
+ls [путь] — список каталога, например ls / или ls SUBDIR;
+
+cat <файл> — вывод содержимого файла (до 13 строк, с переносом длинных строк);
+
+diskinfo — поля загрузочного сектора exFAT;
+
+rootdir — псевдоним ls /, оставлен для совместимости.
+
+Поддерживается только чтение. Запись данных, создание и удаление файлов, а также тома с размером сектора, отличным от 512 байт, не реализованы. Пути разделяются символом /, регистр ASCII не учитывается. Имена, содержащие не-ASCII символы, выводятся с символами ?.
+
+Проверка драйвера exFAT на хосте
+
+Драйвер файловой системы вынесен в kernel/src/exfat/fs.rs и не зависит от ATA и VGA: доступ к диску выполняется через трейт BlockReader. Благодаря этому его можно проверять обычными тестами на хосте, подставляя образ диска в памяти. Тесты лежат в tools/exfat-check и компилируют тот же файл драйвера, что и ядро.
+
+Запуск проверки:
+
+cargo test --manifest-path tools/exfat-check/Cargo.toml
+
+Тесты покрывают монтирование тома, определение раздела MBR, проверку контрольной суммы загрузочного региона, разбор наборов записей каталога, FAT-цепочки, режим NoFatChain, чтение файлов и обработку повреждённых структур.
+
+
 
 8. Ограничения
 

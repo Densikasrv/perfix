@@ -1,0 +1,11 @@
+[package]
+name = "exfat-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Хост-проверка драйвера exFAT из kernel/src/exfat/fs.rs.
+# Собирается только на хосте и не входит в сборку ядра.
+[[bin]]
+name = "exfat-check"
+path = "src/main.rs"

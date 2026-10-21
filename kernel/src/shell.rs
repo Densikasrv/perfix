@@ -1,3 +1,4 @@
+use crate::exfat;
 use crate::vga;
 use crate::version;
 
@@ -6,10 +7,11 @@ pub fn show_screen(message: Option<&[u8]>) {
 
     vga::print_at(0, 0, b"Welcome to Perfix Shell!");
     vga::print_at(
-    2,
-    0,
-    b"Commands: help, about, version, clear, divzero, pagefault, diskinfo",
-);
+        2,
+        0,
+        b"Commands: help, about, version, clear, divzero, pagefault,",
+    );
+    vga::print_at(3, 0, b"          diskinfo, mount, ls [path], cat <file>");
 
     if let Some(text) = message {
         vga::print_at(4, 0, text);
@@ -22,6 +24,56 @@ fn prompt(row: usize) {
     vga::print_at(row, 0, b"perfix> ");
 }
 
+/// Отделяет аргумент команды: `ls /SYSTEM` -> `/SYSTEM`.
+fn command_arg<'a>(input: &'a [u8], command: &[u8]) -> Option<&'a [u8]> {
+    let rest = input.strip_prefix(command)?;
+
+    if rest.is_empty() {
+        return Some(rest);
+    }
+
+    if rest[0] != b' ' && rest[0] != b'\t' {
+        return None;
+    }
+
+    Some(trim_ascii_space(rest))
+}
+
+fn trim_ascii_space(input: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut end = input.len();
+
+    while start < end && (input[start] == b' ' || input[start] == b'\t') {
+        start += 1;
+    }
+
+    while end > start && (input[end - 1] == b' ' || input[end - 1] == b'\t') {
+        end -= 1;
+    }
+
+    &input[start..end]
+}
+
+/// Сколько строк вывода резервировать под команду до её выполнения.
+fn command_lines(input: &[u8]) -> usize {
+    if input == b"help" {
+        11
+    } else if input == b"version" {
+        5
+    } else if input == b"diskinfo" {
+        9
+    } else if input == b"mount" {
+        14
+    } else if input == b"rootdir" {
+        16
+    } else if command_arg(input, b"ls").is_some() {
+        16
+    } else if command_arg(input, b"cat").is_some() {
+        exfat::CAT_LINES
+    } else {
+        1
+    }
+}
 
 pub fn execute(input: &[u8], row: &mut usize) {
     if input == b"clear" {
@@ -32,47 +84,34 @@ pub fn execute(input: &[u8], row: &mut usize) {
 
     if input == b"divzero" {
         crate::idt::test_divzero();
-        return;
     }
 
     if input == b"pagefault" {
         crate::paging::test_page_fault();
-        return;
     }
 
-    let lines = if input == b"help" {
-        8
-    } else if input == b"version" {
-        5
-    } else if input == b"diskinfo" {
-        9
-    } else if input == b"rootdir" {
-        6
-    } else {
-        1
-    };
+    let lines = command_lines(input);
 
     // Освобождаем место ДО вывода всей команды.
-    while *row + 1 + lines > 24 {
+    while *row + 1 + lines > 24 && *row > 0 {
         vga::scroll_screen();
         *row -= 1;
     }
 
     let output_row = *row + 1;
 
-    if input == b"diskinfo" {
-        crate::ata::test_disk(output_row);
-    } else if input == b"rootdir" {
-        crate::ata::test_root_directory(output_row);
-    } else if input == b"help" {
+    if input == b"help" {
         vga::print_at(output_row, 0, b"Available commands:");
-        vga::print_at(output_row + 1, 0, b"help    - show commands");
-        vga::print_at(output_row + 2, 0, b"about   - about Perfix");
-        vga::print_at(output_row + 3, 0, b"version - kernel information");
-        vga::print_at(output_row + 4, 0, b"clear   - clear the screen");
-        vga::print_at(output_row + 5, 0, b"divzero - test CPU exception");
+        vga::print_at(output_row + 1, 0, b"help      - show commands");
+        vga::print_at(output_row + 2, 0, b"about     - about Perfix");
+        vga::print_at(output_row + 3, 0, b"version   - kernel information");
+        vga::print_at(output_row + 4, 0, b"clear     - clear the screen");
+        vga::print_at(output_row + 5, 0, b"divzero   - test CPU exception");
         vga::print_at(output_row + 6, 0, b"pagefault - test page fault");
-        vga::print_at(output_row + 7, 0, b"diskinfo - read exFAT boot sector");
+        vga::print_at(output_row + 7, 0, b"diskinfo  - read exFAT boot sector");
+        vga::print_at(output_row + 8, 0, b"mount     - show exFAT volume info");
+        vga::print_at(output_row + 9, 0, b"ls [path] - list exFAT directory");
+        vga::print_at(output_row + 10, 0, b"cat <file>- print file contents");
     } else if input == b"about" {
         vga::print_at(
             output_row,
@@ -89,6 +128,16 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 3, 10, version::LANGUAGE);
         vga::print_at(output_row + 4, 0, b"Status: ");
         vga::print_at(output_row + 4, 8, version::STATUS);
+    } else if input == b"diskinfo" {
+        exfat::print_boot_sector(output_row);
+    } else if input == b"mount" {
+        exfat::print_volume_info(output_row);
+    } else if input == b"rootdir" || command_arg(input, b"ls").is_some() {
+        let root: &[u8] = b"/";
+        let path = command_arg(input, b"ls").unwrap_or(root);
+        exfat::shell_list(path, output_row);
+    } else if let Some(path) = command_arg(input, b"cat") {
+        exfat::shell_cat(path, output_row);
     } else if input.is_empty() {
         *row += 1;
         prompt(*row);
@@ -100,3 +149,4 @@ pub fn execute(input: &[u8], row: &mut usize) {
     *row = output_row + lines;
     prompt(*row);
 }
+

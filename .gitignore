@@ -1,3 +1,4 @@
 /target/
 /build/
 /kernel/target/
+/tools/exfat-check/target/

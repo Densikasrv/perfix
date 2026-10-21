@@ -50,6 +50,8 @@ fn keyboard_char(sc: u8, shift: bool) -> Option<u8> {
         0x17 => if shift { b'I' } else { b'i' },
         0x18 => if shift { b'O' } else { b'o' },
         0x19 => if shift { b'P' } else { b'p' },
+        0x1A => if shift { b'{' } else { b'[' },
+        0x1B => if shift { b'}' } else { b']' },
 
         0x1E => if shift { b'A' } else { b'a' },
         0x1F => if shift { b'S' } else { b's' },
@@ -61,6 +63,11 @@ fn keyboard_char(sc: u8, shift: bool) -> Option<u8> {
         0x25 => if shift { b'K' } else { b'k' },
         0x26 => if shift { b'L' } else { b'l' },
 
+        0x27 => if shift { b':' } else { b';' },
+        0x28 => if shift { b'"' } else { b'\'' },
+        0x29 => if shift { b'~' } else { b'`' },
+        0x2B => if shift { b'|' } else { b'\\' },
+
         0x2C => if shift { b'Z' } else { b'z' },
         0x2D => if shift { b'X' } else { b'x' },
         0x2E => if shift { b'C' } else { b'c' },
@@ -68,6 +75,10 @@ fn keyboard_char(sc: u8, shift: bool) -> Option<u8> {
         0x30 => if shift { b'B' } else { b'b' },
         0x31 => if shift { b'N' } else { b'n' },
         0x32 => if shift { b'M' } else { b'm' },
+
+        0x33 => if shift { b'<' } else { b',' },
+        0x34 => if shift { b'>' } else { b'.' },
+        0x35 => if shift { b'?' } else { b'/' },
 
         0x39 => b' ',
         _ => return None,
