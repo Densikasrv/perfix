@@ -12,6 +12,9 @@ mod font;
 #[path = "../../../kernel/src/keyboard.rs"]
 mod keyboard;
 
+#[path = "../../../kernel/src/utf8.rs"]
+mod utf8;
+
 use fs::{
     fold_case, mount, read_file, resolve, utf16_to_cp866, BlockError, BlockReader,
     DirCursor, FsError, Volume, SECTOR_SIZE,
@@ -557,6 +560,64 @@ fn english_layout_is_unchanged() {
     assert_eq!(keyboard::keyboard_char(0x35, false), Some(b'/'));
     assert_eq!(keyboard::keyboard_char(0x28, true), Some(b'"'));
     assert_eq!(keyboard::keyboard_char(0x0E, false), None);
+}
+
+#[test]
+fn decodes_utf8_text_to_cp866() {
+    let mut decoder = utf8::Decoder::new();
+    let mut output = Vec::new();
+
+    for &byte in "привет, Ёжик №5\n".as_bytes() {
+        let mut decoded = [0u8; 4];
+        let len = decoder.feed(byte, &mut decoded, utf16_to_cp866);
+        output.extend_from_slice(&decoded[..len]);
+    }
+
+    assert_eq!(
+        output,
+        b"\xAF\xE0\xA8\xA2\xA5\xE2, \xF0\xA6\xA8\xAA \xFC5\n".to_vec()
+    );
+}
+
+#[test]
+fn decodes_utf8_split_across_chunks() {
+    let mut decoder = utf8::Decoder::new();
+    let mut output = Vec::new();
+
+    // "я" = D1 8F; байты приходят по одному, как при чтении секторами.
+    for &byte in "я".as_bytes() {
+        let mut decoded = [0u8; 4];
+        let len = decoder.feed(byte, &mut decoded, utf16_to_cp866);
+        output.extend_from_slice(&decoded[..len]);
+    }
+
+    assert_eq!(output, b"\xEF".to_vec());
+}
+
+#[test]
+fn keeps_ascii_and_bare_cp866_bytes() {
+    let mut decoder = utf8::Decoder::new();
+    let mut output = Vec::new();
+
+    // 0xC2 — начало UTF-8, но следующий байт не продолжение,
+    // значит оба байта выводятся как есть (CP866/ASCII).
+    for &byte in &[b'O', b'K', 0xC2, b'X', 0xFF] {
+        let mut decoded = [0u8; 4];
+        let len = decoder.feed(byte, &mut decoded, utf16_to_cp866);
+        output.extend_from_slice(&decoded[..len]);
+    }
+
+    assert_eq!(output, vec![b'O', b'K', 0xC2, b'X', 0xFF]);
+}
+
+#[test]
+fn holds_incomplete_utf8_sequence() {
+    let mut decoder = utf8::Decoder::new();
+    let mut decoded = [0u8; 4];
+
+    assert_eq!(decoder.feed(0xD0, &mut decoded, utf16_to_cp866), 0);
+    assert_eq!(decoder.feed(0xBF, &mut decoded, utf16_to_cp866), 1);
+    assert_eq!(decoded[0], 0xAF);
 }
 
 #[test]

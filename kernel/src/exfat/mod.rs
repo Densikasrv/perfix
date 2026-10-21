@@ -385,47 +385,55 @@ pub fn shell_cat(path: &[u8], row: usize) -> usize {
     let mut col = 0usize;
     let mut empty = true;
     let mut truncated = false;
+    let mut decoder = crate::utf8::Decoder::new();
 
     let result = fs::read_file(&AtaDevice, &volume, &file, |chunk| {
         for &byte in chunk {
-            empty = false;
+            let mut decoded = [0u8; 4];
+            let decoded_len = decoder.feed(byte, &mut decoded, fs::utf16_to_cp866);
 
-            if byte == b'\r' {
-                continue;
-            }
+            for &code in &decoded[..decoded_len] {
+                empty = false;
 
-            if byte == b'\n' {
-                text_row += 1;
-                col = 0;
-
-                if text_row > last_row {
-                    truncated = true;
-                    return false;
+                if code == b'\r' {
+                    continue;
                 }
 
-                continue;
-            }
+                if code == b'\n' {
+                    text_row += 1;
+                    col = 0;
 
-            if col >= 80 {
-                text_row += 1;
-                col = 0;
+                    if text_row > last_row {
+                        truncated = true;
+                        return false;
+                    }
 
-                if text_row > last_row {
-                    truncated = true;
-                    return false;
+                    continue;
                 }
+
+                if col >= 80 {
+                    text_row += 1;
+                    col = 0;
+
+                    if text_row > last_row {
+                        truncated = true;
+                        return false;
+                    }
+                }
+
+                // Старшие байты — это CP866 (кириллица, псевдографика),
+                // поэтому отбрасываем только управляющие символы ASCII.
+                let display = if code == b'\t' {
+                    b' '
+                } else if code >= 0x20 && code != 0x7f {
+                    code
+                } else {
+                    b'.'
+                };
+
+                vga::print_at(text_row, col, &[display]);
+                col += 1;
             }
-
-            let display = if byte == b'\t' {
-                b' '
-            } else if (0x20..=0x7E).contains(&byte) {
-                byte
-            } else {
-                b'.'
-            };
-
-            vga::print_at(text_row, col, &[display]);
-            col += 1;
         }
 
         true
