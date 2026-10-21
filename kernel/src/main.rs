@@ -13,6 +13,7 @@ mod gdt;
 mod idt;
 mod paging;
 mod ata;
+mod exfat;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memset(

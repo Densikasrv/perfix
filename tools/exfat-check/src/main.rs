@@ -1,0 +1,520 @@
+//! Хост-проверка драйвера exFAT из ядра Perfix.
+//!
+//! Тесты работают с тем же файлом `kernel/src/exfat/fs.rs`, который
+//! компилируется в ядро: модуль подключается по относительному пути.
+
+#[path = "../../../kernel/src/exfat/fs.rs"]
+mod fs;
+
+use fs::{
+    mount, read_file, resolve, BlockError, BlockReader, DirCursor, FsError, Volume,
+    SECTOR_SIZE,
+};
+
+const SEC: usize = SECTOR_SIZE;
+const CLUSTER_SHIFT: u8 = 1;
+const SECTORS_PER_CLUSTER: u32 = 1 << CLUSTER_SHIFT;
+
+fn main() {}
+
+struct MemoryDisk {
+    data: Vec<u8>,
+}
+
+impl MemoryDisk {
+    fn new(data: Vec<u8>) -> MemoryDisk {
+        MemoryDisk { data }
+    }
+}
+
+impl BlockReader for MemoryDisk {
+    fn read_sector(&self, lba: u32, buffer: &mut [u8; SEC]) -> Result<(), BlockError> {
+        let start = lba as usize * SEC;
+        let end = start + SEC;
+
+        if end > self.data.len() {
+            return Err(BlockError::InvalidLba);
+        }
+
+        buffer.copy_from_slice(&self.data[start..end]);
+        Ok(())
+    }
+}
+
+/// Синтетический том exFAT: 8 кластеров по 2 сектора.
+///
+/// Раскладка кластеров:
+/// 2 — корневой каталог, 3 — подкаталог SUBDIR,
+/// 4 -> 5 — файл readme.txt (1200 байт через FAT-цепочку),
+/// 6 — файл hello.txt (12 байт, NoFatChain).
+struct Image {
+    fat_offset: u32,
+    fat_length: u32,
+    heap_offset: u32,
+    cluster_count: u32,
+    root_cluster: u32,
+    data: Vec<u8>,
+}
+
+impl Image {
+    fn new() -> Image {
+        let fat_offset = 24u32;
+        let fat_length = 1u32;
+        let heap_offset = 25u32;
+        let cluster_count = 8u32;
+        let volume_length = heap_offset as u64
+            + cluster_count as u64 * SECTORS_PER_CLUSTER as u64;
+
+        let mut image = Image {
+            fat_offset,
+            fat_length,
+            heap_offset,
+            cluster_count,
+            root_cluster: 2,
+            data: vec![0u8; volume_length as usize * SEC],
+        };
+
+        image.write_boot_region(volume_length);
+        image.write_fat();
+        image.write_root();
+        image.write_subdir();
+        image.write_file_data();
+        image.write_checksum_sector();
+        image
+    }
+
+    fn cluster_offset(&self, cluster: u32) -> usize {
+        (self.heap_offset + (cluster - 2) * SECTORS_PER_CLUSTER) as usize * SEC
+    }
+
+    fn write_cluster(&mut self, cluster: u32, bytes: &[u8]) {
+        let offset = self.cluster_offset(cluster);
+        self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn write_boot_region(&mut self, volume_length: u64) {
+        let mut boot = [0u8; SEC];
+        boot[0] = 0xEB;
+        boot[1] = 0x76;
+        boot[2] = 0x90;
+        boot[3..11].copy_from_slice(b"EXFAT   ");
+        boot[72..80].copy_from_slice(&volume_length.to_le_bytes());
+        boot[80..84].copy_from_slice(&self.fat_offset.to_le_bytes());
+        boot[84..88].copy_from_slice(&self.fat_length.to_le_bytes());
+        boot[88..92].copy_from_slice(&self.heap_offset.to_le_bytes());
+        boot[92..96].copy_from_slice(&self.cluster_count.to_le_bytes());
+        boot[96..100].copy_from_slice(&self.root_cluster.to_le_bytes());
+        boot[100..104].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        boot[104..106].copy_from_slice(&0x0100u16.to_le_bytes());
+        boot[108] = 9;
+        boot[109] = CLUSTER_SHIFT;
+        boot[110] = 1;
+        boot[111] = 0x80;
+        boot[112] = 25;
+        boot[510] = 0x55;
+        boot[511] = 0xAA;
+
+        self.data[..SEC].copy_from_slice(&boot);
+    }
+
+    fn write_fat(&mut self) {
+        let entries: [u32; 7] = [
+            0xFFFF_FFF8,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF,
+            5,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF,
+        ];
+
+        let offset = self.fat_offset as usize * SEC;
+
+        for (index, value) in entries.iter().enumerate() {
+            let at = offset + index * 4;
+            self.data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    fn write_root(&mut self) {
+        let mut buffer = vec![0u8; SECTORS_PER_CLUSTER as usize * SEC];
+        let mut offset = 0usize;
+
+        // Метка тома: служебная запись, драйвер обязан её пропускать.
+        let mut label = [0u8; 32];
+        label[0] = 0x83;
+        label[1] = 4;
+
+        for (index, unit) in "TEST".encode_utf16().enumerate() {
+            label[2 + index * 2..4 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+
+        buffer[offset..offset + 32].copy_from_slice(&label);
+        offset += 32;
+
+        // Файл из двух кластеров, связанных через FAT.
+        offset = write_set(&mut buffer, offset, 0x20, b"readme.txt", 4, 1200, false);
+
+        // Набор записей с испорченной контрольной суммой — игнорируется.
+        let mut broken = build_set(0x20, b"broken.txt", 2, 0, false);
+        broken[2][4] ^= 0x20;
+
+        for entry in &broken {
+            buffer[offset..offset + 32].copy_from_slice(entry);
+            offset += 32;
+        }
+
+        // Подкаталог с непрерывным размещением кластеров.
+        write_set(&mut buffer, offset, 0x10, b"SUBDIR", 3, 0, true);
+
+        self.write_cluster(self.root_cluster, &buffer);
+    }
+
+    fn write_subdir(&mut self) {
+        let mut buffer = vec![0u8; SECTORS_PER_CLUSTER as usize * SEC];
+        let mut offset = 0usize;
+
+        // 15 неактивных записей: набор записей hello.txt начнётся
+        // в последней записи сектора и продолжится в следующем секторе.
+        for _ in 0..15 {
+            let mut filler = [0u8; 32];
+            filler[0] = 0x05;
+            buffer[offset..offset + 32].copy_from_slice(&filler);
+            offset += 32;
+        }
+
+        write_set(&mut buffer, offset, 0x20, b"hello.txt", 6, 12, true);
+
+        self.write_cluster(3, &buffer);
+    }
+
+    fn write_file_data(&mut self) {
+        let pattern: Vec<u8> = (0..1200u32)
+            .map(|index| b'a' + (index % 26) as u8)
+            .collect();
+
+        self.write_cluster(4, &pattern[..1024]);
+        self.write_cluster(5, &pattern[1024..]);
+        self.write_cluster(6, b"hello world\n");
+    }
+
+    fn write_checksum_sector(&mut self) {
+        let mut checksum = 0u32;
+
+        for sector_index in 0..11usize {
+            for offset in 0..SEC {
+                if sector_index == 0 && (offset == 106 || offset == 107 || offset == 112) {
+                    continue;
+                }
+
+                let byte = self.data[sector_index * SEC + offset];
+                checksum = if checksum & 1 != 0 {
+                    (checksum >> 1) | 0x8000_0000
+                } else {
+                    checksum >> 1
+                };
+
+                checksum = checksum.wrapping_add(byte as u32);
+            }
+        }
+
+        let at = 11 * SEC;
+        self.data[at..at + 4].copy_from_slice(&checksum.to_le_bytes());
+    }
+}
+
+fn write_set(
+    buffer: &mut [u8],
+    mut offset: usize,
+    attributes: u16,
+    name: &[u8],
+    first_cluster: u32,
+    data_length: u64,
+    contiguous: bool,
+) -> usize {
+    for entry in build_set(attributes, name, first_cluster, data_length, contiguous) {
+        buffer[offset..offset + 32].copy_from_slice(&entry);
+        offset += 32;
+    }
+
+    offset
+}
+
+/// Собирает набор записей 0x85 + 0xC0 + 0xC1 с корректным SetChecksum.
+fn build_set(
+    attributes: u16,
+    name: &[u8],
+    first_cluster: u32,
+    data_length: u64,
+    contiguous: bool,
+) -> Vec<[u8; 32]> {
+    let units: Vec<u16> = name.iter().map(|&byte| byte as u16).collect();
+    let name_entries = units.len().div_ceil(15);
+    let mut entries: Vec<[u8; 32]> = Vec::new();
+
+    let mut primary = [0u8; 32];
+    primary[0] = 0x85;
+    primary[1] = (1 + name_entries) as u8;
+    primary[4..6].copy_from_slice(&attributes.to_le_bytes());
+    entries.push(primary);
+
+    let mut stream = [0u8; 32];
+    stream[0] = 0xC0;
+    stream[1] = if contiguous { 0x03 } else { 0x01 };
+    stream[3] = units.len() as u8;
+    stream[8..16].copy_from_slice(&data_length.to_le_bytes());
+    stream[20..24].copy_from_slice(&first_cluster.to_le_bytes());
+    stream[24..32].copy_from_slice(&data_length.to_le_bytes());
+    entries.push(stream);
+
+    for chunk in units.chunks(15) {
+        let mut entry = [0u8; 32];
+        entry[0] = 0xC1;
+        entry[1] = 0x01;
+
+        for (index, unit) in chunk.iter().enumerate() {
+            entry[2 + index * 2..4 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+
+        entries.push(entry);
+    }
+
+    let mut checksum = 0u16;
+
+    for (entry_index, entry) in entries.iter().enumerate() {
+        for (offset, &byte) in entry.iter().enumerate() {
+            if entry_index == 0 && (offset == 2 || offset == 3) {
+                continue;
+            }
+
+            checksum = ((checksum << 15) | (checksum >> 1)).wrapping_add(byte as u16);
+        }
+    }
+
+    entries[0][2..4].copy_from_slice(&checksum.to_le_bytes());
+    entries
+}
+
+fn mounted() -> (MemoryDisk, Volume) {
+    let image = Image::new();
+    let disk = MemoryDisk::new(image.data);
+    let volume = mount(&disk).expect("mount failed");
+    (disk, volume)
+}
+
+fn collect_file(disk: &MemoryDisk, volume: &Volume, path: &[u8]) -> Vec<u8> {
+    let entry = resolve(disk, volume, path).expect("file not found");
+    let mut data = Vec::new();
+
+    read_file(disk, volume, &entry, |chunk| {
+        data.extend_from_slice(chunk);
+        true
+    })
+    .expect("read failed");
+
+    data
+}
+
+#[test]
+fn mounts_and_validates_boot_region() {
+    let (_, volume) = mounted();
+
+    assert_eq!(volume.base_lba, 0);
+    assert_eq!(volume.sectors_per_cluster, 2);
+    assert_eq!(volume.cluster_count, 8);
+    assert_eq!(volume.root_cluster, 2);
+    assert_eq!(volume.cluster_bytes(), 1024);
+    assert_eq!(volume.serial, 0x1234_5678);
+    assert_eq!(volume.revision, 0x0100);
+    assert_eq!(volume.percent_in_use, 25);
+    assert!(volume.boot_checksum_ok);
+    assert!(!volume.is_dirty());
+}
+
+#[test]
+fn rejects_non_exfat_disk() {
+    let disk = MemoryDisk::new(vec![0u8; 64 * SEC]);
+    assert!(matches!(mount(&disk), Err(FsError::NotExfat)));
+}
+
+#[test]
+fn rejects_bad_geometry() {
+    // ������� ��������� ��������� �� FAT.
+    let mut image = Image::new();
+    image.data[88..92].copy_from_slice(&24u32.to_le_bytes());
+
+    let disk = MemoryDisk::new(image.data);
+    assert!(matches!(mount(&disk), Err(FsError::BadGeometry)));
+
+    // �������� ������� ��� ������� ���������.
+    let mut image = Image::new();
+    image.data[96..100].copy_from_slice(&100u32.to_le_bytes());
+
+    let disk = MemoryDisk::new(image.data);
+    assert!(matches!(mount(&disk), Err(FsError::BadGeometry)));
+}
+
+#[test]
+fn resolves_paths_case_insensitively() {
+    let (disk, volume) = mounted();
+
+    let root = resolve(&disk, &volume, b"/").expect("root");
+    assert!(root.is_directory());
+    assert_eq!(root.first_cluster, 2);
+
+    let entry = resolve(&disk, &volume, b"/README.TXT").expect("readme");
+    assert_eq!(entry.name(), b"readme.txt");
+    assert_eq!(entry.data_length, 1200);
+    assert_eq!(entry.first_cluster, 4);
+    assert!(!entry.contiguous);
+    assert!(!entry.is_directory());
+
+    let subdir = resolve(&disk, &volume, b"subdir").expect("subdir");
+    assert!(subdir.is_directory());
+    assert_eq!(subdir.first_cluster, 3);
+    assert!(subdir.contiguous);
+
+    assert!(matches!(
+        resolve(&disk, &volume, b"/missing.txt"),
+        Err(FsError::PathNotFound)
+    ));
+    assert!(matches!(
+        resolve(&disk, &volume, b"/readme.txt/child"),
+        Err(FsError::NotADirectory)
+    ));
+}
+
+#[test]
+fn lists_root_and_skips_broken_entry_sets() {
+    let (disk, volume) = mounted();
+    let root = resolve(&disk, &volume, b"/").expect("root");
+
+    let mut cursor = DirCursor::new(&volume, &disk, root.first_cluster, root.contiguous);
+    let mut names: Vec<(Vec<u8>, bool)> = Vec::new();
+
+    while let Some(entry) = cursor.next_entry().expect("entry") {
+        names.push((entry.name().to_vec(), entry.is_directory()));
+    }
+
+    assert_eq!(names.len(), 2, "broken.txt должен быть отброшен: {names:?}");
+    assert!(names.contains(&(b"readme.txt".to_vec(), false)));
+    assert!(names.contains(&(b"SUBDIR".to_vec(), true)));
+    assert!(!names.iter().any(|(name, _)| name == b"broken.txt"));
+}
+
+#[test]
+fn reads_file_through_fat_chain() {
+    let (disk, volume) = mounted();
+    let data = collect_file(&disk, &volume, b"/readme.txt");
+
+    let expected: Vec<u8> = (0..1200u32)
+        .map(|index| b'a' + (index % 26) as u8)
+        .collect();
+
+    assert_eq!(data.len(), 1200);
+    assert_eq!(data, expected);
+}
+
+#[test]
+fn reads_contiguous_file_whose_entry_set_crosses_sector_boundary() {
+    let (disk, volume) = mounted();
+    let entry = resolve(&disk, &volume, b"/SubDir/HELLO.TXT").expect("hello");
+
+    assert!(entry.contiguous);
+    assert_eq!(entry.first_cluster, 6);
+    assert_eq!(
+        collect_file(&disk, &volume, b"/SubDir/hello.txt"),
+        b"hello world\n"
+    );
+}
+
+#[test]
+fn reads_file_with_valid_data_length() {
+    let (disk, volume) = mounted();
+    let mut entry = resolve(&disk, &volume, b"/readme.txt").expect("readme");
+
+    // Preallocation: записано только 600 байт из 1200 выделенных.
+    entry.valid_data_length = 600;
+
+    let mut data = Vec::new();
+    read_file(&disk, &volume, &entry, |chunk| {
+        data.extend_from_slice(chunk);
+        true
+    })
+    .expect("read");
+
+    assert_eq!(data.len(), 600);
+}
+
+#[test]
+fn finds_volume_inside_mbr_partition() {
+    let image = Image::new();
+    let start_lba = 2048usize;
+
+    let mut data = vec![0u8; start_lba * SEC];
+    data.extend_from_slice(&image.data);
+
+    data[446 + 4] = 0x07;
+    data[446 + 8..446 + 12].copy_from_slice(&(start_lba as u32).to_le_bytes());
+    data[510] = 0x55;
+    data[511] = 0xAA;
+
+    let disk = MemoryDisk::new(data);
+    let volume = mount(&disk).expect("mount");
+
+    assert_eq!(volume.base_lba as usize, start_lba);
+    assert_eq!(volume.fat_lba as usize, start_lba + 24);
+    assert!(volume.boot_checksum_ok);
+    assert_eq!(collect_file(&disk, &volume, b"/readme.txt").len(), 1200);
+}
+
+#[test]
+fn reports_corrupted_boot_checksum() {
+    let mut image = Image::new();
+
+    // PartitionOffset входит в контрольную сумму загрузочного региона.
+    image.data[64] ^= 0xFF;
+
+    let disk = MemoryDisk::new(image.data);
+    let volume = mount(&disk).expect("mount");
+
+    assert!(!volume.boot_checksum_ok);
+}
+
+#[test]
+fn detects_broken_cluster_chain() {
+    let mut image = Image::new();
+    let fat_offset = image.fat_offset as usize * SEC;
+    let entry_at = fat_offset + 4 * 4;
+    image.data[entry_at..entry_at + 4].copy_from_slice(&0u32.to_le_bytes());
+
+    let disk = MemoryDisk::new(image.data);
+    let volume = mount(&disk).expect("mount");
+    let entry = resolve(&disk, &volume, b"/readme.txt").expect("readme");
+
+    let mut data = Vec::new();
+    let result = read_file(&disk, &volume, &entry, |chunk| {
+        data.extend_from_slice(chunk);
+        true
+    });
+
+    assert_eq!(result, Err(FsError::FatOutOfRange));
+    assert_eq!(data.len(), 1024, "первый кластер должен быть прочитан");
+}
+
+#[test]
+fn stops_reading_when_sink_returns_false() {
+    let (disk, volume) = mounted();
+    let entry = resolve(&disk, &volume, b"/readme.txt").expect("readme");
+
+    let mut calls = 0usize;
+    read_file(&disk, &volume, &entry, |_| {
+        calls += 1;
+        false
+    })
+    .expect("read");
+
+    assert_eq!(calls, 1);
+}
+
+
