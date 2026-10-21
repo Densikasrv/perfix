@@ -49,17 +49,31 @@ export RUSTFLAGS="-C link-arg=-T$KERNEL_DIR/linker.ld \
 -C link-arg=$TARGET_DIR/boot-gdt.o \
 -C link-arg=$TARGET_DIR/boot-idt.o"
 
-# В новых nightly флаг -Z json-target-spec удалён: JSON-спека цели
-# принимается и без него.
-BUILD_FLAGS=(-Z build-std=core)
-if rustc +nightly -Z help 2>/dev/null | grep -q 'json-target-spec'; then
-    BUILD_FLAGS+=(-Z json-target-spec)
-fi
+# Набор флагов зависит от версии cargo: в одних nightly json-спека цели
+# требует -Z json-target-spec, в других флаг уже удалён. Поэтому сборка
+# сначала идёт без флага и повторяется с ним только при явной ошибке.
+build_kernel() {
+    cargo +nightly build \
+        --manifest-path "$KERNEL_DIR/Cargo.toml" \
+        "$@" \
+        --target "$TARGET_SPEC"
+}
 
-cargo +nightly build \
-    --manifest-path "$KERNEL_DIR/Cargo.toml" \
-    "${BUILD_FLAGS[@]}" \
-    --target "$TARGET_SPEC"
+set +e
+BUILD_OUTPUT="$(build_kernel -Z build-std=core 2>&1)"
+BUILD_STATUS=$?
+set -e
+
+printf '%s\n' "$BUILD_OUTPUT"
+
+if [ "$BUILD_STATUS" -ne 0 ]; then
+    if printf '%s' "$BUILD_OUTPUT" | grep -q 'json-target-spec'; then
+        echo "[2/4] Повторная сборка с -Z json-target-spec"
+        build_kernel -Z build-std=core -Z json-target-spec
+    else
+        exit "$BUILD_STATUS"
+    fi
+fi
 
 if [ ! -f "$ELF" ]; then
     echo "error: не найден $ELF" >&2
