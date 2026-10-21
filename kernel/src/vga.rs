@@ -113,12 +113,14 @@ pub fn load_glyphs(glyphs: &[(u8, [u8; 16])]) {
 
     let cell_height = crtc_cell_height();
 
-    // Временный режим: плоскость 2 открыта на запись целиком.
+    // Временный режим: плоскость 2 в окне A0000-BFFFF, odd/even выключен.
+    // GR6: биты 2-3 задают Memory Map Select, 00 — окно 128K с A0000.
     write_register(SEQUENCER_INDEX, SEQUENCER_DATA, 0x02, 0x04);
+    write_register(SEQUENCER_INDEX, SEQUENCER_DATA, 0x03, 0x00);
     write_register(SEQUENCER_INDEX, SEQUENCER_DATA, 0x04, 0x07);
     write_register(GRAPHICS_INDEX, GRAPHICS_DATA, 0x04, 0x02);
     write_register(GRAPHICS_INDEX, GRAPHICS_DATA, 0x05, 0x00);
-    write_register(GRAPHICS_INDEX, GRAPHICS_DATA, 0x06, 0x0c);
+    write_register(GRAPHICS_INDEX, GRAPHICS_DATA, 0x06, 0x00);
 
     for &(code, bitmap) in glyphs {
         let offset = code as usize * 32;
