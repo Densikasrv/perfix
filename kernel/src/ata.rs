@@ -61,6 +61,17 @@ unsafe fn inw(port: u16) -> u16 {
     value
 }
 
+unsafe fn outw(port: u16, value: u16) {
+    unsafe {
+        asm!(
+            "out dx, ax",
+            in("dx") port,
+            in("ax") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
 unsafe fn wait_ready() -> Result<u8, AtaError> {
     for _ in 0..TIMEOUT {
         let status = unsafe { inb(STATUS) };
@@ -152,6 +163,66 @@ while i < 256 {
             buffer[i * 2 + 1] = (word >> 8) as u8;
             i += 1;
         }
+    }
+
+    Ok(())
+}
+
+/// Записывает один 512-байтовый сектор на primary master IDE-диск
+/// и сбрасывает кэш устройства.
+pub fn write_sector(lba: u32, buffer: &[u8; 512]) -> Result<(), AtaError> {
+    if lba > 0x0FFF_FFFF {
+        return Err(AtaError::InvalidLba);
+    }
+
+    unsafe {
+        outb(DRIVE, 0xE0 | ((lba >> 24) as u8 & 0x0F));
+
+        let _ = inb(STATUS);
+        let _ = inb(STATUS);
+        let _ = inb(STATUS);
+        let _ = inb(STATUS);
+
+        wait_ready()?;
+
+        let _ = inb(STATUS);
+        let _ = inb(STATUS);
+        let _ = inb(STATUS);
+        let _ = inb(STATUS);
+
+        wait_ready()?;
+
+        outb(SECTOR_COUNT, 1);
+        outb(LBA_LOW, lba as u8);
+        outb(LBA_MID, (lba >> 8) as u8);
+        outb(LBA_HIGH, (lba >> 16) as u8);
+        outb(COMMAND, 0x30); // WRITE SECTORS
+
+        wait_data_ready()?;
+
+        let mut i = 0;
+        while i < 256 {
+            let word = u16::from_le_bytes([buffer[i * 2], buffer[i * 2 + 1]]);
+            outw(DATA, word);
+            i += 1;
+        }
+
+        wait_ready()?;
+
+        flush()?;
+    }
+
+    Ok(())
+}
+
+/// Сбрасывает внутренний кэш диска (FLUSH CACHE).
+pub fn flush() -> Result<(), AtaError> {
+    unsafe {
+        wait_ready()?;
+
+        outb(COMMAND, 0xE7);
+
+        wait_ready()?;
     }
 
     Ok(())

@@ -12,18 +12,36 @@ use crate::vga;
 /// Устройство чтения секторов через ATA PIO (primary master).
 struct AtaDevice;
 
+fn map_ata_error(error: AtaError) -> fs::BlockError {
+    match error {
+        AtaError::Timeout => fs::BlockError::Timeout,
+        AtaError::NoDevice => fs::BlockError::NoDevice,
+        AtaError::DeviceError(_) => fs::BlockError::Device,
+        AtaError::InvalidLba => fs::BlockError::InvalidLba,
+    }
+}
+
 impl fs::BlockReader for AtaDevice {
     fn read_sector(
         &self,
         lba: u32,
         buffer: &mut [u8; fs::SECTOR_SIZE],
     ) -> Result<(), fs::BlockError> {
-        ata::read_sector(lba, buffer).map_err(|error| match error {
-            AtaError::Timeout => fs::BlockError::Timeout,
-            AtaError::NoDevice => fs::BlockError::NoDevice,
-            AtaError::DeviceError(_) => fs::BlockError::Device,
-            AtaError::InvalidLba => fs::BlockError::InvalidLba,
-        })
+        ata::read_sector(lba, buffer).map_err(map_ata_error)
+    }
+}
+
+impl fs::BlockDevice for AtaDevice {
+    fn write_sector(
+        &self,
+        lba: u32,
+        buffer: &[u8; fs::SECTOR_SIZE],
+    ) -> Result<(), fs::BlockError> {
+        ata::write_sector(lba, buffer).map_err(map_ata_error)
+    }
+
+    fn flush(&self) -> Result<(), fs::BlockError> {
+        ata::flush().map_err(map_ata_error)
     }
 }
 
@@ -459,6 +477,102 @@ pub fn shell_cat(path: &[u8], row: usize) -> usize {
     }
 
     (text_row - row) + 1
+}
+
+/// Делит аргумент команды на имя файла и остаток текста.
+fn split_argument(argument: &[u8]) -> (&[u8], &[u8]) {
+    match argument.iter().position(|&byte| byte == b' ') {
+        Some(index) => (&argument[..index], trim_spaces(&argument[index + 1..])),
+        None => (argument, b""),
+    }
+}
+
+fn trim_spaces(input: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut end = input.len();
+
+    while start < end && (input[start] == b' ' || input[start] == b'\t') {
+        start += 1;
+    }
+
+    while end > start && (input[end - 1] == b' ' || input[end - 1] == b'\t') {
+        end -= 1;
+    }
+
+    &input[start..end]
+}
+
+/// Команда `write <файл> <текст>`: создание или перезапись файла.
+pub fn shell_write(argument: &[u8], row: usize) -> usize {
+    let (name, text) = split_argument(argument);
+
+    if name.is_empty() {
+        vga::print_at(row, 0, b"Usage: write <file> <text>");
+        return 1;
+    }
+
+    let volume = match mount_volume() {
+        Ok(volume) => volume,
+        Err(error) => return print_error(row, error),
+    };
+
+    // Текст храним в UTF-8: так его прочитает и cat, и Linux.
+    let mut utf8 = [0u8; 256];
+    let text_len = fs::cp866_to_utf8(text, &mut utf8);
+
+    match fs::write_file(
+        &AtaDevice,
+        &volume,
+        name,
+        &utf8[..text_len],
+        crate::rtc::timestamp(),
+    ) {
+        Ok(()) => {
+            let mut line = [b' '; 80];
+            let mut len = 0usize;
+            push(&mut line, &mut len, b"written: ");
+            push(&mut line, &mut len, name);
+            push(&mut line, &mut len, b" (");
+
+            let mut digits = [0u8; 20];
+            let digits_len = write_dec(text_len as u64, &mut digits);
+            push(&mut line, &mut len, &digits[..digits_len]);
+            push(&mut line, &mut len, b" bytes)");
+
+            vga::print_at(row, 0, &line[..len]);
+
+            1
+        }
+        Err(error) => print_error(row, error),
+    }
+}
+
+/// Команда `rm <файл>`: удаление файла.
+pub fn shell_remove(argument: &[u8], row: usize) -> usize {
+    let (name, _) = split_argument(argument);
+
+    if name.is_empty() {
+        vga::print_at(row, 0, b"Usage: rm <file>");
+        return 1;
+    }
+
+    let volume = match mount_volume() {
+        Ok(volume) => volume,
+        Err(error) => return print_error(row, error),
+    };
+
+    match fs::remove_file(&AtaDevice, &volume, name) {
+        Ok(()) => {
+            let mut line = [b' '; 80];
+            let mut len = 0usize;
+            push(&mut line, &mut len, b"removed: ");
+            push(&mut line, &mut len, name);
+            vga::print_at(row, 0, &line[..len]);
+
+            1
+        }
+        Err(error) => print_error(row, error),
+    }
 }
 
 

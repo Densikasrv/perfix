@@ -66,7 +66,7 @@ fn trim_ascii_space(input: &[u8]) -> &[u8] {
 /// Сколько строк вывода резервировать под команду до её выполнения.
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
-        12
+        14
     } else if input == b"version" {
         5
     } else if input == b"diskinfo" {
@@ -124,6 +124,8 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 9, 0, b"ls [path] - list exFAT directory");
         vga::print_at(output_row + 10, 0, b"cat <file>- print file contents");
         vga::print_at(output_row + 11, 0, b"charset   - show CP866 glyphs");
+        vga::print_at(output_row + 12, 0, b"write <f> <text> - create/overwrite file");
+        vga::print_at(output_row + 13, 0, b"rm <file> - delete file");
     } else if input == b"about" {
         vga::print_at(
             output_row,
@@ -152,6 +154,10 @@ pub fn execute(input: &[u8], row: &mut usize) {
         exfat::shell_list(path, output_row);
     } else if let Some(path) = command_arg(input, b"cat") {
         exfat::shell_cat(path, output_row);
+    } else if let Some(argument) = command_arg(input, b"write") {
+        exfat::shell_write(argument, output_row);
+    } else if let Some(argument) = command_arg(input, b"rm") {
+        exfat::shell_remove(argument, output_row);
     } else if input.is_empty() {
         *row += 1;
         prompt(*row);

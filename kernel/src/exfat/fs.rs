@@ -51,6 +51,18 @@ pub trait BlockReader {
     ) -> Result<(), BlockError>;
 }
 
+/// Устройство, поддерживающее запись секторов.
+pub trait BlockDevice: BlockReader {
+    fn write_sector(
+        &self,
+        lba: u32,
+        buffer: &[u8; SECTOR_SIZE],
+    ) -> Result<(), BlockError>;
+
+    /// Сбрасывает кэш устройства на носитель.
+    fn flush(&self) -> Result<(), BlockError>;
+}
+
 /// Ошибки разбора и чтения exFAT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsError {
@@ -64,6 +76,8 @@ pub enum FsError {
     NotAFile,
     NotADirectory,
     TruncatedChain,
+    NoSpace,
+    InvalidName,
 }
 
 impl From<BlockError> for FsError {
@@ -89,6 +103,8 @@ impl FsError {
             FsError::NotAFile => b"not a file",
             FsError::NotADirectory => b"not a directory",
             FsError::TruncatedChain => b"broken cluster chain",
+            FsError::NoSpace => b"no free space",
+            FsError::InvalidName => b"invalid file name",
         }
     }
 }
@@ -151,6 +167,84 @@ pub fn fold_case(byte: u8) -> u8 {
         0xF0 => 0xF1,               // Ё -> ё
         _ => byte,
     }
+}
+
+/// Переводит байт CP866 в код UTF-16 (для имён файлов).
+pub fn cp866_to_utf16(code: u8) -> Option<u16> {
+    match code {
+        0x00..=0x7E => Some(code as u16),
+        0x80..=0x8F => Some(0x0410 + (code - 0x80) as u16), // А..П
+        0x90..=0x9F => Some(0x0420 + (code - 0x90) as u16), // Р..Я
+        0xA0..=0xAF => Some(0x0430 + (code - 0xA0) as u16), // а..п
+        0xE0..=0xEF => Some(0x0440 + (code - 0xE0) as u16), // р..я
+        0xF0 => Some(0x0401),                               // Ё
+        0xF1 => Some(0x0451),                               // ё
+        0xFC => Some(0x2116),                               // №
+        _ => None,
+    }
+}
+
+/// Верхний регистр по правилам Up-case Table для поддерживаемых символов.
+///
+/// Для ASCII и русской кириллицы эти отображения совпадают со стандартной
+/// Up-case Table Microsoft, поэтому NameHash получается корректным.
+fn upcase_for_hash(unit: u16) -> u16 {
+    match unit {
+        0x0061..=0x007A => unit - 0x20, // a-z -> A-Z
+        0x0430..=0x044F => unit - 0x20, // а-я -> А-Я
+        0x0451 => 0x0401,               // ё -> Ё
+        _ => unit,
+    }
+}
+
+/// Кодирует текст из CP866 в UTF-8. Возвращает длину результата.
+///
+/// Файлы пишутся в UTF-8, чтобы их корректно читали и `cat`, и Linux.
+pub fn cp866_to_utf8(input: &[u8], out: &mut [u8]) -> usize {
+    let mut written = 0usize;
+
+    for &byte in input {
+        let Some(code) = cp866_to_utf16(byte) else {
+            continue;
+        };
+
+        let mut buffer = [0u8; 3];
+        let len = if code < 0x80 {
+            buffer[0] = code as u8;
+            1
+        } else if code < 0x800 {
+            buffer[0] = 0xc0 | (code >> 6) as u8;
+            buffer[1] = 0x80 | (code & 0x3f) as u8;
+            2
+        } else {
+            buffer[0] = 0xe0 | (code >> 12) as u8;
+            buffer[1] = 0x80 | ((code >> 6) & 0x3f) as u8;
+            buffer[2] = 0x80 | (code & 0x3f) as u8;
+            3
+        };
+
+        if written + len > out.len() {
+            break;
+        }
+
+        out[written..written + len].copy_from_slice(&buffer[..len]);
+        written += len;
+    }
+
+    written
+}
+
+/// Вычисляет NameHash набора записей (exFAT, побайтовое вращение).
+pub fn name_hash(units: &[u16]) -> u16 {
+    let mut hash = 0u16;
+
+    for &unit in units {
+        let up = upcase_for_hash(unit);
+        hash = ((hash << 15) | (hash >> 1)).wrapping_add((up & 0xFF) as u16);
+        hash = ((hash << 15) | (hash >> 1)).wrapping_add((up >> 8) as u16);
+    }
+
+    hash
 }
 
 
@@ -473,6 +567,10 @@ pub struct Entry {
     pub valid_data_length: u64,
     /// Поток размещён подряд (NoFatChain), FAT-цепочка не используется.
     pub contiguous: bool,
+    /// Количество вторичных записей в наборе (для удаления).
+    pub secondary_count: usize,
+    /// Индекс основной записи набора в потоке каталога.
+    pub entry_index: usize,
 }
 
 impl Entry {
@@ -485,6 +583,8 @@ impl Entry {
             data_length: 0,
             valid_data_length: 0,
             contiguous: false,
+            secondary_count: 0,
+            entry_index: 0,
         }
     }
 
@@ -548,6 +648,8 @@ pub struct DirCursor<'a> {
     sector_loaded: bool,
     cluster_steps: u32,
     finished: bool,
+    /// Сколько 32-байтовых записей уже выдано (позиция в каталоге).
+    records: usize,
 }
 
 impl<'a> DirCursor<'a> {
@@ -572,6 +674,7 @@ impl<'a> DirCursor<'a> {
             sector_loaded: false,
             cluster_steps: 0,
             finished: false,
+            records: 0,
         }
     }
 
@@ -637,8 +740,14 @@ impl<'a> DirCursor<'a> {
         let mut entry = [0u8; ENTRY_SIZE];
         entry.copy_from_slice(&self.sector[offset..offset + ENTRY_SIZE]);
         self.entry_index += 1;
+        self.records += 1;
 
         Ok(Some(entry))
+    }
+
+    /// Возвращает следующую «сырую» 32-байтовую запись каталога.
+    pub fn next_record(&mut self) -> Result<Option<[u8; ENTRY_SIZE]>, FsError> {
+        self.next_raw()
     }
 
     /// Возвращает следующую запись файла или каталога.
@@ -650,6 +759,8 @@ impl<'a> DirCursor<'a> {
             let Some(primary) = self.next_raw()? else {
                 return Ok(None);
             };
+
+            let primary_index = self.records - 1;
 
             let entry_type = primary[0];
 
@@ -687,6 +798,7 @@ impl<'a> DirCursor<'a> {
             let mut complete = true;
 
             entry.attributes = read_u16(&primary, 4);
+            entry.secondary_count = secondary_count;
 
             for _ in 0..secondary_count {
                 let Some(secondary) = self.next_raw()? else {
@@ -745,6 +857,8 @@ impl<'a> DirCursor<'a> {
             if entry.data_length > 0 && !self.volume.is_valid_cluster(entry.first_cluster) {
                 continue;
             }
+
+            entry.entry_index = primary_index;
 
             return Ok(Some(entry));
         }
@@ -860,6 +974,686 @@ where
             None => return Err(FsError::TruncatedChain),
         }
     }
+
+    Ok(())
+}
+
+impl Volume {
+    /// Устанавливает или снимает флаг VolumeDirty в основном и резервном
+    /// загрузочных секторах. В контрольную сумму региона флаг не входит.
+    pub fn set_dirty(
+        &self,
+        device: &dyn BlockDevice,
+        dirty: bool,
+    ) -> Result<(), FsError> {
+        for offset in [0u32, 12u32] {
+            let Some(lba) = self.base_lba.checked_add(offset) else {
+                return Err(FsError::BadGeometry);
+            };
+
+            let mut boot = [0u8; SECTOR_SIZE];
+            device.read_sector(lba, &mut boot)?;
+
+            let mut flags = read_u16(&boot, 106);
+
+            if dirty {
+                flags |= 0x0002;
+            } else {
+                flags &= !0x0002;
+            }
+
+            boot[106..108].copy_from_slice(&flags.to_le_bytes());
+            device.write_sector(lba, &boot)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Расположение файла битовой карты распределения кластеров (запись 0x81).
+#[derive(Clone, Copy)]
+struct AllocationBitmap {
+    first_cluster: u32,
+    data_length: u64,
+}
+
+fn find_allocation_bitmap(
+    device: &dyn BlockReader,
+    volume: &Volume,
+) -> Result<AllocationBitmap, FsError> {
+    let mut cursor = DirCursor::new(volume, device, volume.root_cluster, false);
+
+    while let Some(record) = cursor.next_record()? {
+        if record[0] == ENTRY_END {
+            break;
+        }
+
+        if record[0] == 0x81 {
+            let first_cluster = read_u32(&record, 20);
+            let data_length = read_u64(&record, 24);
+
+            if !volume.is_valid_cluster(first_cluster) || data_length == 0 {
+                return Err(FsError::BadGeometry);
+            }
+
+            return Ok(AllocationBitmap {
+                first_cluster,
+                data_length,
+            });
+        }
+    }
+
+    Err(FsError::BadGeometry)
+}
+
+/// Доступ к битовой карте распределения с кэшем одного сектора.
+struct BitmapWindow<'a> {
+    device: &'a dyn BlockDevice,
+    volume: &'a Volume,
+    bitmap: AllocationBitmap,
+    cluster: u32,
+    cluster_index: u32,
+    sector: [u8; SECTOR_SIZE],
+    lba: u32,
+    valid: bool,
+}
+
+impl<'a> BitmapWindow<'a> {
+    fn new(
+        device: &'a dyn BlockDevice,
+        volume: &'a Volume,
+        bitmap: AllocationBitmap,
+    ) -> BitmapWindow<'a> {
+        BitmapWindow {
+            device,
+            volume,
+            bitmap,
+            cluster: bitmap.first_cluster,
+            cluster_index: 0,
+            sector: [0u8; SECTOR_SIZE],
+            lba: 0,
+            valid: false,
+        }
+    }
+
+    fn load_sector(&mut self, sector_index: u64) -> Result<(), FsError> {
+        let sectors_per_cluster = self.volume.sectors_per_cluster as u64;
+        let target_cluster = (sector_index / sectors_per_cluster) as u32;
+        let sector_in_cluster = (sector_index % sectors_per_cluster) as u32;
+
+        if target_cluster < self.cluster_index {
+            self.cluster = self.bitmap.first_cluster;
+            self.cluster_index = 0;
+        }
+
+        while self.cluster_index < target_cluster {
+            let Some(next) = self
+                .volume
+                .next_cluster(self.device, self.cluster, false)?
+            else {
+                return Err(FsError::TruncatedChain);
+            };
+
+            self.cluster = next;
+            self.cluster_index += 1;
+        }
+
+        let lba = self
+            .volume
+            .cluster_lba(self.cluster)?
+            .checked_add(sector_in_cluster)
+            .ok_or(FsError::BadGeometry)?;
+
+        if !self.valid || self.lba != lba {
+            self.device.read_sector(lba, &mut self.sector)?;
+            self.lba = lba;
+            self.valid = true;
+        }
+
+        Ok(())
+    }
+
+    fn bit(&mut self, index: u32) -> Result<bool, FsError> {
+        let byte_index = index as u64 / 8;
+
+        if byte_index >= self.bitmap.data_length {
+            return Err(FsError::BadGeometry);
+        }
+
+        self.load_sector(byte_index / SECTOR_SIZE as u64)?;
+
+        let offset = (byte_index % SECTOR_SIZE as u64) as usize;
+
+        Ok(self.sector[offset] & (1 << (index % 8)) != 0)
+    }
+
+    fn set_bit(&mut self, index: u32, used: bool) -> Result<(), FsError> {
+        let byte_index = index as u64 / 8;
+
+        if byte_index >= self.bitmap.data_length {
+            return Err(FsError::BadGeometry);
+        }
+
+        self.load_sector(byte_index / SECTOR_SIZE as u64)?;
+
+        let offset = (byte_index % SECTOR_SIZE as u64) as usize;
+        let mask = 1u8 << (index % 8);
+
+        if used {
+            self.sector[offset] |= mask;
+        } else {
+            self.sector[offset] &= !mask;
+        }
+
+        self.device.write_sector(self.lba, &self.sector)?;
+
+        Ok(())
+    }
+}
+
+/// Ищет непрерывный свободный участок из `count` кластеров и помечает его.
+fn allocate_contiguous(window: &mut BitmapWindow, count: u32) -> Result<u32, FsError> {
+    let total = window.volume.cluster_count;
+    let mut run_start = 0u32;
+    let mut run_len = 0u32;
+
+    for index in 0..total {
+        if window.bit(index)? {
+            run_len = 0;
+            continue;
+        }
+
+        if run_len == 0 {
+            run_start = index;
+        }
+
+        run_len += 1;
+
+        if run_len == count {
+            for bit in run_start..run_start + count {
+                window.set_bit(bit, true)?;
+            }
+
+            return Ok(run_start + 2);
+        }
+    }
+
+    Err(FsError::NoSpace)
+}
+
+/// Освобождает кластеры файла в битовой карте.
+fn free_clusters(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    window: &mut BitmapWindow,
+    first_cluster: u32,
+    data_length: u64,
+    contiguous: bool,
+) -> Result<(), FsError> {
+    if data_length == 0 {
+        return Ok(());
+    }
+
+    let cluster_bytes = volume.cluster_bytes() as u64;
+    let count = (data_length + cluster_bytes - 1) / cluster_bytes;
+    let mut cluster = first_cluster;
+
+    for step in 0..count {
+        if !volume.is_valid_cluster(cluster) {
+            return Err(FsError::ClusterOutOfRange);
+        }
+
+        window.set_bit(cluster - 2, false)?;
+
+        if step + 1 < count {
+            cluster = if contiguous {
+                cluster + 1
+            } else {
+                volume
+                    .next_cluster(device, cluster, false)?
+                    .ok_or(FsError::TruncatedChain)?
+            };
+        }
+    }
+
+    Ok(())
+}
+
+/// Преобразует имя в UTF-16 и проверяет допустимые символы.
+fn encode_name(name: &[u8]) -> Result<([u16; MAX_NAME_CHARS], usize), FsError> {
+    const FORBIDDEN: &[u8] = b"/\\:*?\"<>|";
+
+    if name.is_empty() || name.len() > MAX_NAME_CHARS {
+        return Err(FsError::InvalidName);
+    }
+
+    let mut units = [0u16; MAX_NAME_CHARS];
+
+    for (index, &byte) in name.iter().enumerate() {
+        if byte < 0x20 || byte == 0x7f || FORBIDDEN.contains(&byte) {
+            return Err(FsError::InvalidName);
+        }
+
+        units[index] = cp866_to_utf16(byte).ok_or(FsError::InvalidName)?;
+    }
+
+    Ok((units, name.len()))
+}
+
+/// Максимальное количество 32-байтовых записей в наборе для одного файла.
+const MAX_ENTRY_SET: usize = 20;
+
+/// Собирает набор записей 0x85 + 0xC0 + 0xC1 с корректным SetChecksum.
+fn build_entry_set(
+    units: &[u16],
+    first_cluster: u32,
+    data_length: u64,
+    timestamp: u32,
+) -> Result<([[u8; ENTRY_SIZE]; MAX_ENTRY_SET], usize), FsError> {
+    let name_entries = (units.len() + 14) / 15;
+    let count = 2 + name_entries;
+
+    if units.is_empty() || count > MAX_ENTRY_SET {
+        return Err(FsError::InvalidName);
+    }
+
+    let mut set = [[0u8; ENTRY_SIZE]; MAX_ENTRY_SET];
+
+    // Основная запись файла.
+    set[0][0] = ENTRY_FILE;
+    set[0][1] = (1 + name_entries) as u8;
+    set[0][4..6].copy_from_slice(&0x0020u16.to_le_bytes()); // archive
+
+    for offset in [8usize, 12, 16] {
+        set[0][offset..offset + 4].copy_from_slice(&timestamp.to_le_bytes());
+    }
+
+    // Stream extension.
+    set[1][0] = ENTRY_STREAM;
+    set[1][1] = if data_length > 0 { 0x03 } else { 0x00 };
+    set[1][3] = units.len() as u8;
+
+    let hash = name_hash(units);
+    set[1][4..6].copy_from_slice(&hash.to_le_bytes());
+    set[1][8..16].copy_from_slice(&data_length.to_le_bytes());
+    set[1][20..24].copy_from_slice(&first_cluster.to_le_bytes());
+    set[1][24..32].copy_from_slice(&data_length.to_le_bytes());
+
+    // File name entries.
+    for (chunk_index, chunk) in units.chunks(15).enumerate() {
+        let entry = &mut set[2 + chunk_index];
+        entry[0] = ENTRY_NAME;
+
+        for (index, unit) in chunk.iter().enumerate() {
+            entry[2 + index * 2..4 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+    }
+
+    // SetChecksum: байты 2-3 основной записи в расчёт не входят.
+    let mut checksum = 0u16;
+
+    for entry_index in 0..count {
+        for (offset, &byte) in set[entry_index].iter().enumerate() {
+            if entry_index == 0 && (offset == 2 || offset == 3) {
+                continue;
+            }
+
+            checksum = checksum_byte(checksum, byte);
+        }
+    }
+
+    set[0][2..4].copy_from_slice(&checksum.to_le_bytes());
+
+    Ok((set, count))
+}
+
+/// Ищет свободные слоты в корневом каталоге.
+///
+/// Возвращает индекс первой 32-байтовой записи; набор может пересекать
+/// границы секторов, поэтому поиск идёт по всему потоку каталога.
+fn find_free_slots(
+    device: &dyn BlockReader,
+    volume: &Volume,
+    count: usize,
+) -> Result<usize, FsError> {
+    let mut index = 0usize;
+    let mut run = 0usize;
+    let mut start = 0usize;
+    let mut cluster = volume.root_cluster;
+    let mut steps = 0u32;
+
+    loop {
+        let base = volume.cluster_lba(cluster)?;
+
+        for sector_offset in 0..volume.sectors_per_cluster {
+            let lba = base
+                .checked_add(sector_offset)
+                .ok_or(FsError::BadGeometry)?;
+            let mut sector = [0u8; SECTOR_SIZE];
+            device.read_sector(lba, &mut sector)?;
+
+            for slot in 0..ENTRIES_PER_SECTOR {
+                let entry_type = sector[slot * ENTRY_SIZE];
+                let free = entry_type == ENTRY_END || entry_type & 0x80 == 0;
+
+                if free {
+                    if run == 0 {
+                        start = index;
+                    }
+
+                    run += 1;
+
+                    if run == count {
+                        return Ok(start);
+                    }
+                } else {
+                    run = 0;
+                }
+
+                index += 1;
+            }
+        }
+
+        if steps >= volume.cluster_count {
+            break;
+        }
+
+        match volume.next_cluster(device, cluster, false)? {
+            Some(next) => {
+                cluster = next;
+                steps += 1;
+            }
+            None => break,
+        }
+    }
+
+    Err(FsError::NoSpace)
+}
+
+/// Записывает набор записей, начиная с указанного индекса каталога.
+fn write_entry_set(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    start_index: usize,
+    entries: &[[u8; ENTRY_SIZE]],
+) -> Result<(), FsError> {
+    let entries_per_cluster = volume.sectors_per_cluster as usize * ENTRIES_PER_SECTOR;
+    let mut cluster = volume.root_cluster;
+    let mut cluster_index = 0usize;
+    let mut sector = [0u8; SECTOR_SIZE];
+    let mut loaded_lba: Option<u32> = None;
+
+    for (offset_in_set, entry) in entries.iter().enumerate() {
+        let index = start_index + offset_in_set;
+        let target_cluster = index / entries_per_cluster;
+        let within = index % entries_per_cluster;
+        let sector_offset = within / ENTRIES_PER_SECTOR;
+        let slot = within % ENTRIES_PER_SECTOR;
+
+        while cluster_index < target_cluster {
+            let Some(next) = volume.next_cluster(device, cluster, false)? else {
+                return Err(FsError::BadGeometry);
+            };
+
+            cluster = next;
+            cluster_index += 1;
+        }
+
+        let lba = volume.cluster_lba(cluster)?
+            .checked_add(sector_offset as u32)
+            .ok_or(FsError::BadGeometry)?;
+
+        if loaded_lba != Some(lba) {
+            if let Some(previous) = loaded_lba {
+                device.write_sector(previous, &sector)?;
+            }
+
+            device.read_sector(lba, &mut sector)?;
+            loaded_lba = Some(lba);
+        }
+
+        let start = slot * ENTRY_SIZE;
+        sector[start..start + ENTRY_SIZE].copy_from_slice(entry);
+    }
+
+    if let Some(lba) = loaded_lba {
+        device.write_sector(lba, &sector)?;
+    }
+
+    Ok(())
+}
+
+/// Записывает данные в непрерывно выделенные кластеры.
+fn write_data(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    first_cluster: u32,
+    data: &[u8],
+) -> Result<(), FsError> {
+    let mut cluster = first_cluster;
+    let mut written = 0usize;
+
+    loop {
+        let base = volume.cluster_lba(cluster)?;
+
+        for sector_offset in 0..volume.sectors_per_cluster {
+            let mut sector = [0u8; SECTOR_SIZE];
+
+            if written < data.len() {
+                let end = (written + SECTOR_SIZE).min(data.len());
+                sector[..end - written].copy_from_slice(&data[written..end]);
+                written = end;
+            }
+
+            let lba = base
+                .checked_add(sector_offset)
+                .ok_or(FsError::BadGeometry)?;
+            device.write_sector(lba, &sector)?;
+        }
+
+        if written >= data.len() {
+            break;
+        }
+
+        cluster = cluster.checked_add(1).ok_or(FsError::BadGeometry)?;
+    }
+
+    Ok(())
+}
+
+/// Ищет запись файла в корневом каталоге.
+fn find_entry(
+    device: &dyn BlockReader,
+    volume: &Volume,
+    name: &[u8],
+) -> Result<Option<(Entry, usize)>, FsError> {
+    let mut cursor = DirCursor::new(volume, device, volume.root_cluster, false);
+
+    loop {
+        let Some(entry) = cursor.next_entry()? else {
+            return Ok(None);
+        };
+
+        if entry.name_eq_ignore_case(name) {
+            return Ok(Some((entry, entry.entry_index)));
+        }
+    }
+}
+
+/// Помечает набор записей как удалённый (сбрасывает бит InUse).
+fn delete_entry_set(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    start: usize,
+    count: usize,
+) -> Result<(), FsError> {
+    let end = start + count;
+    let mut index = 0usize;
+    let mut cluster = volume.root_cluster;
+    let mut steps = 0u32;
+
+    loop {
+        let base = volume.cluster_lba(cluster)?;
+
+        for sector_offset in 0..volume.sectors_per_cluster {
+            let lba = base
+                .checked_add(sector_offset)
+                .ok_or(FsError::BadGeometry)?;
+            let mut sector = [0u8; SECTOR_SIZE];
+            device.read_sector(lba, &mut sector)?;
+
+            let mut changed = false;
+
+            for slot in 0..ENTRIES_PER_SECTOR {
+                let offset = slot * ENTRY_SIZE;
+
+                if index >= start && index < end && sector[offset] & 0x80 != 0 {
+                    sector[offset] &= 0x7f;
+                    changed = true;
+                }
+
+                index += 1;
+            }
+
+            if changed {
+                device.write_sector(lba, &sector)?;
+            }
+        }
+
+        if steps >= volume.cluster_count {
+            break;
+        }
+
+        match volume.next_cluster(device, cluster, false)? {
+            Some(next) => {
+                cluster = next;
+                steps += 1;
+            }
+            None => break,
+        }
+    }
+
+    Ok(())
+}
+
+/// Создаёт файл в корневом каталоге или перезаписывает существующий.
+///
+/// Кластеры выделяются непрерывно (NoFatChain), битовая карта
+/// распределения обновляется. `timestamp` — упакованные дата и время
+/// exFAT (см. `rtc::timestamp`).
+pub fn write_file(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    name: &[u8],
+    data: &[u8],
+    timestamp: u32,
+) -> Result<(), FsError> {
+    let reader: &dyn BlockReader = device;
+    let (units, units_len) = encode_name(name)?;
+    let bitmap = find_allocation_bitmap(reader, volume)?;
+
+    volume.set_dirty(device, true)?;
+
+    let result = write_file_inner(
+        device,
+        volume,
+        bitmap,
+        name,
+        &units[..units_len],
+        data,
+        timestamp,
+    );
+
+    if result.is_err() {
+        // Том изменён не до конца — оставляем VolumeDirty установленным.
+        let _ = device.flush();
+        return result;
+    }
+
+    volume.set_dirty(device, false)?;
+    device.flush()?;
+
+    Ok(())
+}
+
+fn write_file_inner(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    bitmap: AllocationBitmap,
+    name: &[u8],
+    units: &[u16],
+    data: &[u8],
+    timestamp: u32,
+) -> Result<(), FsError> {
+    let reader: &dyn BlockReader = device;
+    let mut window = BitmapWindow::new(device, volume, bitmap);
+
+    if let Some((entry, index)) = find_entry(reader, volume, name)? {
+        free_clusters(
+            device,
+            volume,
+            &mut window,
+            entry.first_cluster,
+            entry.data_length,
+            entry.contiguous,
+        )?;
+
+        delete_entry_set(device, volume, index, 1 + entry.secondary_count)?;
+    }
+
+    let first_cluster = if data.is_empty() {
+        0
+    } else {
+        let cluster_bytes = volume.cluster_bytes() as u64;
+        let count = ((data.len() as u64 + cluster_bytes - 1) / cluster_bytes) as u32;
+        let first = allocate_contiguous(&mut window, count)?;
+        write_data(device, volume, first, data)?;
+        first
+    };
+
+    let (set, count) = build_entry_set(units, first_cluster, data.len() as u64, timestamp)?;
+    let start = find_free_slots(reader, volume, count)?;
+
+    write_entry_set(device, volume, start, &set[..count])?;
+
+    Ok(())
+}
+
+/// Удаляет файл из корневого каталога и освобождает его кластеры.
+pub fn remove_file(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    name: &[u8],
+) -> Result<(), FsError> {
+    let reader: &dyn BlockReader = device;
+
+    let Some((entry, index)) = find_entry(reader, volume, name)? else {
+        return Err(FsError::PathNotFound);
+    };
+
+    let bitmap = find_allocation_bitmap(reader, volume)?;
+
+    volume.set_dirty(device, true)?;
+
+    let mut window = BitmapWindow::new(device, volume, bitmap);
+
+    let result = free_clusters(
+        device,
+        volume,
+        &mut window,
+        entry.first_cluster,
+        entry.data_length,
+        entry.contiguous,
+    )
+    .and_then(|()| delete_entry_set(device, volume, index, 1 + entry.secondary_count));
+
+    if result.is_err() {
+        let _ = device.flush();
+        return result;
+    }
+
+    volume.set_dirty(device, false)?;
+    device.flush()?;
 
     Ok(())
 }

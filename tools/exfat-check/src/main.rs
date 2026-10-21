@@ -15,6 +15,9 @@ mod keyboard;
 #[path = "../../../kernel/src/utf8.rs"]
 mod utf8;
 
+#[path = "../../../kernel/src/rtc.rs"]
+mod rtc;
+
 use fs::{
     fold_case, mount, read_file, resolve, utf16_to_cp866, BlockError, BlockReader,
     DirCursor, FsError, Volume, SECTOR_SIZE,
@@ -23,29 +26,59 @@ use fs::{
 const SEC: usize = SECTOR_SIZE;
 const CLUSTER_SHIFT: u8 = 1;
 const SECTORS_PER_CLUSTER: u32 = 1 << CLUSTER_SHIFT;
+/// Кластер, в котором лежит тестовая битовая карта распределения.
+const BITMAP_CLUSTER: u32 = 8;
+/// LBA первого сектора битовой карты (heap_offset = 25).
+const BITMAP_LBA: usize = 25 + (BITMAP_CLUSTER as usize - 2) * SECTORS_PER_CLUSTER as usize;
 
 fn main() {}
 
 struct MemoryDisk {
-    data: Vec<u8>,
+    data: std::cell::RefCell<Vec<u8>>,
 }
 
 impl MemoryDisk {
     fn new(data: Vec<u8>) -> MemoryDisk {
-        MemoryDisk { data }
+        MemoryDisk {
+            data: std::cell::RefCell::new(data),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.data.borrow().clone()
     }
 }
 
 impl BlockReader for MemoryDisk {
     fn read_sector(&self, lba: u32, buffer: &mut [u8; SEC]) -> Result<(), BlockError> {
+        let data = self.data.borrow();
         let start = lba as usize * SEC;
         let end = start + SEC;
 
-        if end > self.data.len() {
+        if end > data.len() {
             return Err(BlockError::InvalidLba);
         }
 
-        buffer.copy_from_slice(&self.data[start..end]);
+        buffer.copy_from_slice(&data[start..end]);
+        Ok(())
+    }
+}
+
+impl fs::BlockDevice for MemoryDisk {
+    fn write_sector(&self, lba: u32, buffer: &[u8; SEC]) -> Result<(), BlockError> {
+        let mut data = self.data.borrow_mut();
+        let start = lba as usize * SEC;
+        let end = start + SEC;
+
+        if end > data.len() {
+            return Err(BlockError::InvalidLba);
+        }
+
+        data[start..end].copy_from_slice(buffer);
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), BlockError> {
         Ok(())
     }
 }
@@ -70,7 +103,7 @@ impl Image {
         let fat_offset = 24u32;
         let fat_length = 1u32;
         let heap_offset = 25u32;
-        let cluster_count = 8u32;
+        let cluster_count = 12u32;
         let volume_length = heap_offset as u64
             + cluster_count as u64 * SECTORS_PER_CLUSTER as u64;
 
@@ -161,6 +194,14 @@ impl Image {
         buffer[offset..offset + 32].copy_from_slice(&label);
         offset += 32;
 
+        // Битовая карта распределения кластеров (запись 0x81).
+        let mut bitmap = [0u8; 32];
+        bitmap[0] = 0x81;
+        bitmap[20..24].copy_from_slice(&BITMAP_CLUSTER.to_le_bytes());
+        bitmap[24..32].copy_from_slice(&2u64.to_le_bytes());
+        buffer[offset..offset + 32].copy_from_slice(&bitmap);
+        offset += 32;
+
         // Файл из двух кластеров, связанных через FAT.
         offset = write_set(&mut buffer, offset, 0x20, b"readme.txt", 4, 1200, false);
 
@@ -211,6 +252,8 @@ impl Image {
         self.write_cluster(6, b"hello world\n");
         // Содержимое привет.txt в CP866: "да\n".
         self.write_cluster(7, &[0xA4, 0xA0, b'\n']);
+        // Битовая карта: заняты кластеры 2..8 (root, subdir, data, bitmap).
+        self.write_cluster(BITMAP_CLUSTER, &[0x7F, 0x00]);
     }
 
     fn write_checksum_sector(&mut self) {
@@ -364,7 +407,7 @@ fn mounts_and_validates_boot_region() {
 
     assert_eq!(volume.base_lba, 0);
     assert_eq!(volume.sectors_per_cluster, 2);
-    assert_eq!(volume.cluster_count, 8);
+    assert_eq!(volume.cluster_count, 12);
     assert_eq!(volume.root_cluster, 2);
     assert_eq!(volume.cluster_bytes(), 1024);
     assert_eq!(volume.serial, 0x1234_5678);
@@ -764,6 +807,190 @@ fn stops_reading_when_sink_returns_false() {
     .expect("read");
 
     assert_eq!(calls, 1);
+}
+
+fn bitmap_byte(disk: &MemoryDisk, offset: usize) -> u8 {
+    disk.snapshot()[BITMAP_LBA * SEC + offset]
+}
+
+#[test]
+fn creates_file_and_reads_it_back() {
+    let (disk, volume) = mounted();
+
+    fs::write_file(&disk, &volume, b"new.txt", b"hello exfat\n", 0).expect("write");
+
+    let reloaded = MemoryDisk::new(disk.snapshot());
+    let volume2 = mount(&reloaded).expect("mount");
+
+    assert!(volume2.boot_checksum_ok);
+    assert!(!volume2.is_dirty());
+    assert_eq!(
+        collect_file(&reloaded, &volume2, b"/new.txt"),
+        b"hello exfat\n"
+    );
+
+    let root = resolve(&reloaded, &volume2, b"/").expect("root");
+    let mut cursor = DirCursor::new(&volume2, &reloaded, root.first_cluster, root.contiguous);
+    let mut names = Vec::new();
+
+    while let Some(entry) = cursor.next_entry().expect("entry") {
+        names.push(entry.name().to_vec());
+    }
+
+    assert!(names.contains(&b"new.txt".to_vec()));
+    assert_eq!(names.len(), 4, "лишние записи: {names:?}");
+}
+
+#[test]
+fn overwrites_existing_file() {
+    let (disk, volume) = mounted();
+    let pattern: Vec<u8> = (0..1500u32)
+        .map(|index| b'a' + (index % 26) as u8)
+        .collect();
+
+    fs::write_file(&disk, &volume, b"doc.txt", b"short", 0).expect("create");
+    fs::write_file(&disk, &volume, b"doc.txt", &pattern, 0).expect("overwrite");
+
+    let reloaded = MemoryDisk::new(disk.snapshot());
+    let volume2 = mount(&reloaded).expect("mount");
+
+    assert_eq!(collect_file(&reloaded, &volume2, b"/doc.txt"), pattern);
+
+    let root = resolve(&reloaded, &volume2, b"/").expect("root");
+    let mut cursor = DirCursor::new(&volume2, &reloaded, root.first_cluster, root.contiguous);
+    let mut count = 0usize;
+
+    while cursor.next_entry().expect("entry").is_some() {
+        count += 1;
+    }
+
+    assert_eq!(count, 4, "после перезаписи должна остаться одна запись файла");
+}
+
+#[test]
+fn removes_file_and_frees_clusters() {
+    let (disk, volume) = mounted();
+
+    assert_eq!(bitmap_byte(&disk, 0), 0x7F);
+
+    fs::remove_file(&disk, &volume, b"readme.txt").expect("remove");
+
+    // Кластеры 4 и 5 (биты 2 и 3) освобождены.
+    assert_eq!(bitmap_byte(&disk, 0), 0x73);
+    assert!(matches!(
+        resolve(&disk, &volume, b"/readme.txt"),
+        Err(FsError::PathNotFound)
+    ));
+
+    fs::write_file(&disk, &volume, b"again.txt", &[b'x'; 1200], 0).expect("write");
+    assert_eq!(bitmap_byte(&disk, 0), 0x7F);
+
+    let reloaded = MemoryDisk::new(disk.snapshot());
+    let volume2 = mount(&reloaded).expect("mount");
+    assert_eq!(collect_file(&reloaded, &volume2, b"/again.txt").len(), 1200);
+}
+
+#[test]
+fn writes_cyrillic_file_name() {
+    let (disk, volume) = mounted();
+
+    // "тест.txt" в CP866.
+    fs::write_file(&disk, &volume, b"\xE2\xA5\xE1\xE2.txt", b"data\n", 0).expect("write");
+
+    let reloaded = MemoryDisk::new(disk.snapshot());
+    let volume2 = mount(&reloaded).expect("mount");
+
+    assert_eq!(
+        collect_file(&reloaded, &volume2, b"/\xE2\xA5\xE1\xE2.txt"),
+        b"data\n"
+    );
+
+    // Регистр кириллицы не важен: "ТЕСТ.TXT" в CP866.
+    assert_eq!(
+        collect_file(&reloaded, &volume2, b"/\x92\x85\x91\x92.TXT"),
+        b"data\n"
+    );
+}
+
+#[test]
+fn creates_empty_file() {
+    let (disk, volume) = mounted();
+
+    fs::write_file(&disk, &volume, b"empty.txt", b"", 0).expect("write");
+
+    let reloaded = MemoryDisk::new(disk.snapshot());
+    let volume2 = mount(&reloaded).expect("mount");
+
+    assert_eq!(
+        collect_file(&reloaded, &volume2, b"/empty.txt"),
+        Vec::<u8>::new()
+    );
+}
+
+#[test]
+fn rejects_invalid_names_and_reports_no_space() {
+    let (disk, volume) = mounted();
+
+    assert!(matches!(
+        fs::write_file(&disk, &volume, b"a/b", b"x", 0),
+        Err(FsError::InvalidName)
+    ));
+    assert!(matches!(
+        fs::write_file(&disk, &volume, b"", b"x", 0),
+        Err(FsError::InvalidName)
+    ));
+
+    // Свободно 5 кластеров по 1024 байта.
+    let huge = vec![b'z'; 6 * 1024];
+
+    assert!(matches!(
+        fs::write_file(&disk, &volume, b"huge.bin", &huge, 0),
+        Err(FsError::NoSpace)
+    ));
+}
+
+#[test]
+fn encodes_cp866_text_to_utf8() {
+    let mut out = [0u8; 64];
+    let len = fs::cp866_to_utf8(b"\xAF\xE0\xA8\xA2\xA5\xE2", &mut out);
+
+    assert_eq!(&out[..len], "привет".as_bytes());
+}
+
+#[test]
+fn roundtrips_cyrillic_text_through_disk() {
+    let (disk, volume) = mounted();
+
+    // Пользователь вводит текст в CP866, на диск он пишется в UTF-8.
+    let text_cp866 = b"\xAF\xE0\xA8\xA2\xA5\xE2\n";
+    let mut utf8 = [0u8; 64];
+    let utf8_len = fs::cp866_to_utf8(text_cp866, &mut utf8);
+
+    fs::write_file(&disk, &volume, b"ru.txt", &utf8[..utf8_len], 0).expect("write");
+
+    let reloaded = MemoryDisk::new(disk.snapshot());
+    let volume2 = mount(&reloaded).expect("mount");
+    let stored = collect_file(&reloaded, &volume2, b"/ru.txt");
+
+    assert_eq!(stored, "привет\n".as_bytes());
+
+    // Обратное декодирование тем же путём, что делает cat.
+    let mut decoder = utf8::Decoder::new();
+    let mut decoded = Vec::new();
+
+    for &byte in &stored {
+        let mut out = [0u8; 4];
+        let count = decoder.feed(byte, &mut out, utf16_to_cp866);
+        decoded.extend_from_slice(&out[..count]);
+    }
+
+    assert_eq!(decoded, text_cp866);
+}
+
+#[test]
+fn packs_exfat_timestamp() {
+    assert_eq!(rtc::pack(2024, 1, 1, 0, 0, 0), 0x5821_0000);
+    assert_eq!(rtc::pack(2024, 1, 1, 0, 0, 59), 0x5821_0000 | 29);
 }
 
 

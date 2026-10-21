@@ -15,6 +15,7 @@ mod paging;
 mod ata;
 mod exfat;
 mod font_cp866;
+mod rtc;
 mod utf8;
 
 #[unsafe(no_mangle)]
