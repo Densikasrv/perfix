@@ -20,8 +20,17 @@ pub fn show_screen(message: Option<&[u8]>) {
     prompt(6);
 }
 
-fn prompt(row: usize) {
-    vga::print_at(row, 0, b"perfix> ");
+/// Длина приглашения в символах: `perfix[EN]> ` и `perfix[RU]> `.
+pub const PROMPT_WIDTH: usize = 12;
+
+pub fn prompt(row: usize) {
+    let text: &[u8] = if crate::keyboard::is_russian() {
+        b"perfix[RU]> "
+    } else {
+        b"perfix[EN]> "
+    };
+
+    vga::print_at(row, 0, text);
 }
 
 /// Отделяет аргумент команды: `ls /SYSTEM` -> `/SYSTEM`.
@@ -57,13 +66,15 @@ fn trim_ascii_space(input: &[u8]) -> &[u8] {
 /// Сколько строк вывода резервировать под команду до её выполнения.
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
-        11
+        12
     } else if input == b"version" {
         5
     } else if input == b"diskinfo" {
         9
     } else if input == b"mount" {
         14
+    } else if input == b"charset" {
+        6
     } else if input == b"rootdir" {
         16
     } else if command_arg(input, b"ls").is_some() {
@@ -112,6 +123,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 8, 0, b"mount     - show exFAT volume info");
         vga::print_at(output_row + 9, 0, b"ls [path] - list exFAT directory");
         vga::print_at(output_row + 10, 0, b"cat <file>- print file contents");
+        vga::print_at(output_row + 11, 0, b"charset   - show CP866 glyphs");
     } else if input == b"about" {
         vga::print_at(
             output_row,
@@ -132,6 +144,8 @@ pub fn execute(input: &[u8], row: &mut usize) {
         exfat::print_boot_sector(output_row);
     } else if input == b"mount" {
         exfat::print_volume_info(output_row);
+    } else if input == b"charset" {
+        vga::print_charset(output_row);
     } else if input == b"rootdir" || command_arg(input, b"ls").is_some() {
         let root: &[u8] = b"/";
         let path = command_arg(input, b"ls").unwrap_or(root);

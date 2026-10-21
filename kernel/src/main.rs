@@ -88,12 +88,11 @@ paging::init();
 vga::load_glyphs(&font_cp866::GLYPHS);
 
 shell::show_screen(None);
-vga::print_status(keyboard::is_russian());
 
 let mut input = [0u8; 64];
 let mut len = 0usize;
 let mut row = 6usize;
-let mut col = 8usize;
+let mut col = shell::PROMPT_WIDTH;
 
 loop {
     match keyboard::read_key() {
@@ -103,7 +102,7 @@ keyboard::Key::Enter => {
 
     input = [0u8; 64];
     len = 0;
-    col = 8;
+    col = shell::PROMPT_WIDTH;
 
     // shell::execute() уже вывела приглашение.
     // Следующая строка после него — строка ввода.
@@ -116,7 +115,8 @@ keyboard::Key::Enter => {
 
 
         keyboard::Key::LayoutChanged => {
-            vga::print_status(keyboard::is_russian());
+            // Приглашение показывает раскладку, поэтому перерисовываем его.
+            shell::prompt(row);
         }
 
         keyboard::Key::Backspace => {

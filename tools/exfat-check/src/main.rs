@@ -9,6 +9,9 @@ mod fs;
 #[path = "../../../kernel/src/font_cp866.rs"]
 mod font;
 
+#[path = "../../../kernel/src/keyboard.rs"]
+mod keyboard;
+
 use fs::{
     fold_case, mount, read_file, resolve, utf16_to_cp866, BlockError, BlockReader,
     DirCursor, FsError, Volume, SECTOR_SIZE,
@@ -477,6 +480,83 @@ fn folds_case_for_ascii_and_cyrillic() {
     assert_eq!(fold_case(0x9F), 0xEF); // Я -> я
     assert_eq!(fold_case(0xF0), 0xF1); // Ё -> ё
     assert_eq!(fold_case(b'.'), b'.');
+}
+
+#[test]
+fn russian_layout_matches_jcuken() {
+    // Скан-код -> строчная буква CP866.
+    let letters: [(u8, u8); 33] = [
+        (0x10, 0xA9), // q -> й
+        (0x11, 0xE6), // w -> ц
+        (0x12, 0xE3), // e -> у
+        (0x13, 0xAA), // r -> к
+        (0x14, 0xA5), // t -> е
+        (0x15, 0xAD), // y -> н
+        (0x16, 0xA3), // u -> г
+        (0x17, 0xE8), // i -> ш
+        (0x18, 0xE9), // o -> щ
+        (0x19, 0xA7), // p -> з
+        (0x1A, 0xE5), // [ -> х
+        (0x1B, 0xEA), // ] -> ъ
+        (0x1E, 0xE4), // a -> ф
+        (0x1F, 0xEB), // s -> ы
+        (0x20, 0xA2), // d -> в
+        (0x21, 0xA0), // f -> а
+        (0x22, 0xAF), // g -> п
+        (0x23, 0xE0), // h -> р
+        (0x24, 0xAE), // j -> о
+        (0x25, 0xAB), // k -> л
+        (0x26, 0xA4), // l -> д
+        (0x27, 0xA6), // ; -> ж
+        (0x28, 0xED), // ' -> э
+        (0x29, 0xF1), // ` -> ё
+        (0x2C, 0xEF), // z -> я
+        (0x2D, 0xE7), // x -> ч
+        (0x2E, 0xE1), // c -> с
+        (0x2F, 0xAC), // v -> м
+        (0x30, 0xA8), // b -> и
+        (0x31, 0xE2), // n -> т
+        (0x32, 0xEC), // m -> ь
+        (0x33, 0xA1), // , -> б
+        (0x34, 0xEE), // . -> ю
+    ];
+
+    for &(sc, code) in &letters {
+        assert_eq!(
+            keyboard::russian_char(sc, false),
+            Some(code),
+            "строчная буква для скан-кода {sc:#04X}"
+        );
+    }
+
+    // Shift даёт заглавные: Й, А, Я, Ё.
+    assert_eq!(keyboard::russian_char(0x10, true), Some(0x89));
+    assert_eq!(keyboard::russian_char(0x21, true), Some(0x80));
+    assert_eq!(keyboard::russian_char(0x2C, true), Some(0x9F));
+    assert_eq!(keyboard::russian_char(0x29, true), Some(0xF0));
+
+    // Знаки препинания и цифры.
+    assert_eq!(keyboard::russian_char(0x02, false), Some(b'1'));
+    assert_eq!(keyboard::russian_char(0x04, true), Some(0xFC)); // №
+    assert_eq!(keyboard::russian_char(0x07, true), Some(b':'));
+    assert_eq!(keyboard::russian_char(0x08, true), Some(b'?'));
+    assert_eq!(keyboard::russian_char(0x35, false), Some(b'.'));
+    assert_eq!(keyboard::russian_char(0x35, true), Some(b','));
+    assert_eq!(keyboard::russian_char(0x2B, false), Some(b'\\'));
+    assert_eq!(keyboard::russian_char(0x39, false), Some(b' '));
+    assert_eq!(keyboard::russian_char(0x1C, false), None); // Enter обрабатывается отдельно
+    assert_eq!(keyboard::russian_char(0x3A, false), None); // Caps Lock не поддерживается
+}
+
+#[test]
+fn english_layout_is_unchanged() {
+    assert_eq!(keyboard::keyboard_char(0x21, false), Some(b'f'));
+    assert_eq!(keyboard::keyboard_char(0x21, true), Some(b'F'));
+    assert_eq!(keyboard::keyboard_char(0x34, false), Some(b'.'));
+    assert_eq!(keyboard::keyboard_char(0x34, true), Some(b'>'));
+    assert_eq!(keyboard::keyboard_char(0x35, false), Some(b'/'));
+    assert_eq!(keyboard::keyboard_char(0x28, true), Some(b'"'));
+    assert_eq!(keyboard::keyboard_char(0x0E, false), None);
 }
 
 #[test]

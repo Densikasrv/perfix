@@ -18,6 +18,8 @@ pub enum Layout {
 }
 
 static mut SHIFT_PRESSED: bool = false;
+static mut ALT_PRESSED: bool = false;
+static mut COMBO_ACTIVE: bool = false;
 static mut LAYOUT: Layout = Layout::English;
 static mut EXTENDED: bool = false;
 
@@ -37,7 +39,7 @@ fn inb(port: u16) -> u8 {
     value
 }
 
-fn keyboard_char(sc: u8, shift: bool) -> Option<u8> {
+pub(crate) fn keyboard_char(sc: u8, shift: bool) -> Option<u8> {
     let ch = match sc {
         0x02 => if shift { b'!' } else { b'1' },
         0x03 => if shift { b'@' } else { b'2' },
@@ -117,6 +119,28 @@ fn toggle_layout() {
     }
 }
 
+/// Переключает раскладку, когда Alt и Shift нажаты вместе.
+///
+/// Возвращает `true` в момент, когда комбинация только что стала активной,
+/// поэтому удержание клавиш не переключает раскладку повторно.
+fn update_combo() -> bool {
+    unsafe {
+        let active = ALT_PRESSED && SHIFT_PRESSED;
+
+        if active && !COMBO_ACTIVE {
+            COMBO_ACTIVE = true;
+            toggle_layout();
+            return true;
+        }
+
+        if !active {
+            COMBO_ACTIVE = false;
+        }
+
+        false
+    }
+}
+
 /// Переводит строчную букву CP866 в заглавную.
 fn russian_upper(code: u8) -> u8 {
     match code {
@@ -128,7 +152,7 @@ fn russian_upper(code: u8) -> u8 {
 }
 
 /// Символ для русской раскладки (ЙЦУКЕН), коды CP866.
-fn russian_char(sc: u8, shift: bool) -> Option<u8> {
+pub(crate) fn russian_char(sc: u8, shift: bool) -> Option<u8> {
     // Строчные буквы, при Shift заменяются заглавными.
     let letter = match sc {
         0x10 => 0xA9, // й
@@ -187,6 +211,7 @@ fn russian_char(sc: u8, shift: bool) -> Option<u8> {
         0x0D => if shift { b'+' } else { b'=' },
         0x2B => if shift { b'|' } else { b'\\' },
         0x35 => if shift { b',' } else { b'.' },
+        0x39 => b' ',
         _ => return None,
     };
 
@@ -223,10 +248,30 @@ pub fn read_key() -> Key {
         match sc {
             0x2A | 0x36 => {
                 SHIFT_PRESSED = true;
+
+                if update_combo() {
+                    return Key::LayoutChanged;
+                }
+
                 return Key::None;
             }
             0xAA | 0xB6 => {
                 SHIFT_PRESSED = false;
+                update_combo();
+                return Key::None;
+            }
+            0x38 => {
+                ALT_PRESSED = true;
+
+                if update_combo() {
+                    return Key::LayoutChanged;
+                }
+
+                return Key::None;
+            }
+            0xB8 => {
+                ALT_PRESSED = false;
+                update_combo();
                 return Key::None;
             }
             _ => {}
