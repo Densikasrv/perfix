@@ -68,27 +68,28 @@ build/ — каталог для сборочных артефактов.
 
 4. Сборка ядра
 
-Перед сборкой должны быть доступны объектные файлы загрузчика, используемые линковщиком:
+Все шаги сборки выполняет скрипт tools/build-iso.sh: он собирает объектные файлы загрузчика через NASM, собирает ядро nightly-компилятором с -Z build-std=core и создаёт ISO через grub-mkrescue.
 
-kernel/target/boot.o
+bash tools/build-iso.sh
 
-kernel/target/boot-gdt.o
+Готовый образ появится в build/perfix-min.iso. Скрипт сам подставляет абсолютные пути в RUSTFLAGS, поэтому каталог репозитория может быть любым, а запускать его можно из любой директории.
 
-kernel/target/boot-idt.o
+Ручная сборка
 
-Они должны быть созданы предусмотренным проектом способом из соответствующих файлов в boot/.
+Соберите объектные файлы загрузчика:
 
-Из корня репозитория выполните:
+mkdir -p kernel/target
+nasm -f elf32 boot/boot.asm -o kernel/target/boot.o
+nasm -f elf32 boot/gdt.asm -o kernel/target/boot-gdt.o
+nasm -f elf32 boot/idt.asm -o kernel/target/boot-idt.o
 
-set -lx RUSTFLAGS "-C link-arg=-T/home/dzianis/perfix/kernel/linker.ld -C link-arg=-m -C link-arg=elf_i386 -C link-arg=/home/dzianis/perfix/kernel/target/boot.o -C link-arg=/home/dzianis/perfix/kernel/target/boot-gdt.o -C link-arg=/home/dzianis/perfix/kernel/target/boot-idt.o"
+Затем задайте RUSTFLAGS и соберите ядро (пример для bash, из корня репозитория):
 
-cargo +nightly build \
-    --manifest-path kernel/Cargo.toml \
-    -Z build-std=core \
-    -Z json-target-spec \
-    --target kernel/i686-perfix.json
+export RUSTFLAGS="-C link-arg=-T$PWD/kernel/linker.ld -C link-arg=-m -C link-arg=elf_i386 -C link-arg=$PWD/kernel/target/boot.o -C link-arg=$PWD/kernel/target/boot-gdt.o -C link-arg=$PWD/kernel/target/boot-idt.o"
 
-Важно: путь /home/dzianis/perfix относится к исходной среде разработки автора. Если проект находится в другом каталоге, замените абсолютные пути в RUSTFLAGS на соответствующие пути вашей системы.
+cargo +nightly build --manifest-path kernel/Cargo.toml -Z build-std=core -Z json-target-spec --target kernel/i686-perfix.json
+
+Учтите: RUSTFLAGS содержит абсолютные пути, вычисленные через $PWD, поэтому команды нужно выполнять из корня репозитория. В fish многострочная вставка без обратного слэша ломается на отдельные команды — используйте одну строку или запускайте скрипт. В свежих nightly флаг -Z json-target-spec удалён; если cargo сообщает о неизвестном флаге, уберите его.
 
 При успешной сборке ELF-файл ядра появится по пути:
 
@@ -96,15 +97,12 @@ kernel/target/i686-perfix/debug/perfix
 
 5. Создание загрузочного ISO
 
-Подготовьте каталог ISO:
+Скрипт tools/build-iso.sh выполняет это автоматически. Вручную шаги выглядят так:
 
 mkdir -p build/iso/boot/grub
-
-Скопируйте скомпилированное ядро:
-
 cp kernel/target/i686-perfix/debug/perfix build/iso/boot/perfix.elf
 
-В каталоге build/iso/boot/grub/ должен находиться grub.cfg, содержащий конфигурацию загрузки ядра через Multiboot 1. Если файл отсутствует, создайте его со следующим содержимым:
+Файл build/iso/boot/grub/grub.cfg с конфигурацией загрузки через Multiboot 1:
 
 set timeout=0
 set default=0
@@ -114,16 +112,9 @@ menuentry "Perfix" {
     boot
 }
 
-Создайте ISO:
+Создание ISO:
 
-grub-mkrescue \
-    --modules="multiboot" \
-    --fonts="" \
-    --locales="" \
-    --themes="" \
-    -o build/perfix-min.iso \
-    -d /usr/lib/grub/i386-pc \
-    build/iso
+grub-mkrescue --modules="multiboot" --fonts="" --locales="" --themes="" -o build/perfix-min.iso -d /usr/lib/grub/i386-pc build/iso
 
 Готовый образ будет находиться в build/perfix-min.iso.
 
