@@ -9,9 +9,9 @@ pub fn show_screen(message: Option<&[u8]>) {
     vga::print_at(
         2,
         0,
-        b"Commands: help, about, version, clear, divzero, pagefault,",
+        b"To see the list of commands, write help.",
     );
-    vga::print_at(3, 0, b"          diskinfo, mount, ls [path], cat <file>");
+    vga::print_at(3, 0, b"To change the keyboard layout to russian, press Alt+Shift.");
 
     if let Some(text) = message {
         vga::print_at(4, 0, text);
