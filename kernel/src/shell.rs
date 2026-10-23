@@ -115,7 +115,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row, 0, b"Available commands:");
         vga::print_at(output_row + 1, 0, b"help      - show commands");
         vga::print_at(output_row + 2, 0, b"about     - about Perfix");
-        vga::print_at(output_row + 3, 0, b"version   - kernel information");
+        vga::print_at(output_row + 3, 0, b"version   - OS information");
         vga::print_at(output_row + 4, 0, b"clear     - clear the screen");
         vga::print_at(output_row + 5, 0, b"divzero   - test CPU exception");
         vga::print_at(output_row + 6, 0, b"pagefault - test page fault");
@@ -130,7 +130,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(
             output_row,
             0,
-            b"Perfix is a bare-metal kernel written in Rust.",
+            b"Perfix is an Operating System written in Rust.",
         );
     } else if input == b"version" {
         vga::print_at(output_row, 0, version::KERNEL_NAME);
