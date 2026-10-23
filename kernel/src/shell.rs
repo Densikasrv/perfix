@@ -134,7 +134,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         );
     } else if input == b"version" {
         vga::print_at(output_row, 0, version::KERNEL_NAME);
-        vga::print_at(output_row + 1, 0, b"Kernel version: ");
+        vga::print_at(output_row + 1, 0, b"OS version: ");
         vga::print_at(output_row + 1, 16, version::KERNEL_VERSION);
         vga::print_at(output_row + 2, 0, b"Architecture: ");
         vga::print_at(output_row + 2, 13, version::ARCHITECTURE);
