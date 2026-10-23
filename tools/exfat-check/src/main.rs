@@ -475,7 +475,7 @@ fn lists_root_and_skips_broken_entry_sets() {
     let (disk, volume) = mounted();
     let root = resolve(&disk, &volume, b"/").expect("root");
 
-    let mut cursor = DirCursor::new(&volume, &disk, root.first_cluster, root.contiguous);
+    let mut cursor = DirCursor::new(&volume, &disk, root.first_cluster, root.contiguous, root.data_length);
     let mut names: Vec<(Vec<u8>, bool)> = Vec::new();
 
     while let Some(entry) = cursor.next_entry().expect("entry") {
@@ -761,6 +761,102 @@ fn finds_volume_inside_mbr_partition() {
 }
 
 #[test]
+fn scans_superfloppy_and_mbr_partitions() {
+    // Диск целиком formatted as exFAT.
+    let image = Image::new();
+    let disk = MemoryDisk::new(image.data);
+    let mut parts = [fs::PartitionInfo::empty(); fs::MAX_PARTITIONS];
+    let count = fs::scan_exfat_partitions(&disk, &mut parts).expect("scan");
+
+    assert_eq!(count, 1);
+    assert_eq!(parts[0].base_lba, 0);
+    assert_eq!(parts[0].volume_length, 49);
+
+    // Тот же том внутри MBR-раздела.
+    let image = Image::new();
+    let start_lba = 2048usize;
+    let mut data = vec![0u8; start_lba * SEC];
+    data.extend_from_slice(&image.data);
+    data[446 + 4] = 0x07;
+    data[446 + 8..446 + 12].copy_from_slice(&(start_lba as u32).to_le_bytes());
+    data[446 + 12..446 + 16]
+        .copy_from_slice(&((image.data.len() / SEC) as u32).to_le_bytes());
+    data[510] = 0x55;
+    data[511] = 0xAA;
+
+    let disk = MemoryDisk::new(data);
+    let mut parts = [fs::PartitionInfo::empty(); fs::MAX_PARTITIONS];
+    let count = fs::scan_exfat_partitions(&disk, &mut parts).expect("scan");
+
+    assert_eq!(count, 1);
+    assert_eq!(parts[0].base_lba, start_lba as u32);
+    assert_eq!(parts[0].sectors, (image.data.len() / SEC) as u64);
+    assert!(fs::mount_at(&disk, parts[0].base_lba).is_ok());
+}
+
+#[test]
+fn scans_gpt_and_extended_partitions() {
+    let image = Image::new();
+    let image_sectors = (image.data.len() / SEC) as u64;
+
+    // GPT: protective MBR + header + одна запись.
+    let start_lba = 2048usize;
+    let mut data = vec![0u8; start_lba * SEC];
+    data.extend_from_slice(&image.data);
+
+    data[446 + 4] = 0xEE;
+    data[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+    data[446 + 12..446 + 16].copy_from_slice(&2048u32.to_le_bytes());
+    data[510] = 0x55;
+    data[511] = 0xAA;
+
+    let header = 1 * SEC;
+    data[header..header + 8].copy_from_slice(b"EFI PART");
+    data[header + 72..header + 80].copy_from_slice(&2u64.to_le_bytes());
+    data[header + 80..header + 84].copy_from_slice(&1u32.to_le_bytes());
+    data[header + 84..header + 88].copy_from_slice(&128u32.to_le_bytes());
+
+    let entry = 2 * SEC;
+    data[entry] = 1; // non-empty type GUID
+    data[entry + 32..entry + 40]
+        .copy_from_slice(&(start_lba as u64).to_le_bytes());
+    data[entry + 40..entry + 48]
+        .copy_from_slice(&(start_lba as u64 + image_sectors - 1).to_le_bytes());
+
+    let disk = MemoryDisk::new(data);
+    let mut parts = [fs::PartitionInfo::empty(); fs::MAX_PARTITIONS];
+    let count = fs::scan_exfat_partitions(&disk, &mut parts).expect("gpt scan");
+    assert_eq!(count, 1);
+    assert_eq!(parts[0].base_lba, start_lba as u32);
+
+    // Extended MBR: EBR в LBA 100, логический раздел в LBA 101.
+    let image = Image::new();
+    let ebr_lba = 100usize;
+    let logical_lba = 101usize;
+    let mut data = vec![0u8; logical_lba * SEC];
+    data.extend_from_slice(&image.data);
+
+    data[446 + 4] = 0x05;
+    data[446 + 8..446 + 12].copy_from_slice(&(ebr_lba as u32).to_le_bytes());
+    data[510] = 0x55;
+    data[511] = 0xAA;
+
+    let ebr = ebr_lba * SEC;
+    data[ebr + 446 + 4] = 0x07;
+    data[ebr + 446 + 8..ebr + 446 + 12].copy_from_slice(&1u32.to_le_bytes());
+    data[ebr + 446 + 12..ebr + 446 + 16]
+        .copy_from_slice(&(image_sectors as u32).to_le_bytes());
+    data[ebr + 510] = 0x55;
+    data[ebr + 511] = 0xAA;
+
+    let disk = MemoryDisk::new(data);
+    let mut parts = [fs::PartitionInfo::empty(); fs::MAX_PARTITIONS];
+    let count = fs::scan_exfat_partitions(&disk, &mut parts).expect("ebr scan");
+    assert_eq!(count, 1);
+    assert_eq!(parts[0].base_lba, logical_lba as u32);
+}
+
+#[test]
 fn reports_corrupted_boot_checksum() {
     let mut image = Image::new();
 
@@ -830,7 +926,13 @@ fn creates_file_and_reads_it_back() {
     );
 
     let root = resolve(&reloaded, &volume2, b"/").expect("root");
-    let mut cursor = DirCursor::new(&volume2, &reloaded, root.first_cluster, root.contiguous);
+    let mut cursor = DirCursor::new(
+        &volume2,
+        &reloaded,
+        root.first_cluster,
+        root.contiguous,
+        root.data_length,
+    );
     let mut names = Vec::new();
 
     while let Some(entry) = cursor.next_entry().expect("entry") {
@@ -857,7 +959,13 @@ fn overwrites_existing_file() {
     assert_eq!(collect_file(&reloaded, &volume2, b"/doc.txt"), pattern);
 
     let root = resolve(&reloaded, &volume2, b"/").expect("root");
-    let mut cursor = DirCursor::new(&volume2, &reloaded, root.first_cluster, root.contiguous);
+    let mut cursor = DirCursor::new(
+        &volume2,
+        &reloaded,
+        root.first_cluster,
+        root.contiguous,
+        root.data_length,
+    );
     let mut count = 0usize;
 
     while cursor.next_entry().expect("entry").is_some() {
@@ -928,11 +1036,165 @@ fn creates_empty_file() {
 }
 
 #[test]
+fn creates_and_removes_empty_directory() {
+    let (disk, volume) = mounted();
+
+    assert_eq!(bitmap_byte(&disk, 0), 0x7F);
+
+    fs::make_directory(&disk, &volume, b"NEWDIR", 0).expect("mkdir");
+
+    let entry = resolve(&disk, &volume, b"/newdir").expect("new directory");
+    assert!(entry.is_directory());
+    assert!(entry.contiguous);
+    assert_eq!(entry.first_cluster, 9);
+    assert_eq!(entry.data_length, volume.cluster_bytes() as u64);
+
+    // Кластер 9 (бит 7) отмечен занятым.
+    assert_eq!(bitmap_byte(&disk, 0), 0xFF);
+
+    assert!(matches!(
+        fs::make_directory(&disk, &volume, b"NewDir", 0),
+        Err(FsError::AlreadyExists)
+    ));
+    assert!(matches!(
+        fs::make_directory(&disk, &volume, b"README.TXT", 0),
+        Err(FsError::AlreadyExists)
+    ));
+
+    // Каталог сохраняется после повторного монтирования и пуст.
+    let reloaded = MemoryDisk::new(disk.snapshot());
+    let volume2 = mount(&reloaded).expect("mount");
+    let entry = resolve(&reloaded, &volume2, b"/NEWDIR").expect("reloaded dir");
+
+    let mut cursor = DirCursor::new(
+        &volume2,
+        &reloaded,
+        entry.first_cluster,
+        entry.contiguous,
+        entry.data_length,
+    );
+    assert!(cursor.next_entry().expect("dir scan").is_none());
+
+    fs::remove_directory(&reloaded, &volume2, b"newdir").expect("rmdir");
+
+    assert!(matches!(
+        resolve(&reloaded, &volume2, b"/newdir"),
+        Err(FsError::PathNotFound)
+    ));
+    assert_eq!(bitmap_byte(&reloaded, 0), 0x7F);
+
+    // Освобождённый кластер снова выдаётся под новый каталог.
+    fs::make_directory(&reloaded, &volume2, b"AGAIN", 0).expect("second mkdir");
+    let again = resolve(&reloaded, &volume2, b"/again").expect("again");
+    assert!(again.is_directory());
+    assert_eq!(again.first_cluster, 9);
+}
+
+#[test]
+fn rejects_invalid_directory_operations() {
+    let (disk, volume) = mounted();
+
+    assert!(matches!(
+        fs::make_directory(&disk, &volume, b"a/b", 0),
+        Err(FsError::PathNotFound)
+    ));
+    assert!(matches!(
+        fs::make_directory(&disk, &volume, b"bad:name", 0),
+        Err(FsError::InvalidName)
+    ));
+    assert!(matches!(
+        fs::make_directory(&disk, &volume, b"", 0),
+        Err(FsError::InvalidName)
+    ));
+
+    assert!(matches!(
+        fs::remove_directory(&disk, &volume, b"SUBDIR"),
+        Err(FsError::DirectoryNotEmpty)
+    ));
+    assert!(matches!(
+        fs::remove_directory(&disk, &volume, b"readme.txt"),
+        Err(FsError::NotADirectory)
+    ));
+    assert!(matches!(
+        fs::remove_directory(&disk, &volume, b"missing"),
+        Err(FsError::PathNotFound)
+    ));
+
+    // Неудачное удаление не повредило непустой каталог.
+    assert_eq!(
+        collect_file(&disk, &volume, b"/SUBDIR/hello.txt"),
+        b"hello world\n"
+    );
+
+    // Файловые операции не должны затирать каталог.
+    assert!(matches!(
+        fs::write_file(&disk, &volume, b"SUBDIR", b"x", 0),
+        Err(FsError::NotAFile)
+    ));
+    assert!(matches!(
+        fs::remove_file(&disk, &volume, b"SUBDIR"),
+        Err(FsError::NotAFile)
+    ));
+    assert_eq!(
+        collect_file(&disk, &volume, b"/SUBDIR/hello.txt"),
+        b"hello world\n"
+    );
+}
+
+#[test]
+fn creates_nested_directories_and_files() {
+    let (disk, volume) = mounted();
+
+    fs::make_directory(&disk, &volume, b"PARENT", 0).expect("parent");
+    fs::make_directory(&disk, &volume, b"PARENT/CHILD", 0).expect("child");
+
+    assert!(matches!(
+        fs::remove_directory(&disk, &volume, b"PARENT"),
+        Err(FsError::DirectoryNotEmpty)
+    ));
+
+    fs::write_file(
+        &disk,
+        &volume,
+        b"PARENT/CHILD/nested.txt",
+        b"nested\n",
+        0,
+    )
+    .expect("nested file");
+
+    let reloaded = MemoryDisk::new(disk.snapshot());
+    let volume2 = mount(&reloaded).expect("mount");
+
+    assert_eq!(
+        collect_file(&reloaded, &volume2, b"/PARENT/CHILD/NESTED.TXT"),
+        b"nested\n"
+    );
+
+    assert!(matches!(
+        fs::remove_directory(&reloaded, &volume2, b"PARENT/CHILD"),
+        Err(FsError::DirectoryNotEmpty)
+    ));
+
+    fs::remove_file(&reloaded, &volume2, b"PARENT/CHILD/nested.txt").expect("remove nested");
+    fs::remove_directory(&reloaded, &volume2, b"PARENT/CHILD").expect("remove child");
+    fs::remove_directory(&reloaded, &volume2, b"PARENT").expect("remove parent");
+
+    assert!(matches!(
+        resolve(&reloaded, &volume2, b"/PARENT"),
+        Err(FsError::PathNotFound)
+    ));
+}
+
+#[test]
 fn rejects_invalid_names_and_reports_no_space() {
     let (disk, volume) = mounted();
 
     assert!(matches!(
         fs::write_file(&disk, &volume, b"a/b", b"x", 0),
+        Err(FsError::PathNotFound)
+    ));
+    assert!(matches!(
+        fs::write_file(&disk, &volume, b"bad:name", b"x", 0),
         Err(FsError::InvalidName)
     ));
     assert!(matches!(

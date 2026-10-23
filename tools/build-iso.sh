@@ -49,6 +49,10 @@ export RUSTFLAGS="-C link-arg=-T$KERNEL_DIR/linker.ld \
 -C link-arg=$TARGET_DIR/boot-gdt.o \
 -C link-arg=$TARGET_DIR/boot-idt.o"
 
+# boot.o и другие ассемблерные объекты не отслеживаются cargo,
+# поэтому принудительно обновляем метку времени исходника ядра.
+touch "$KERNEL_DIR/src/main.rs"
+
 # Набор флагов зависит от версии cargo: в одних nightly json-спека цели
 # требует -Z json-target-spec, в других флаг уже удалён. Поэтому сборка
 # сначала идёт без флага и повторяется с ним только при явной ошибке.
@@ -88,6 +92,8 @@ set timeout=0
 set default=0
 
 menuentry "Perfix" {
+    insmod all_video
+    set gfxpayload=1920x1080x32
     multiboot /boot/perfix.elf
     boot
 }

@@ -4,7 +4,7 @@
 
 mod fs;
 
-pub use fs::{FsError, Volume};
+pub use fs::{cp866_to_utf8, FsError, PartitionInfo, Volume, MAX_PARTITIONS};
 
 use crate::ata::{self, AtaError};
 use crate::vga;
@@ -45,8 +45,53 @@ impl fs::BlockDevice for AtaDevice {
     }
 }
 
+static mut SELECTED_BASE: Option<u32> = None;
+static mut SELECTED_INDEX: Option<usize> = None;
+
+fn selected_base() -> Option<u32> {
+    unsafe { SELECTED_BASE }
+}
+
+/// Выбранный раздел (0-based), либо `None`, если используется первый найденный.
+pub fn selected_partition() -> Option<usize> {
+    unsafe { SELECTED_INDEX }
+}
+
 fn mount_volume() -> Result<Volume, FsError> {
-    fs::mount(&AtaDevice)
+    match selected_base() {
+        Some(base) => fs::mount_at(&AtaDevice, base),
+        None => fs::mount(&AtaDevice),
+    }
+}
+
+/// Возвращает (общий размер, свободные байты) выбранного тома exFAT.
+pub fn space_info() -> Result<(u64, u64), FsError> {
+    let volume = mount_volume()?;
+    fs::volume_space(&AtaDevice, &volume)
+}
+
+/// Перечисляет найденные разделы exFAT.
+pub fn partition_list(out: &mut [PartitionInfo]) -> Result<usize, FsError> {
+    fs::scan_exfat_partitions(&AtaDevice, out)
+}
+
+/// Выбирает раздел по индексу (0-based) для всех файловых операций.
+pub fn select_partition(index: usize) -> Result<PartitionInfo, FsError> {
+    let mut partitions = [PartitionInfo::empty(); MAX_PARTITIONS];
+    let count = partition_list(&mut partitions)?;
+
+    if index >= count {
+        return Err(FsError::PartitionNotFound);
+    }
+
+    let partition = partitions[index];
+
+    unsafe {
+        SELECTED_BASE = Some(partition.base_lba);
+        SELECTED_INDEX = Some(index);
+    }
+
+    Ok(partition)
 }
 
 const VALUE_COLUMN: usize = 22;
@@ -287,7 +332,7 @@ fn format_entry(entry: &fs::Entry, out: &mut [u8; 80]) -> usize {
 }
 
 /// Максимум строк, которые команда `ls` выводит на экран.
-const LIST_MAX_LINES: usize = 15;
+const LIST_MAX_LINES: usize = 40;
 
 /// Команда `ls [path]`: список каталога.
 pub fn shell_list(path: &[u8], row: usize) -> usize {
@@ -322,10 +367,11 @@ pub fn shell_list(path: &[u8], row: usize) -> usize {
         &AtaDevice,
         directory.first_cluster,
         directory.contiguous,
+        directory.data_length,
     );
 
     loop {
-        if row + line > 23 {
+        if row + line >= vga::height() - 1 {
             break;
         }
 
@@ -479,34 +525,83 @@ pub fn shell_cat(path: &[u8], row: usize) -> usize {
     (text_row - row) + 1
 }
 
-/// Делит аргумент команды на имя файла и остаток текста.
-fn split_argument(argument: &[u8]) -> (&[u8], &[u8]) {
-    match argument.iter().position(|&byte| byte == b' ') {
-        Some(index) => (&argument[..index], trim_spaces(&argument[index + 1..])),
-        None => (argument, b""),
+/// Читает текстовый файл в буфер CP866 для полноэкранного редактора.
+///
+/// Возвращает длину текста и признак того, что файл не поместился в буфер.
+/// Символы `\r` отбрасываются, `\n` и `\t` сохраняются, остальные
+/// управляющие коды пропускаются.
+pub fn load_text_file(path: &[u8], out: &mut [u8]) -> Result<(usize, bool), FsError> {
+    let volume = mount_volume()?;
+    let file = fs::resolve(&AtaDevice, &volume, path)?;
+
+    if file.is_directory() {
+        return Err(FsError::NotAFile);
     }
+
+    let mut decoder = crate::utf8::Decoder::new();
+    let mut len = 0usize;
+    let mut truncated = false;
+
+    fs::read_file(&AtaDevice, &volume, &file, |chunk| {
+        for &byte in chunk {
+            let mut decoded = [0u8; 4];
+            let decoded_len = decoder.feed(byte, &mut decoded, fs::utf16_to_cp866);
+
+            for &code in &decoded[..decoded_len] {
+                if code == b'\r' {
+                    continue;
+                }
+
+                let keep = code == b'\n' || code == b'\t' || (code >= 0x20 && code != 0x7f);
+
+                if !keep {
+                    continue;
+                }
+
+                if len >= out.len() {
+                    truncated = true;
+                    return false;
+                }
+
+                out[len] = code;
+                len += 1;
+            }
+        }
+
+        true
+    })?;
+
+    Ok((len, truncated))
 }
 
-fn trim_spaces(input: &[u8]) -> &[u8] {
-    let mut start = 0usize;
-    let mut end = input.len();
-
-    while start < end && (input[start] == b' ' || input[start] == b'\t') {
-        start += 1;
+/// Записывает данные в файл по пути (UTF-8).
+pub fn save_file(path: &[u8], data: &[u8]) -> Result<(), FsError> {
+    if path.is_empty() {
+        return Err(FsError::InvalidName);
     }
 
-    while end > start && (input[end - 1] == b' ' || input[end - 1] == b'\t') {
-        end -= 1;
-    }
+    let volume = mount_volume()?;
 
-    &input[start..end]
+    fs::write_file(
+        &AtaDevice,
+        &volume,
+        path,
+        data,
+        crate::rtc::timestamp(),
+    )
+}
+
+/// Проверяет, что путь существует и указывает на каталог.
+pub fn path_is_directory(path: &[u8]) -> Result<bool, FsError> {
+    let volume = mount_volume()?;
+    let entry = fs::resolve(&AtaDevice, &volume, path)?;
+
+    Ok(entry.is_directory())
 }
 
 /// Команда `write <файл> <текст>`: создание или перезапись файла.
-pub fn shell_write(argument: &[u8], row: usize) -> usize {
-    let (name, text) = split_argument(argument);
-
-    if name.is_empty() {
+pub fn shell_write(path: &[u8], text: &[u8], row: usize) -> usize {
+    if path.is_empty() {
         vga::print_at(row, 0, b"Usage: write <file> <text>");
         return 1;
     }
@@ -523,7 +618,7 @@ pub fn shell_write(argument: &[u8], row: usize) -> usize {
     match fs::write_file(
         &AtaDevice,
         &volume,
-        name,
+        path,
         &utf8[..text_len],
         crate::rtc::timestamp(),
     ) {
@@ -531,7 +626,7 @@ pub fn shell_write(argument: &[u8], row: usize) -> usize {
             let mut line = [b' '; 80];
             let mut len = 0usize;
             push(&mut line, &mut len, b"written: ");
-            push(&mut line, &mut len, name);
+            push(&mut line, &mut len, path);
             push(&mut line, &mut len, b" (");
 
             let mut digits = [0u8; 20];
@@ -548,10 +643,8 @@ pub fn shell_write(argument: &[u8], row: usize) -> usize {
 }
 
 /// Команда `rm <файл>`: удаление файла.
-pub fn shell_remove(argument: &[u8], row: usize) -> usize {
-    let (name, _) = split_argument(argument);
-
-    if name.is_empty() {
+pub fn shell_remove(path: &[u8], row: usize) -> usize {
+    if path.is_empty() {
         vga::print_at(row, 0, b"Usage: rm <file>");
         return 1;
     }
@@ -561,12 +654,12 @@ pub fn shell_remove(argument: &[u8], row: usize) -> usize {
         Err(error) => return print_error(row, error),
     };
 
-    match fs::remove_file(&AtaDevice, &volume, name) {
+    match fs::remove_file(&AtaDevice, &volume, path) {
         Ok(()) => {
             let mut line = [b' '; 80];
             let mut len = 0usize;
             push(&mut line, &mut len, b"removed: ");
-            push(&mut line, &mut len, name);
+            push(&mut line, &mut len, path);
             vga::print_at(row, 0, &line[..len]);
 
             1
@@ -575,5 +668,158 @@ pub fn shell_remove(argument: &[u8], row: usize) -> usize {
     }
 }
 
+
+
+/// Команда `mkdir <каталог>`: создание каталога по указанному пути.
+pub fn shell_mkdir(path: &[u8], row: usize) -> usize {
+    if path.is_empty() {
+        vga::print_at(row, 0, b"Usage: mkdir <dir>");
+        return 1;
+    }
+
+    let volume = match mount_volume() {
+        Ok(volume) => volume,
+        Err(error) => return print_error(row, error),
+    };
+
+    match fs::make_directory(&AtaDevice, &volume, path, crate::rtc::timestamp()) {
+        Ok(()) => {
+            let mut line = [b' '; 80];
+            let mut len = 0usize;
+            push(&mut line, &mut len, b"created dir: ");
+            push(&mut line, &mut len, path);
+            vga::print_at(row, 0, &line[..len]);
+
+            1
+        }
+        Err(error) => print_error(row, error),
+    }
+}
+
+fn push_dec_value<const N: usize>(out: &mut [u8; N], len: &mut usize, value: u64) {
+    let mut digits = [0u8; 20];
+    let count = write_dec(value, &mut digits);
+    push(out, len, &digits[..count]);
+}
+
+fn push_size<const N: usize>(out: &mut [u8; N], len: &mut usize, sectors: u64) {
+    let bytes = sectors.saturating_mul(fs::SECTOR_SIZE as u64);
+
+    if bytes == 0 {
+        push(out, len, b"0 B");
+        return;
+    }
+
+    let (unit, suffix): (u64, &[u8]) = if bytes >= 1 << 30 {
+        (1 << 30, b" GiB")
+    } else if bytes >= 1 << 20 {
+        (1 << 20, b" MiB")
+    } else if bytes >= 1 << 10 {
+        (1 << 10, b" KiB")
+    } else {
+        (1, b" B")
+    };
+
+    let whole = bytes / unit;
+    push_dec_value(out, len, whole);
+
+    if unit >= 1 << 10 {
+        let tenths = (bytes % unit) * 10 / unit;
+
+        if tenths > 0 {
+            push(out, len, b".");
+            push(out, len, &[b'0' + tenths as u8]);
+        }
+    }
+
+    push(out, len, suffix);
+}
+
+fn push_hex32<const N: usize>(out: &mut [u8; N], len: &mut usize, value: u32) {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+
+    push(out, len, b"0x");
+
+    for index in 0..8 {
+        let shift = (7 - index) * 4;
+        push(
+            out,
+            len,
+            &[DIGITS[((value >> shift) & 0xf) as usize]],
+        );
+    }
+}
+
+/// Команда `listpart`: список найденных разделов exFAT и их размеров.
+pub fn shell_listpart(row: usize) -> usize {
+    let mut partitions = [PartitionInfo::empty(); MAX_PARTITIONS];
+
+    let count = match partition_list(&mut partitions) {
+        Ok(count) => count,
+        Err(error) => return print_error(row, error),
+    };
+
+    if count == 0 {
+        vga::print_at(row, 0, b"No exFAT partitions found");
+        return 1;
+    }
+
+    let current = match selected_partition() {
+        Some(index) if index < count => index,
+        _ => 0,
+    };
+
+    let mut header = [b' '; 80];
+    let mut header_len = 0usize;
+    push(&mut header, &mut header_len, b"exFAT partitions: ");
+    push_dec_value(&mut header, &mut header_len, count as u64);
+    vga::print_at(row, 0, &header[..header_len]);
+
+    for (index, partition) in partitions[..count].iter().enumerate() {
+        let mut line = [b' '; 80];
+        let mut len = 0usize;
+
+        push(
+            &mut line,
+            &mut len,
+            if index == current { b"* " } else { b"  " },
+        );
+        push_dec_value(&mut line, &mut len, (index + 1) as u64);
+        push(&mut line, &mut len, b"  LBA ");
+        push_dec_value(&mut line, &mut len, partition.base_lba as u64);
+        push(&mut line, &mut len, b"  size ");
+        push_size(&mut line, &mut len, partition.sectors);
+        push(&mut line, &mut len, b"  serial ");
+        push_hex32(&mut line, &mut len, partition.serial);
+
+        vga::print_at(row + 1 + index, 0, &line[..len]);
+    }
+
+    count + 1
+}
+pub fn shell_rmdir(path: &[u8], row: usize) -> usize {
+    if path.is_empty() {
+        vga::print_at(row, 0, b"Usage: rmdir <dir>");
+        return 1;
+    }
+
+    let volume = match mount_volume() {
+        Ok(volume) => volume,
+        Err(error) => return print_error(row, error),
+    };
+
+    match fs::remove_directory(&AtaDevice, &volume, path) {
+        Ok(()) => {
+            let mut line = [b' '; 80];
+            let mut len = 0usize;
+            push(&mut line, &mut len, b"removed dir: ");
+            push(&mut line, &mut len, path);
+            vga::print_at(row, 0, &line[..len]);
+
+            1
+        }
+        Err(error) => print_error(row, error),
+    }
+}
 
 

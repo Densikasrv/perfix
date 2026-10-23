@@ -10,15 +10,30 @@ section .multiboot
 align 4
 
     dd 0x1BADB002
-    dd 0x00000003
-    dd -(0x1BADB002 + 0x00000003)
+    ; ALIGN | MEMINFO | VIDEO
+    dd 0x00000007
+    dd -(0x1BADB002 + 0x00000007)
 
-; Reserve 16 KiB for the initial kernel stack.
+    ; a.out kludge fields (not used)
+    dd 0, 0, 0, 0, 0
+
+    ; Request a linear graphics mode: 1920x1080x32.
+    dd 0
+    dd 1920
+    dd 1080
+    dd 32
+
+; Reserve 64 KiB for the initial kernel stack.
+; The stack sits in .bss directly below kernel statics, so it must have
+; enough headroom for the deepest path: shell -> exFAT write -> bitmap.
 section .bss
 align 16
 
+multiboot_info:
+    resd 1
+
 stack_bottom:
-    resb 16384
+    resb 65536
 stack_top:
 
 ; Actual kernel entry point.
@@ -32,6 +47,7 @@ _start:
 
     mov esp, stack_top
     xor ebp, ebp
+    mov [multiboot_info], ebx
 
     ; Show S: reached the assembly entry point.
     mov dword [0xB8000], 0x0F530F53
@@ -39,6 +55,7 @@ _start:
     ; Show R: about to call Rust.
     mov dword [0xB8004], 0x0F520F52
 
+    push dword [multiboot_info]
     call perfix_main
 
 .hang:

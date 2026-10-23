@@ -1,11 +1,38 @@
-//! Ядро файловой системы exFAT (только чтение).
+//! Ядро файловой системы exFAT.
 //!
 //! Модуль не зависит от остального ядра: весь доступ к диску выполняется
-//! через трейт [`BlockReader`], поэтому логику можно проверять на хосте
-//! подменой устройства чтения.
+//! через трейты [`BlockReader`] и [`BlockDevice`], поэтому логику можно
+//! проверять на хосте подменой устройства.
 //!
 //! Поддерживается стандартная конфигурация exFAT: сектор 512 байт,
-//! один FAT, записи FAT по 4 байта. Запись на диск не реализована.
+//! один FAT, записи FAT по 4 байта. Реализованы чтение, запись и удаление
+//! файлов, а также создание и удаление каталогов по произвольному пути.
+
+/// Возвращает (общий размер тома, свободные байты данных).
+///
+/// Свободное место считается по битовой карте распределения кластеров.
+pub fn volume_space(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+) -> Result<(u64, u64), FsError> {
+    let reader: &dyn BlockReader = device;
+    let bitmap = find_allocation_bitmap(reader, volume)?;
+    let mut window = BitmapWindow::new(device, volume, bitmap);
+    let mut free_clusters = 0u64;
+
+    for index in 0..volume.cluster_count {
+        if !window.bit(index)? {
+            free_clusters += 1;
+        }
+    }
+
+    let free_bytes = free_clusters.saturating_mul(volume.cluster_bytes() as u64);
+    let total_bytes = volume
+        .volume_length
+        .saturating_mul(SECTOR_SIZE as u64);
+
+    Ok((total_bytes, free_bytes))
+}
 
 /// Размер сектора, с которым работает драйвер.
 pub const SECTOR_SIZE: usize = 512;
@@ -78,6 +105,9 @@ pub enum FsError {
     TruncatedChain,
     NoSpace,
     InvalidName,
+    AlreadyExists,
+    DirectoryNotEmpty,
+    PartitionNotFound,
 }
 
 impl From<BlockError> for FsError {
@@ -105,6 +135,9 @@ impl FsError {
             FsError::TruncatedChain => b"broken cluster chain",
             FsError::NoSpace => b"no free space",
             FsError::InvalidName => b"invalid file name",
+            FsError::AlreadyExists => b"already exists",
+            FsError::DirectoryNotEmpty => b"directory not empty",
+            FsError::PartitionNotFound => b"partition not found",
         }
     }
 }
@@ -370,6 +403,228 @@ impl Volume {
     }
 }
 
+/// Максимум разделов, которые может перечислить `listpart`.
+pub const MAX_PARTITIONS: usize = 16;
+
+/// Найденный раздел exFAT.
+#[derive(Clone, Copy)]
+pub struct PartitionInfo {
+    pub base_lba: u32,
+    /// Размер раздела в секторах (из таблицы разделов или загрузочного сектора).
+    pub sectors: u64,
+    pub volume_length: u64,
+    pub serial: u32,
+}
+
+impl PartitionInfo {
+    pub const fn empty() -> PartitionInfo {
+        PartitionInfo {
+            base_lba: 0,
+            sectors: 0,
+            volume_length: 0,
+            serial: 0,
+        }
+    }
+}
+
+/// Монтирует том exFAT по известному LBA начала.
+pub fn mount_at(device: &dyn BlockReader, base_lba: u32) -> Result<Volume, FsError> {
+    let mut boot = [0u8; SECTOR_SIZE];
+    device.read_sector(base_lba, &mut boot)?;
+    Volume::parse(base_lba, &boot, device)
+}
+
+fn add_partition(
+    device: &dyn BlockReader,
+    base_lba: u32,
+    sectors: u64,
+    out: &mut [PartitionInfo],
+    count: &mut usize,
+) {
+    for index in 0..*count {
+        if out[index].base_lba == base_lba {
+            return;
+        }
+    }
+
+    if *count >= out.len() {
+        return;
+    }
+
+    let mut boot = [0u8; SECTOR_SIZE];
+
+    if device.read_sector(base_lba, &mut boot).is_err() || !is_exfat_boot(&boot) {
+        return;
+    }
+
+    let volume_length = read_u64(&boot, 72);
+    let table_sectors = if sectors != 0 {
+        sectors
+    } else {
+        volume_length
+    };
+
+    out[*count] = PartitionInfo {
+        base_lba,
+        sectors: table_sectors,
+        volume_length,
+        serial: read_u32(&boot, 100),
+    };
+    *count += 1;
+}
+
+fn scan_gpt(
+    device: &dyn BlockReader,
+    out: &mut [PartitionInfo],
+    count: &mut usize,
+) {
+    let mut header = [0u8; SECTOR_SIZE];
+
+    if device.read_sector(1, &mut header).is_err() || &header[..8] != b"EFI PART" {
+        return;
+    }
+
+    let entries_lba = read_u64(&header, 72);
+    let entries_count = read_u32(&header, 80) as usize;
+    let entry_size = read_u32(&header, 84) as usize;
+
+    if entry_size < 128 || entries_lba > 0x0FFF_FFFF {
+        return;
+    }
+
+    let entries_lba = entries_lba as u32;
+    let limit = entries_count.min(128);
+
+    for index in 0..limit {
+        let byte_offset = entries_lba as u64 * SECTOR_SIZE as u64
+            + index as u64 * entry_size as u64;
+        let sector_index = byte_offset / SECTOR_SIZE as u64;
+        let offset = (byte_offset % SECTOR_SIZE as u64) as usize;
+
+        if sector_index > 0x0FFF_FFFF || offset + 128 > SECTOR_SIZE {
+            continue;
+        }
+
+        let mut entry = [0u8; SECTOR_SIZE];
+
+        if device.read_sector(sector_index as u32, &mut entry).is_err() {
+            continue;
+        }
+
+        if entry[offset..offset + 16].iter().all(|&byte| byte == 0) {
+            continue;
+        }
+
+        let first_lba = read_u64(&entry, offset + 32);
+        let last_lba = read_u64(&entry, offset + 40);
+
+        if first_lba == 0 || last_lba < first_lba || first_lba > u32::MAX as u64 {
+            continue;
+        }
+
+        add_partition(
+            device,
+            first_lba as u32,
+            last_lba - first_lba + 1,
+            out,
+            count,
+        );
+    }
+}
+
+fn scan_extended(
+    device: &dyn BlockReader,
+    extended_base: u32,
+    out: &mut [PartitionInfo],
+    count: &mut usize,
+) {
+    let mut ebr_lba = extended_base;
+
+    for _ in 0..32 {
+        let mut ebr = [0u8; SECTOR_SIZE];
+
+        if device.read_sector(ebr_lba, &mut ebr).is_err()
+            || read_u16(&ebr, 510) != 0xAA55
+        {
+            return;
+        }
+
+        let first = 446;
+        let first_type = ebr[first + 4];
+        let first_start = read_u32(&ebr, first + 8);
+        let first_sectors = read_u32(&ebr, first + 12) as u64;
+
+        if first_type != 0 && first_type != 0x05 && first_type != 0x0F && first_start != 0 {
+            if let Some(lba) = ebr_lba.checked_add(first_start) {
+                add_partition(device, lba, first_sectors, out, count);
+            }
+        }
+
+        let next = 462;
+        let next_type = ebr[next + 4];
+        let next_start = read_u32(&ebr, next + 8);
+
+        if (next_type != 0x05 && next_type != 0x0F) || next_start == 0 {
+            return;
+        }
+
+        let Some(next_lba) = extended_base.checked_add(next_start) else {
+            return;
+        };
+
+        if next_lba == ebr_lba {
+            return;
+        }
+
+        ebr_lba = next_lba;
+    }
+}
+
+/// Перечисляет все найденные разделы exFAT на устройстве.
+pub fn scan_exfat_partitions(
+    device: &dyn BlockReader,
+    out: &mut [PartitionInfo],
+) -> Result<usize, FsError> {
+    let mut count = 0usize;
+    let mut mbr = [0u8; SECTOR_SIZE];
+    device.read_sector(0, &mut mbr)?;
+
+    if is_exfat_boot(&mbr) {
+        add_partition(device, 0, 0, out, &mut count);
+        return Ok(count);
+    }
+
+    if read_u16(&mbr, 510) != 0xAA55 {
+        return Ok(0);
+    }
+
+    let mut has_gpt = false;
+
+    for index in 0..4 {
+        let offset = 446 + index * 16;
+        let status = mbr[offset];
+        let kind = mbr[offset + 4];
+        let start = read_u32(&mbr, offset + 8);
+        let sectors = read_u32(&mbr, offset + 12) as u64;
+
+        if (status != 0x00 && status != 0x80) || kind == 0 || start == 0 {
+            continue;
+        }
+
+        match kind {
+            0xEE => has_gpt = true,
+            0x05 | 0x0F => scan_extended(device, start, out, &mut count),
+            _ => add_partition(device, start, sectors, out, &mut count),
+        }
+    }
+
+    if has_gpt {
+        scan_gpt(device, out, &mut count);
+    }
+
+    Ok(count)
+}
+
 /// Монтирует первый найденный том exFAT: либо диск целиком, либо первый
 /// раздел MBR, содержащий exFAT.
 pub fn mount(device: &dyn BlockReader) -> Result<Volume, FsError> {
@@ -470,47 +725,14 @@ impl Volume {
 
 /// Ищет начало тома: сначала проверяет сектор 0, затем таблицу разделов MBR.
 fn find_volume_base(device: &dyn BlockReader) -> Result<u32, FsError> {
-    let mut sector = [0u8; SECTOR_SIZE];
-    device.read_sector(0, &mut sector)?;
+    let mut partitions = [PartitionInfo::empty(); MAX_PARTITIONS];
+    let count = scan_exfat_partitions(device, &mut partitions)?;
 
-    if is_exfat_boot(&sector) {
-        return Ok(0);
-    }
-
-    if read_u16(&sector, 510) != 0xAA55 {
+    if count == 0 {
         return Err(FsError::NotExfat);
     }
 
-    for index in 0..4 {
-        let offset = 446 + index * 16;
-        let status = sector[offset];
-
-        if status != 0x00 && status != 0x80 {
-            continue;
-        }
-
-        if sector[offset + 4] == 0 {
-            continue;
-        }
-
-        let start = read_u32(&sector, offset + 8);
-
-        if start == 0 {
-            continue;
-        }
-
-        let mut probe = [0u8; SECTOR_SIZE];
-
-        if device.read_sector(start, &mut probe).is_err() {
-            continue;
-        }
-
-        if is_exfat_boot(&probe) {
-            return Ok(start);
-        }
-    }
-
-    Err(FsError::NotExfat)
+    Ok(partitions[0].base_lba)
 }
 
 /// Проверяет контрольную сумму загрузочного региона (11 секторов).
@@ -647,6 +869,8 @@ pub struct DirCursor<'a> {
     entry_index: usize,
     sector_loaded: bool,
     cluster_steps: u32,
+    /// Количество кластеров, доступных курсору (граница потока каталога).
+    max_clusters: u32,
     finished: bool,
     /// Сколько 32-байтовых записей уже выдано (позиция в каталоге).
     records: usize,
@@ -662,7 +886,21 @@ impl<'a> DirCursor<'a> {
         device: &'a dyn BlockReader,
         first_cluster: u32,
         contiguous: bool,
+        data_length: u64,
     ) -> DirCursor<'a> {
+        let cluster_bytes = volume.cluster_bytes() as u64;
+        let max_clusters = if contiguous {
+            if data_length == 0 {
+                1
+            } else {
+                ((data_length + cluster_bytes - 1) / cluster_bytes) as u32
+            }
+            .max(1)
+            .min(volume.cluster_count)
+        } else {
+            volume.cluster_count
+        };
+
         DirCursor {
             volume,
             device,
@@ -673,6 +911,7 @@ impl<'a> DirCursor<'a> {
             entry_index: 0,
             sector_loaded: false,
             cluster_steps: 0,
+            max_clusters,
             finished: false,
             records: 0,
         }
@@ -700,7 +939,7 @@ impl<'a> DirCursor<'a> {
             return Ok(true);
         }
 
-        if self.cluster_steps >= self.volume.cluster_count {
+        if self.cluster_steps + 1 >= self.max_clusters {
             self.finished = true;
             return Ok(false);
         }
@@ -886,7 +1125,13 @@ pub fn resolve(
         }
 
         let mut cursor =
-            DirCursor::new(volume, device, current.first_cluster, current.contiguous);
+            DirCursor::new(
+                volume,
+                device,
+                current.first_cluster,
+                current.contiguous,
+                current.data_length,
+            );
         let mut found = None;
 
         while let Some(entry) = cursor.next_entry()? {
@@ -1021,7 +1266,7 @@ fn find_allocation_bitmap(
     device: &dyn BlockReader,
     volume: &Volume,
 ) -> Result<AllocationBitmap, FsError> {
-    let mut cursor = DirCursor::new(volume, device, volume.root_cluster, false);
+    let mut cursor = DirCursor::new(volume, device, volume.root_cluster, false, 0);
 
     while let Some(record) = cursor.next_record()? {
         if record[0] == ENTRY_END {
@@ -1246,6 +1491,7 @@ const MAX_ENTRY_SET: usize = 20;
 /// Собирает набор записей 0x85 + 0xC0 + 0xC1 с корректным SetChecksum.
 fn build_entry_set(
     units: &[u16],
+    attributes: u16,
     first_cluster: u32,
     data_length: u64,
     timestamp: u32,
@@ -1262,7 +1508,7 @@ fn build_entry_set(
     // Основная запись файла.
     set[0][0] = ENTRY_FILE;
     set[0][1] = (1 + name_entries) as u8;
-    set[0][4..6].copy_from_slice(&0x0020u16.to_le_bytes()); // archive
+    set[0][4..6].copy_from_slice(&attributes.to_le_bytes());
 
     for offset in [8usize, 12, 16] {
         set[0][offset..offset + 4].copy_from_slice(&timestamp.to_le_bytes());
@@ -1307,20 +1553,37 @@ fn build_entry_set(
     Ok((set, count))
 }
 
-/// Ищет свободные слоты в корневом каталоге.
+/// Ищет свободные слоты в указанном каталоге.
 ///
 /// Возвращает индекс первой 32-байтовой записи; набор может пересекать
 /// границы секторов, поэтому поиск идёт по всему потоку каталога.
 fn find_free_slots(
     device: &dyn BlockReader,
     volume: &Volume,
+    directory: &Entry,
     count: usize,
 ) -> Result<usize, FsError> {
     let mut index = 0usize;
     let mut run = 0usize;
     let mut start = 0usize;
-    let mut cluster = volume.root_cluster;
+    let mut cluster = directory.first_cluster;
     let mut steps = 0u32;
+
+    // Для непрерывного каталога границей служит его DataLength:
+    // у NoFatChain нет маркера конца, иначе поиск уйдёт за пределы потока.
+    let max_clusters = if directory.contiguous {
+        let cluster_bytes = volume.cluster_bytes() as u64;
+
+        if directory.data_length == 0 {
+            1
+        } else {
+            ((directory.data_length + cluster_bytes - 1) / cluster_bytes) as u32
+        }
+        .max(1)
+        .min(volume.cluster_count)
+    } else {
+        volume.cluster_count
+    };
 
     loop {
         let base = volume.cluster_lba(cluster)?;
@@ -1354,11 +1617,11 @@ fn find_free_slots(
             }
         }
 
-        if steps >= volume.cluster_count {
+        if steps + 1 >= max_clusters {
             break;
         }
 
-        match volume.next_cluster(device, cluster, false)? {
+        match volume.next_cluster(device, cluster, directory.contiguous)? {
             Some(next) => {
                 cluster = next;
                 steps += 1;
@@ -1374,11 +1637,12 @@ fn find_free_slots(
 fn write_entry_set(
     device: &dyn BlockDevice,
     volume: &Volume,
+    directory: &Entry,
     start_index: usize,
     entries: &[[u8; ENTRY_SIZE]],
 ) -> Result<(), FsError> {
     let entries_per_cluster = volume.sectors_per_cluster as usize * ENTRIES_PER_SECTOR;
-    let mut cluster = volume.root_cluster;
+    let mut cluster = directory.first_cluster;
     let mut cluster_index = 0usize;
     let mut sector = [0u8; SECTOR_SIZE];
     let mut loaded_lba: Option<u32> = None;
@@ -1391,7 +1655,7 @@ fn write_entry_set(
         let slot = within % ENTRIES_PER_SECTOR;
 
         while cluster_index < target_cluster {
-            let Some(next) = volume.next_cluster(device, cluster, false)? else {
+            let Some(next) = volume.next_cluster(device, cluster, directory.contiguous)? else {
                 return Err(FsError::BadGeometry);
             };
 
@@ -1461,13 +1725,40 @@ fn write_data(
     Ok(())
 }
 
-/// Ищет запись файла в корневом каталоге.
+/// Заполняет кластер нулями (пустой каталог).
+fn zero_cluster(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    cluster: u32,
+) -> Result<(), FsError> {
+    let base = volume.cluster_lba(cluster)?;
+    let empty = [0u8; SECTOR_SIZE];
+
+    for sector_offset in 0..volume.sectors_per_cluster {
+        let lba = base
+            .checked_add(sector_offset)
+            .ok_or(FsError::BadGeometry)?;
+
+        device.write_sector(lba, &empty)?;
+    }
+
+    Ok(())
+}
+
+/// Ищет запись по имени в указанном каталоге.
 fn find_entry(
     device: &dyn BlockReader,
     volume: &Volume,
+    directory: &Entry,
     name: &[u8],
 ) -> Result<Option<(Entry, usize)>, FsError> {
-    let mut cursor = DirCursor::new(volume, device, volume.root_cluster, false);
+    let mut cursor = DirCursor::new(
+        volume,
+        device,
+        directory.first_cluster,
+        directory.contiguous,
+        directory.data_length,
+    );
 
     loop {
         let Some(entry) = cursor.next_entry()? else {
@@ -1484,12 +1775,13 @@ fn find_entry(
 fn delete_entry_set(
     device: &dyn BlockDevice,
     volume: &Volume,
+    directory: &Entry,
     start: usize,
     count: usize,
 ) -> Result<(), FsError> {
     let end = start + count;
     let mut index = 0usize;
-    let mut cluster = volume.root_cluster;
+    let mut cluster = directory.first_cluster;
     let mut steps = 0u32;
 
     loop {
@@ -1518,13 +1810,17 @@ fn delete_entry_set(
             if changed {
                 device.write_sector(lba, &sector)?;
             }
+
+            if index >= end {
+                return Ok(());
+            }
         }
 
-        if steps >= volume.cluster_count {
+        if steps + 1 >= volume.cluster_count {
             break;
         }
 
-        match volume.next_cluster(device, cluster, false)? {
+        match volume.next_cluster(device, cluster, directory.contiguous)? {
             Some(next) => {
                 cluster = next;
                 steps += 1;
@@ -1536,7 +1832,38 @@ fn delete_entry_set(
     Ok(())
 }
 
-/// Создаёт файл в корневом каталоге или перезаписывает существующий.
+/// Разделяет путь на родительский каталог и имя последнего компонента.
+fn resolve_parent<'a>(
+    device: &dyn BlockReader,
+    volume: &Volume,
+    path: &'a [u8],
+) -> Result<(Entry, &'a [u8]), FsError> {
+    let split = path.iter().rposition(|&byte| byte == b'/');
+
+    let (parent_path, name) = match split {
+        Some(0) => (&path[..1], &path[1..]),
+        Some(index) => (&path[..index], &path[index + 1..]),
+        None => (&path[..0], path),
+    };
+
+    if name.is_empty() {
+        return Err(FsError::InvalidName);
+    }
+
+    let parent = if parent_path.is_empty() || parent_path == b"/" {
+        Entry::root(volume)
+    } else {
+        resolve(device, volume, parent_path)?
+    };
+
+    if !parent.is_directory() {
+        return Err(FsError::NotADirectory);
+    }
+
+    Ok((parent, name))
+}
+
+/// Создаёт файл по пути или перезаписывает существующий.
 ///
 /// Кластеры выделяются непрерывно (NoFatChain), битовая карта
 /// распределения обновляется. `timestamp` — упакованные дата и время
@@ -1544,11 +1871,12 @@ fn delete_entry_set(
 pub fn write_file(
     device: &dyn BlockDevice,
     volume: &Volume,
-    name: &[u8],
+    path: &[u8],
     data: &[u8],
     timestamp: u32,
 ) -> Result<(), FsError> {
     let reader: &dyn BlockReader = device;
+    let (parent, name) = resolve_parent(reader, volume, path)?;
     let (units, units_len) = encode_name(name)?;
     let bitmap = find_allocation_bitmap(reader, volume)?;
 
@@ -1558,6 +1886,7 @@ pub fn write_file(
         device,
         volume,
         bitmap,
+        &parent,
         name,
         &units[..units_len],
         data,
@@ -1580,6 +1909,7 @@ fn write_file_inner(
     device: &dyn BlockDevice,
     volume: &Volume,
     bitmap: AllocationBitmap,
+    directory: &Entry,
     name: &[u8],
     units: &[u16],
     data: &[u8],
@@ -1588,7 +1918,11 @@ fn write_file_inner(
     let reader: &dyn BlockReader = device;
     let mut window = BitmapWindow::new(device, volume, bitmap);
 
-    if let Some((entry, index)) = find_entry(reader, volume, name)? {
+    if let Some((entry, index)) = find_entry(reader, volume, directory, name)? {
+        if entry.is_directory() {
+            return Err(FsError::NotAFile);
+        }
+
         free_clusters(
             device,
             volume,
@@ -1598,7 +1932,13 @@ fn write_file_inner(
             entry.contiguous,
         )?;
 
-        delete_entry_set(device, volume, index, 1 + entry.secondary_count)?;
+        delete_entry_set(
+            device,
+            volume,
+            directory,
+            index,
+            1 + entry.secondary_count,
+        )?;
     }
 
     let first_cluster = if data.is_empty() {
@@ -1611,25 +1951,36 @@ fn write_file_inner(
         first
     };
 
-    let (set, count) = build_entry_set(units, first_cluster, data.len() as u64, timestamp)?;
-    let start = find_free_slots(reader, volume, count)?;
+    let (set, count) = build_entry_set(
+        units,
+        0x0020, // archive
+        first_cluster,
+        data.len() as u64,
+        timestamp,
+    )?;
+    let start = find_free_slots(reader, volume, directory, count)?;
 
-    write_entry_set(device, volume, start, &set[..count])?;
+    write_entry_set(device, volume, directory, start, &set[..count])?;
 
     Ok(())
 }
 
-/// Удаляет файл из корневого каталога и освобождает его кластеры.
+/// Удаляет файл по пути и освобождает его кластеры.
 pub fn remove_file(
     device: &dyn BlockDevice,
     volume: &Volume,
-    name: &[u8],
+    path: &[u8],
 ) -> Result<(), FsError> {
     let reader: &dyn BlockReader = device;
+    let (parent, name) = resolve_parent(reader, volume, path)?;
 
-    let Some((entry, index)) = find_entry(reader, volume, name)? else {
+    let Some((entry, index)) = find_entry(reader, volume, &parent, name)? else {
         return Err(FsError::PathNotFound);
     };
+
+    if entry.is_directory() {
+        return Err(FsError::NotAFile);
+    }
 
     let bitmap = find_allocation_bitmap(reader, volume)?;
 
@@ -1645,7 +1996,161 @@ pub fn remove_file(
         entry.data_length,
         entry.contiguous,
     )
-    .and_then(|()| delete_entry_set(device, volume, index, 1 + entry.secondary_count));
+    .and_then(|()| {
+        delete_entry_set(
+            device,
+            volume,
+            &parent,
+            index,
+            1 + entry.secondary_count,
+        )
+    });
+
+    if result.is_err() {
+        let _ = device.flush();
+        return result;
+    }
+
+    volume.set_dirty(device, false)?;
+    device.flush()?;
+
+    Ok(())
+}
+
+
+/// Создаёт каталог по указанному пути.
+///
+/// Каталог получает один непрерывно выделенный нулевой кластер и набор
+/// записей с атрибутом Directory. `timestamp` — упакованные дата и время
+/// exFAT (см. `rtc::timestamp`).
+pub fn make_directory(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    path: &[u8],
+    timestamp: u32,
+) -> Result<(), FsError> {
+    let reader: &dyn BlockReader = device;
+    let (parent, name) = resolve_parent(reader, volume, path)?;
+    let (units, units_len) = encode_name(name)?;
+    let bitmap = find_allocation_bitmap(reader, volume)?;
+
+    volume.set_dirty(device, true)?;
+
+    let result = make_directory_inner(
+        device,
+        volume,
+        bitmap,
+        &parent,
+        name,
+        &units[..units_len],
+        timestamp,
+    );
+
+    if result.is_err() {
+        let _ = device.flush();
+        return result;
+    }
+
+    volume.set_dirty(device, false)?;
+    device.flush()?;
+
+    Ok(())
+}
+
+fn make_directory_inner(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    bitmap: AllocationBitmap,
+    directory: &Entry,
+    name: &[u8],
+    units: &[u16],
+    timestamp: u32,
+) -> Result<(), FsError> {
+    let reader: &dyn BlockReader = device;
+
+    if find_entry(reader, volume, directory, name)?.is_some() {
+        return Err(FsError::AlreadyExists);
+    }
+
+    // Количество записей набора не зависит от кластера, поэтому сначала
+    // находим место в каталоге, чтобы не выделять кластер впустую.
+    let (_, count) = build_entry_set(units, ATTR_DIRECTORY, 0, 0, timestamp)?;
+    let start = find_free_slots(reader, volume, directory, count)?;
+
+    let mut window = BitmapWindow::new(device, volume, bitmap);
+    let first_cluster = allocate_contiguous(&mut window, 1)?;
+    let data_length = volume.cluster_bytes() as u64;
+
+    zero_cluster(device, volume, first_cluster)?;
+
+    let (set, set_count) =
+        build_entry_set(units, ATTR_DIRECTORY, first_cluster, data_length, timestamp)?;
+
+    write_entry_set(device, volume, directory, start, &set[..set_count])?;
+
+    Ok(())
+}
+
+/// Удаляет пустой каталог по указанному пути и освобождает его кластеры.
+pub fn remove_directory(
+    device: &dyn BlockDevice,
+    volume: &Volume,
+    path: &[u8],
+) -> Result<(), FsError> {
+    let reader: &dyn BlockReader = device;
+    let (parent, name) = resolve_parent(reader, volume, path)?;
+
+    let Some((entry, index)) = find_entry(reader, volume, &parent, name)? else {
+        return Err(FsError::PathNotFound);
+    };
+
+    if !entry.is_directory() {
+        return Err(FsError::NotADirectory);
+    }
+
+    // Пустой каталог может иметь DataLength = 0, но при этом валидный
+    // первый кластер — поэтому проверяем содержимое всегда, когда кластер есть.
+    let empty = if entry.first_cluster == 0 {
+        true
+    } else {
+        let mut cursor = DirCursor::new(
+            volume,
+            reader,
+            entry.first_cluster,
+            entry.contiguous,
+            entry.data_length,
+        );
+
+        cursor.next_entry()?.is_none()
+    };
+
+    if !empty {
+        return Err(FsError::DirectoryNotEmpty);
+    }
+
+    let bitmap = find_allocation_bitmap(reader, volume)?;
+
+    volume.set_dirty(device, true)?;
+
+    let mut window = BitmapWindow::new(device, volume, bitmap);
+
+    let result = free_clusters(
+        device,
+        volume,
+        &mut window,
+        entry.first_cluster,
+        entry.data_length,
+        entry.contiguous,
+    )
+    .and_then(|()| {
+        delete_entry_set(
+            device,
+            volume,
+            &parent,
+            index,
+            1 + entry.secondary_count,
+        )
+    });
 
     if result.is_err() {
         let _ = device.flush();

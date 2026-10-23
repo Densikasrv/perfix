@@ -5,6 +5,19 @@ pub enum Key {
     Character(u8),
     Enter,
     Backspace,
+    Delete,
+    Tab,
+    Escape,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    /// Ctrl+<буква>; буква всегда латинская в нижнем регистре.
+    Control(u8),
     /// Переключена раскладка (Right Ctrl).
     LayoutChanged,
     None,
@@ -19,6 +32,7 @@ pub enum Layout {
 
 static mut SHIFT_PRESSED: bool = false;
 static mut ALT_PRESSED: bool = false;
+static mut CTRL_PRESSED: bool = false;
 static mut COMBO_ACTIVE: bool = false;
 static mut LAYOUT: Layout = Layout::English;
 static mut EXTENDED: bool = false;
@@ -99,6 +113,17 @@ pub(crate) fn keyboard_char(sc: u8, shift: bool) -> Option<u8> {
     };
 
     Some(ch)
+}
+
+/// Переводит скан-код буквы в латинскую букву для Ctrl-комбинаций.
+fn control_char(sc: u8) -> Option<u8> {
+    let ch = keyboard_char(sc, false)?;
+
+    if ch.is_ascii_lowercase() {
+        Some(ch)
+    } else {
+        None
+    }
 }
 
 /// Активная раскладка.
@@ -236,16 +261,34 @@ pub fn read_key() -> Key {
         if EXTENDED {
             EXTENDED = false;
 
-            // Правый Ctrl переключает EN/RU.
-            if sc == 0x1D {
-                toggle_layout();
-                return Key::LayoutChanged;
-            }
-
-            return Key::None;
+            return match sc {
+                // Правый Ctrl переключает EN/RU.
+                0x1D => {
+                    toggle_layout();
+                    Key::LayoutChanged
+                }
+                0x48 => Key::ArrowUp,
+                0x50 => Key::ArrowDown,
+                0x4B => Key::ArrowLeft,
+                0x4D => Key::ArrowRight,
+                0x47 => Key::Home,
+                0x4F => Key::End,
+                0x49 => Key::PageUp,
+                0x51 => Key::PageDown,
+                0x53 => Key::Delete,
+                _ => Key::None,
+            };
         }
 
         match sc {
+            0x1D => {
+                CTRL_PRESSED = true;
+                return Key::None;
+            }
+            0x9D => {
+                CTRL_PRESSED = false;
+                return Key::None;
+            }
             0x2A | 0x36 => {
                 SHIFT_PRESSED = true;
 
@@ -282,12 +325,27 @@ pub fn read_key() -> Key {
             return Key::None;
         }
 
+        // Ctrl+буква: комбинации обрабатываются независимо от раскладки.
+        if CTRL_PRESSED {
+            if let Some(ch) = control_char(sc) {
+                return Key::Control(ch);
+            }
+        }
+
         if sc == 0x1C {
             return Key::Enter;
         }
 
         if sc == 0x0E {
             return Key::Backspace;
+        }
+
+        if sc == 0x0F {
+            return Key::Tab;
+        }
+
+        if sc == 0x01 {
+            return Key::Escape;
         }
 
         let shift = SHIFT_PRESSED;
