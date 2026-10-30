@@ -17,15 +17,13 @@ align 4
     ; a.out kludge fields (not used)
     dd 0, 0, 0, 0, 0
 
-    ; Request a linear graphics mode: 1920x1080x32.
-    dd 0
+        ; Request a linear graphics mode (1 = Text mode preferred, but allows override)
+    dd 0   ; Было 0 (чистая графика). Ставим 1 (текст по дефолту, но графика разрешена)
     dd 1920
     dd 1080
     dd 32
 
 ; Reserve 64 KiB for the initial kernel stack.
-; The stack sits in .bss directly below kernel statics, so it must have
-; enough headroom for the deepest path: shell -> exFAT write -> bitmap.
 section .bss
 align 16
 
@@ -49,11 +47,11 @@ _start:
     xor ebp, ebp
     mov [multiboot_info], ebx
 
-    ; Show S: reached the assembly entry point.
-    mov dword [0xB8000], 0x0F530F53
-
-    ; Show R: about to call Rust.
-    mov dword [0xB8004], 0x0F520F52
+    ; ВНИМАНИЕ: Запись в 0xB8000 безопасна ТОЛЬКО если GRUB остался в текстовом режиме.
+    ; Если GRUB включит графику, эти строки могут не отобразиться или повредить память кадра.
+    ; Для отладки графики лучше убрать или закомментировать их.
+    ; mov dword [0xB8000], 0x0F530F53
+    ; mov dword [0xB8004], 0x0F520F52
 
     push dword [multiboot_info]
     call perfix_main

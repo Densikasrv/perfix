@@ -451,6 +451,33 @@ pub fn scroll_screen() {
                     CONSOLE[index + 1] = COLOR_NORMAL;
                 }
 
+                // Также сдвигаем реальный framebuffer, чтобы экран оставался
+                // синхронизирован с буфером CONSOLE. Иначе после каждой
+                // прокрутки CONSOLE уходит вперёд, а изображение на экране
+                // остаётся старым, и разрыв растёт с каждой командой.
+                let framebuffer = FRAMEBUFFER;
+                let pitch = PITCH;
+                if !framebuffer.is_null() && pitch > 0 {
+                    let row_pitch_bytes = pitch * GLYPH_HEIGHT;
+                    let total_bytes = (height - 1) * row_pitch_bytes;
+                    // Копируем 32-битными словами (rep movsd) — быстро даже
+                    // для больших разрешений.
+                    copy_dwords(
+                        framebuffer.add(row_pitch_bytes) as usize,
+                        framebuffer as usize,
+                        total_bytes / 4,
+                    );
+                    // Остаток байт, если row_pitch_bytes не кратен 4.
+                    let dword_end = (total_bytes / 4) * 4;
+                    for i in dword_end..total_bytes {
+                        framebuffer.add(i).write(framebuffer.add(i + row_pitch_bytes).read());
+                    }
+                    // Зачищаем последнюю строку.
+                    for i in 0..row_pitch_bytes {
+                        framebuffer.add(total_bytes + i).write(0);
+                    }
+                }
+
                 CURSOR = None;
             }
 

@@ -9,6 +9,7 @@ mod version;
 mod vga;
 mod keyboard;
 mod shell;
+mod power;
 mod gdt;
 mod idt;
 mod paging;

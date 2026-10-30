@@ -1,4 +1,5 @@
 use crate::exfat;
+use crate::power;
 use crate::vga;
 use crate::version;
 
@@ -187,7 +188,7 @@ fn trim_ascii_space(input: &[u8]) -> &[u8] {
 /// Сколько строк вывода резервировать под команду до её выполнения.
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
-        23
+        25
     } else if input == b"version" {
         5
     } else if input == b"diskinfo" {
@@ -433,6 +434,8 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 20, 0, b"listpart  - list exFAT partitions");
         vga::print_at(output_row + 21, 0, b"cdpart <n>- select partition");
         vga::print_at(output_row + 22, 0, b"fetch     - system information");
+        vga::print_at(output_row + 23, 0, b"halt      - turn off the computer");
+        vga::print_at(output_row + 24, 0, b"calc      - simple calculator");
     } else if input == b"about" {
         vga::print_at(
             output_row,
@@ -593,6 +596,116 @@ pub fn execute(input: &[u8], row: &mut usize) {
         } else {
             path_too_long(output_row);
         }
+    } else if input == b"halt" {
+        vga::print_at(output_row, 0, b"Shutting down...");
+        if !power::shutdown() {
+            power::halt();
+        }
+    } else if let Some(argument) = command_arg(input, b"calc") {
+        let arg = argument;
+        let mut i = 0;
+
+        while i < arg.len() && arg[i] == b' ' {
+            i += 1;
+        }
+        let n1_start = i;
+        while i < arg.len() && arg[i] != b' ' {
+            i += 1;
+        }
+        let n1_end = i;
+
+        while i < arg.len() && arg[i] == b' ' {
+            i += 1;
+        }
+        let op_start = i;
+        while i < arg.len() && arg[i] != b' ' {
+            i += 1;
+        }
+        let op_end = i;
+
+        while i < arg.len() && arg[i] == b' ' {
+            i += 1;
+        }
+        let n2_start = i;
+        while i < arg.len() && arg[i] != b' ' {
+            i += 1;
+        }
+        let n2_end = i;
+
+        let n1_str = &arg[n1_start..n1_end];
+        let op_str = &arg[op_start..op_end];
+        let n2_str = &arg[n2_start..n2_end];
+
+        if n1_str.is_empty() || op_str.is_empty() || n2_str.is_empty() {
+            vga::print_at(output_row, 0, b"Usage: calc <n> <+|-|*|/> <n>");
+        } else {
+            let n1 = match parse_i32(n1_str) {
+                Some(n) => n,
+                None => {
+                    vga::print_at(output_row, 0, b"Invalid number.");
+                    *row = output_row + 1;
+                    prompt(*row);
+                    return;
+                }
+            };
+            let n2 = match parse_i32(n2_str) {
+                Some(n) => n,
+                None => {
+                    vga::print_at(output_row, 0, b"Invalid number.");
+                    *row = output_row + 1;
+                    prompt(*row);
+                    return;
+                }
+            };
+
+            let result = match op_str {
+                b"+" => n1.wrapping_add(n2),
+                b"-" => n1.wrapping_sub(n2),
+                b"*" => n1.wrapping_mul(n2),
+                b"/" => {
+                    if n2 == 0 {
+                        vga::print_at(output_row, 0, b"Division by zero.");
+                        *row = output_row + 1;
+                        prompt(*row);
+                        return;
+                    }
+                    n1.wrapping_div(n2)
+                }
+                _ => {
+                    vga::print_at(output_row, 0, b"Unknown operator. Use + - * /");
+                    *row = output_row + 1;
+                    prompt(*row);
+                    return;
+                }
+            };
+
+            let mut buf = [0u8; 12];
+            let result_len = format_i32(&mut buf, result);
+
+            let mut out = [0u8; 80];
+            let mut out_len = 0;
+
+            out[out_len..out_len + n1_str.len()].copy_from_slice(n1_str);
+            out_len += n1_str.len();
+            out[out_len] = b' ';
+            out_len += 1;
+            out[out_len..out_len + op_str.len()].copy_from_slice(op_str);
+            out_len += op_str.len();
+            out[out_len] = b' ';
+            out_len += 1;
+            out[out_len..out_len + n2_str.len()].copy_from_slice(n2_str);
+            out_len += n2_str.len();
+            out[out_len] = b'=';
+            out[out_len + 1] = b' ';
+            out_len += 2;
+            out[out_len..out_len + result_len].copy_from_slice(&buf[..result_len]);
+            out_len += result_len;
+
+            vga::print_at(output_row, 0, &out[..out_len]);
+        }
+        *row = output_row + 1;
+        prompt(*row);
+        return;
     } else if input.is_empty() {
         *row += 1;
 
@@ -610,5 +723,64 @@ pub fn execute(input: &[u8], row: &mut usize) {
 
     *row = output_row + lines;
     prompt(*row);
+}
+
+/// Парсит срез байт как целое i32. Возвращает None при ошибке.
+fn parse_i32(s: &[u8]) -> Option<i32> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    let mut negative = false;
+    if s[i] == b'-' {
+        negative = true;
+        i += 1;
+        if i >= s.len() {
+            return None;
+        }
+    }
+    let mut result: i32 = 0;
+    while i < s.len() {
+        if s[i] < b'0' || s[i] > b'9' {
+            return None;
+        }
+        result = result.wrapping_mul(10).wrapping_add((s[i] - b'0') as i32);
+        i += 1;
+    }
+    if negative {
+        result = -result;
+    }
+    Some(result)
+}
+
+/// Записывает i32 в буфер как десятичные цифры, возвращает длину.
+fn format_i32(out: &mut [u8], mut value: i32) -> usize {
+    if value == 0 {
+        out[0] = b'0';
+        return 1;
+    }
+    let mut negative = false;
+    if value < 0 {
+        negative = true;
+        value = -value;
+    }
+    let mut digits = [0u8; 11];
+    let mut len = 0;
+    while value > 0 {
+        digits[len] = b'0' + (value % 10) as u8;
+        value /= 10;
+        len += 1;
+    }
+    let mut out_len = 0;
+    if negative {
+        out[out_len] = b'-';
+        out_len += 1;
+    }
+    while len > 0 {
+        len -= 1;
+        out[out_len] = digits[len];
+        out_len += 1;
+    }
+    out_len
 }
 
