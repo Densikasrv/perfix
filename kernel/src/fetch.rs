@@ -1,7 +1,7 @@
 //! Команда `fetch`: краткая сводка о системе.
 
 use crate::cpu;
-use crate::exfat;
+use crate::fs;
 use crate::sysinfo;
 use crate::version;
 use crate::vga;
@@ -98,19 +98,27 @@ pub fn show(row: usize) -> usize {
     let mut space = [b' '; 80];
     let mut space_len = 0usize;
 
-    match exfat::space_info() {
-        Ok((total, free)) => {
-            push_size(&mut space, &mut space_len, free);
-            push(&mut space, &mut space_len, b" free / ");
-            push_size(&mut space, &mut space_len, total);
-            push(&mut space, &mut space_len, b" total");
+    let mut space_shown = false;
+    for f in fs::filesystems() {
+        match f.space_info() {
+            Ok((total, free)) => {
+                push_size(&mut space, &mut space_len, free);
+                push(&mut space, &mut space_len, b" free / ");
+                push_size(&mut space, &mut space_len, total);
+                push(&mut space, &mut space_len, b" total");
+            }
+            Err(_) => {
+                push(&mut space, &mut space_len, b"unavailable");
+            }
         }
-        Err(_) => {
-            push(&mut space, &mut space_len, b"unavailable");
-        }
+        space_shown = true;
+        break; // пока выводим только первую ФС с доступной информацией
+    }
+    if !space_shown {
+        push(&mut space, &mut space_len, b"unavailable");
     }
 
-    field(row + 3, b"exFAT Space:", &space[..space_len]);
+    field(row + 3, b"Space:", &space[..space_len]);
 
     4
 }

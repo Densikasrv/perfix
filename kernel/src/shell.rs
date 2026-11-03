@@ -1,4 +1,4 @@
-use crate::exfat;
+use crate::fs::{self, FileSystem, CAT_LINES};
 use crate::power;
 use crate::vga;
 use crate::version;
@@ -28,6 +28,41 @@ const PATH_MAX: usize = 512;
 pub const INPUT_CAPACITY: usize = 256;
 /// Сколько последних команд хранит история.
 const HISTORY_DEPTH: usize = 16;
+
+/// Первая зарегистрированная файловая система (по умолчанию exFAT).
+fn primary_fs() -> &'static dyn FileSystem {
+    fs::filesystems()[0]
+}
+
+/// Вызывает метод на каждой ФС, накапливая смещение строк по возвращённому количеству.
+fn for_each_fs<F>(row: usize, mut f: F) -> usize
+where
+    F: FnMut(&dyn FileSystem, usize) -> usize,
+{
+    let mut offset = 0usize;
+    for fs in fs::filesystems() {
+        offset += f(fs, row + offset);
+    }
+    offset
+}
+
+/// Выполняет операцию по пути на первой ФС, где путь существует.
+/// Для операций создания (create = true) используется первая ФС.
+fn with_path_fs<F>(path: &[u8], row: usize, create: bool, mut f: F) -> usize
+where
+    F: FnMut(&dyn FileSystem) -> usize,
+{
+    if !create {
+        for fs in fs::filesystems() {
+            if (*fs).path_is_directory(path).is_ok() {
+                return f(fs);
+            }
+        }
+        vga::print_at(row, 0, b"Path not found on any filesystem");
+        return 1;
+    }
+    f(primary_fs())
+}
 
 static mut HISTORY: [[u8; INPUT_CAPACITY]; HISTORY_DEPTH] =
     [[0; INPUT_CAPACITY]; HISTORY_DEPTH];
@@ -206,7 +241,7 @@ fn command_lines(input: &[u8]) -> usize {
     } else if command_arg(input, b"ls").is_some() {
         42
     } else if command_arg(input, b"cat").is_some() {
-        exfat::CAT_LINES
+        CAT_LINES
     } else {
         1
     }
@@ -306,26 +341,30 @@ fn change_directory(argument: &[u8], row: usize) {
         return;
     };
 
-    match exfat::path_is_directory(&path[..target_len]) {
-        Ok(true) => {
-            set_cwd(&path[..target_len]);
+    let mut cd_handled = false;
+    for fs in fs::filesystems() {
+        match fs.path_is_directory(&path[..target_len]) {
+            Ok(true) => {
+                set_cwd(&path[..target_len]);
 
-            let mut line = [b' '; 80];
-            let mut len = 0usize;
-            push_message(&mut line, &mut len, b"cwd: ");
-            push_message(&mut line, &mut len, &path[..target_len]);
-            vga::print_at(row, 0, &line[..len]);
+                let mut line = [b' '; 80];
+                let mut len = 0usize;
+                push_message(&mut line, &mut len, b"cwd: ");
+                push_message(&mut line, &mut len, &path[..target_len]);
+                vga::print_at(row, 0, &line[..len]);
+                cd_handled = true;
+                break;
+            }
+            Ok(false) => {
+                vga::print_at(row, 0, b"Not a directory");
+                cd_handled = true;
+                break;
+            }
+            Err(_) => continue,
         }
-        Ok(false) => {
-            vga::print_at(row, 0, b"Not a directory");
-        }
-        Err(error) => {
-            let mut line = [b' '; 80];
-            let mut len = 0usize;
-            push_message(&mut line, &mut len, b"cd: ");
-            push_message(&mut line, &mut len, error.message());
-            vga::print_at(row, 0, &line[..len]);
-        }
+    }
+    if !cd_handled {
+        vga::print_at(row, 0, b"Path not found on any filesystem");
     }
 }
 
@@ -437,11 +476,15 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 23, 0, b"halt      - turn off the computer");
         vga::print_at(output_row + 24, 0, b"calc      - simple calculator");
     } else if input == b"about" {
-        vga::print_at(
-            output_row,
-            0,
-            b"Perfix is an Operating System written in Rust.",
-        );
+        vga::print_at(output_row, 0, b"Perfix");
+        vga::print_at(output_row + 1, 0, b"Copyright (C) 2026 Densikasrv");
+        vga::print_at(output_row + 3, 0, b"This program comes with ABSOLUTELY NO WARRANTY.");
+        vga::print_at(output_row + 4, 0, b"This is free software, and you are welcome to");
+        vga::print_at(output_row + 5, 0, b"redistribute it under certain conditions.");
+        
+        *row = output_row + 6;
+        prompt(*row);
+        return;
     } else if input == b"version" {
         vga::print_at(output_row, 0, version::KERNEL_NAME);
         vga::print_at(output_row + 1, 0, b"OS version: ");
@@ -458,63 +501,230 @@ pub fn execute(input: &[u8], row: &mut usize) {
         prompt(*row);
         return;
     } else if input == b"diskinfo" {
-        exfat::print_boot_sector(output_row);
+        let used = crate::disk::print_disk_info(output_row);
+        *row = output_row + used;
+        prompt(*row);
+        return;
     } else if input == b"mount" {
-        exfat::print_volume_info(output_row);
+        for_each_fs(output_row, |fs, r| fs.print_volume_info(r));
     } else if input == b"charset" {
         vga::print_charset(output_row);
-    } else if input == b"listpart" {
-        let used = exfat::shell_listpart(output_row);
+    
+} else if input == b"listpart" {
+    let mut partitions = [crate::disk::DiskPartition {
+        number: 0,
+        kind: crate::disk::FsKind::Other,
+        start_lba: 0,
+        sectors: 0,
+    }; 4];
+
+    let count = crate::disk::read_partitions(&mut partitions);
+
+    if count == 0 {
+        vga::print_at(output_row, 0, b"No partitions found");
+    } else {
+        vga::print_at(output_row, 0, b"Disk partitions:");
+
+        for (i, p) in partitions[..count].iter().enumerate() {
+            let name = match p.kind {
+                crate::disk::FsKind::Exfat => b"exFAT".as_slice(),
+                crate::disk::FsKind::Ext4 => b"ext4".as_slice(),
+                crate::disk::FsKind::Other => b"Other".as_slice(),
+            };
+
+            vga::print_at(output_row + 1 + i, 0, b"Partition");
+
+            let mut digits = [0u8; 10];
+            let mut n = p.number;
+            let mut len = 0;
+
+            if n == 0 {
+                digits[0] = b'0';
+                len = 1;
+            } else {
+                while n > 0 {
+                    digits[len] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    len += 1;
+                }
+            }
+
+            for j in 0..len {
+                vga::print_at(
+                    output_row + 1 + i,
+                    10 + j,
+                    &[digits[len - j - 1]],
+                );
+            }
+
+            vga::print_at(output_row + 1 + i, 14, name);
+        }
+    }
+
+    *row = output_row + count + 1;
+    prompt(*row);
+    return;
+
+
+    } else if let Some(argument) = command_arg(input, b"setup") {
+        let mut n: i32 = 0;
+        let mut i = 0;
+
+        while i < argument.len() && argument[i].is_ascii_digit() {
+            n = n.wrapping_mul(10).wrapping_add((argument[i] - b'0') as i32);
+            i += 1;
+        }
+
+        if i == 0 || n < 0 {
+            vga::print_at(output_row, 0, b"Usage: setup <partiton number>");
+            *row = output_row + 1;
+            prompt(*row);
+            return;
+        }
+
+        let used = primary_fs().shell_setup(n as usize);
         *row = output_row + used;
         prompt(*row);
         return;
     } else if let Some(argument) = command_arg(input, b"cdpart") {
-        let mut number = 0usize;
-        let mut valid = !argument.is_empty();
+    let mut number = 0usize;
+    let mut valid = !argument.is_empty();
 
-        for &byte in argument {
-            if !byte.is_ascii_digit() {
-                valid = false;
+    for &byte in argument {
+        if !byte.is_ascii_digit() {
+            valid = false;
+            break;
+        }
+
+        number = number
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as usize);
+    }
+    let mut used_rows = 1usize;
+    if !valid || number == 0 {
+        vga::print_at(output_row, 0, b"Usage: cdpart <number>");
+    } else {
+        match crate::disk::select_partition(number) {
+            Ok(crate::disk::FsKind::Exfat) => {
+                set_cwd(b"/");
+                vga::print_at(output_row, 0, b"exFAT partition selected");
+            }
+            Ok(crate::disk::FsKind::Ext4) => {
+    set_cwd(b"/");
+
+    vga::print_at(output_row, 0, b"ext4 partition selected");
+    vga::print_at(output_row + 1, 0, b"Superblock: OK");
+
+    match crate::disk::read_ext4_root_inode(number) {
+        Ok(inode) => {
+            vga::print_at(output_row + 2, 0, b"Root inode: ");
+            vga::print_at(output_row + 2, 12, b"2");
+
+            if inode.is_directory {
+                vga::print_at(output_row + 3, 0, b"Type: Directory");
+            } else {
+                vga::print_at(output_row + 3, 0, b"Type: Not a directory");
+            }
+
+            vga::print_at(output_row + 4, 0, b"Inode read: OK");
+            let mut hex = [b'0'; 16];
+let digits = b"0123456789ABCDEF";
+
+let mut value = inode.first_extent_block;
+
+for i in (0..16).rev() {
+    hex[i] = digits[(value & 0xF) as usize];
+    value >>= 4;
+}  
+
+            vga::print_at(output_row + 5, 0, b"Extent: 0x");
+            vga::print_at(output_row + 5, 10, &hex);
+            let mut directory_block = [0u8; 4096];
+
+match crate::disk::read_ext4_root_directory_block(
+    number,
+    &mut directory_block,
+) {
+    Ok(block_size) => {
+        vga::print_at(output_row + 6, 0, b"Root directory:");
+
+        let mut offset = 0usize;
+        let mut entries = 0usize;
+
+        while offset + 8 <= block_size && entries < 8 {
+            let inode_number = u32::from_le_bytes([
+                directory_block[offset],
+                directory_block[offset + 1],
+                directory_block[offset + 2],
+                directory_block[offset + 3],
+            ]);
+
+            let record_length = u16::from_le_bytes([
+                directory_block[offset + 4],
+                directory_block[offset + 5],
+            ]) as usize;
+
+            let name_length = directory_block[offset + 6] as usize;
+
+            if record_length < 8
+                || offset + record_length > block_size
+                || name_length > record_length - 8
+            {
                 break;
             }
 
-            number = number
-                .saturating_mul(10)
-                .saturating_add((byte - b'0') as usize);
+            if inode_number != 0 && name_length > 0 {
+                vga::print_at(
+                    output_row + 7 + entries,
+                    2,
+                    &directory_block[offset + 8..offset + 8 + name_length],
+                );
+
+                entries += 1;
+            }
+
+            offset += record_length;
         }
 
-        let mut line = [b' '; 80];
-        let mut len = 0usize;
-
-        if !valid || number == 0 {
-            push_message(&mut line, &mut len, b"Usage: cdpart <n>");
-        } else {
-            match exfat::select_partition(number - 1) {
-                Ok(partition) => {
-                    set_cwd(b"/");
-                    push_message(&mut line, &mut len, b"partition ");
-                    push_dec_message(&mut line, &mut len, number);
-                    push_message(&mut line, &mut len, b" selected, LBA ");
-                    push_dec_message(
-                        &mut line,
-                        &mut len,
-                        partition.base_lba as usize,
-                    );
-                }
-                Err(error) => {
-                    push_message(&mut line, &mut len, b"cdpart: ");
-                    push_message(&mut line, &mut len, error.message());
-                }
+        if entries == 0 {
+            vga::print_at(output_row + 7, 2, b"Directory is empty");
+        }
+        used_rows = if entries == 0 {
+    8
+} else {
+    7 + entries
+};
+    }
+    Err(message) => {
+        vga::print_at(output_row + 6, 0, message);
+        used_rows = 7;
+    }
+}
+        }
+        Err(message) => {
+            vga::print_at(output_row + 2, 0, message);
+            used_rows = 3;
+        }
+    }
+}
+            Ok(crate::disk::FsKind::Other) => {
+                vga::print_at(output_row, 0, b"Unsupported filesystem");
+            }
+            Err(message) => {
+                vga::print_at(output_row, 0, message);
             }
         }
+    }
 
-        vga::print_at(output_row, 0, &line[..len]);
+    *row = output_row + used_rows;
+    prompt(*row);
+    return;
     } else if input == b"pwd" {
         vga::print_at(output_row, 0, cwd());
     } else if let Some(argument) = command_arg(input, b"cd") {
         change_directory(argument, output_row);
     } else if input == b"rootdir" {
-        let used = exfat::shell_list(b"/", output_row);
+        let used = with_path_fs(b"/", output_row, false, |fs| fs.shell_list(b"/", output_row));
         *row = output_row + used;
         prompt(*row);
         return;
@@ -530,7 +740,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         };
 
         if let Some(target_len) = target_len {
-            let used = exfat::shell_list(&path[..target_len], output_row);
+            let used = with_path_fs(&path[..target_len], output_row, false, |fs| fs.shell_list(&path[..target_len], output_row));
             *row = output_row + used;
             prompt(*row);
             return;
@@ -539,7 +749,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         path_too_long(output_row);
     } else if let Some(argument) = command_arg(input, b"cat") {
         if argument.is_empty() {
-            let used = exfat::shell_cat(b"", output_row);
+            let used = with_path_fs(b"", output_row, false, |fs| fs.shell_cat(b"", output_row));
             *row = output_row + used;
             prompt(*row);
             return;
@@ -548,7 +758,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         let mut path = [0u8; PATH_MAX];
 
         if let Some(len) = absolute_path(argument, &mut path) {
-            let used = exfat::shell_cat(&path[..len], output_row);
+            let used = with_path_fs(&path[..len], output_row, false, |fs| fs.shell_cat(&path[..len], output_row));
             *row = output_row + used;
             prompt(*row);
             return;
@@ -560,9 +770,9 @@ pub fn execute(input: &[u8], row: &mut usize) {
         let mut path = [0u8; PATH_MAX];
 
         if name.is_empty() {
-            exfat::shell_write(b"", text, output_row);
+            with_path_fs(b"", output_row, true, |fs| fs.shell_write(b"", text, output_row));
         } else if let Some(len) = absolute_path(name, &mut path) {
-            exfat::shell_write(&path[..len], text, output_row);
+            with_path_fs(&path[..len], output_row, true, |fs| fs.shell_write(&path[..len], text, output_row));
         } else {
             path_too_long(output_row);
         }
@@ -570,9 +780,9 @@ pub fn execute(input: &[u8], row: &mut usize) {
         let mut path = [0u8; PATH_MAX];
 
         if argument.is_empty() {
-            exfat::shell_remove(b"", output_row);
+            with_path_fs(b"", output_row, false, |fs| fs.shell_remove(b"", output_row));
         } else if let Some(len) = absolute_path(argument, &mut path) {
-            exfat::shell_remove(&path[..len], output_row);
+            with_path_fs(&path[..len], output_row, false, |fs| fs.shell_remove(&path[..len], output_row));
         } else {
             path_too_long(output_row);
         }
@@ -580,9 +790,9 @@ pub fn execute(input: &[u8], row: &mut usize) {
         let mut path = [0u8; PATH_MAX];
 
         if argument.is_empty() {
-            exfat::shell_mkdir(b"", output_row);
+            with_path_fs(b"", output_row, true, |fs| fs.shell_mkdir(b"", output_row));
         } else if let Some(len) = absolute_path(argument, &mut path) {
-            exfat::shell_mkdir(&path[..len], output_row);
+            with_path_fs(&path[..len], output_row, true, |fs| fs.shell_mkdir(&path[..len], output_row));
         } else {
             path_too_long(output_row);
         }
@@ -590,9 +800,9 @@ pub fn execute(input: &[u8], row: &mut usize) {
         let mut path = [0u8; PATH_MAX];
 
         if argument.is_empty() {
-            exfat::shell_rmdir(b"", output_row);
+            with_path_fs(b"", output_row, false, |fs| fs.shell_rmdir(b"", output_row));
         } else if let Some(len) = absolute_path(argument, &mut path) {
-            exfat::shell_rmdir(&path[..len], output_row);
+            with_path_fs(&path[..len], output_row, false, |fs| fs.shell_rmdir(&path[..len], output_row));
         } else {
             path_too_long(output_row);
         }

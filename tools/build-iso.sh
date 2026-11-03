@@ -64,7 +64,7 @@ build_kernel() {
 }
 
 set +e
-BUILD_OUTPUT="$(build_kernel -Z build-std=core 2>&1)"
+BUILD_OUTPUT="$(build_kernel -Z build-std=core -Z json-target-spec 2>&1)"
 BUILD_STATUS=$?
 set -e
 

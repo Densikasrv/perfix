@@ -2,7 +2,9 @@
 //!
 //! Сам драйвер живёт в [`fs`] и не знает ни про ATA, ни про VGA.
 
-mod fs;
+pub mod fs;
+
+pub use fs::{BlockReader, BlockDevice, BlockError};
 
 pub use fs::{cp866_to_utf8, FsError, PartitionInfo, Volume, MAX_PARTITIONS};
 
@@ -751,12 +753,43 @@ fn push_hex32<const N: usize>(out: &mut [u8; N], len: &mut usize, value: u32) {
 }
 
 /// Команда `listpart`: список найденных разделов exFAT и их размеров.
+pub fn shell_setup(index: usize) -> usize {
+    let mut partitions = [PartitionInfo::empty(); MAX_PARTITIONS];
+    let count = match partition_list(&mut partitions) {
+        Ok(c) => c,
+        Err(e) => return print_error(0, e),
+    };
+    if count == 0 {
+        vga::print_at(0, 0, b"No exFAT partitions found");
+        return 1;
+    }
+    if index >= count {
+        vga::print_at(0, 0, b"Partition number out of range");
+        return 1;
+    }
+
+    if let Err(e) = select_partition(index) {
+        return print_error(0, e);
+    }
+
+    if shell_mkdir(b"/System", 0) != 0 {
+        // Directory already exists; not an error
+    }
+
+    let mut line = [b' '; 80];
+    let mut len = 0usize;
+    push(&mut line, &mut len, b"setup: /System ready on partition ");
+    push_dec_value(&mut line, &mut len, (index + 1) as u64);
+    vga::print_at(0, 0, &line[..len]);
+    0
+}
+
 pub fn shell_listpart(row: usize) -> usize {
     let mut partitions = [PartitionInfo::empty(); MAX_PARTITIONS];
 
     let count = match partition_list(&mut partitions) {
-        Ok(count) => count,
-        Err(error) => return print_error(row, error),
+        Ok(c) => c,
+        Err(e) => return print_error(0, e),
     };
 
     if count == 0 {
@@ -797,6 +830,7 @@ pub fn shell_listpart(row: usize) -> usize {
 
     count + 1
 }
+
 pub fn shell_rmdir(path: &[u8], row: usize) -> usize {
     if path.is_empty() {
         vga::print_at(row, 0, b"Usage: rmdir <dir>");

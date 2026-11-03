@@ -14,7 +14,10 @@ mod gdt;
 mod idt;
 mod paging;
 mod ata;
-mod exfat;
+mod fs;
+mod disk;
+pub use fs::exfat;
+pub use fs::ext4;
 mod tedit;
 mod fetch;
 mod cpu;
@@ -360,6 +363,24 @@ loop {
 
         // Специальные клавиши игнорируются в командной строке.
         _ => {}
+    }
+}
+
+fn test_ext4() {
+    use crate::fs::ext4::{AtaDevice, Ext4};
+
+    let device = AtaDevice;
+    let partition_start = 2048; // ЗАМЕНИ на реальный LBA раздела
+
+    match Ext4::mount(&device, partition_start) {
+        Ok(ext4) => {
+            // Файловая система распознана.
+            let _block_size = ext4.block_size();
+            let _blocks = ext4.blocks_count();
+        }
+        Err(_) => {
+            // Не удалось подключить ext4.
+        }
     }
 }
 
