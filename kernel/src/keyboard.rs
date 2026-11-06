@@ -245,11 +245,21 @@ pub(crate) fn russian_char(sc: u8, shift: bool) -> Option<u8> {
 
 
 pub fn read_key() -> Key {
-    if inb(0x64) & 1 == 0 {
+    let status = inb(0x64);
+
+    if status & 1 == 0 {
         return Key::None;
     }
 
     let sc = inb(0x60);
+
+    // Бит 5 — байт пришёл от AUX-устройства (мышь). Его нужно забрать из
+    // контроллера, иначе он заблокирует выдачу данных клавиатуры, поэтому
+    // передаём байт драйверу мыши.
+    if status & 0x20 != 0 {
+        crate::mouse::handle_byte(sc);
+        return Key::None;
+    }
 
     unsafe {
         // Расширенные клавиши приходят с префиксом 0xE0.

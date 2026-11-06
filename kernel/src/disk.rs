@@ -20,6 +20,24 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
     ])
 }
 
+fn read_u64(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+    ])
+}
+
+/// Признак загрузочного сектора exFAT (OEM-имя "EXFAT   ").
+fn is_exfat_boot(sector: &[u8]) -> bool {
+    &sector[3..11] == b"EXFAT   "
+}
+
 fn detect_fs(start_lba: u32, partition_type: u8) -> &'static [u8] {
     let mut sector = [0u8; SECTOR_SIZE];
 
@@ -194,11 +212,42 @@ pub struct DiskPartition {
 pub fn read_partitions(out: &mut [DiskPartition]) -> usize {
     let mut sector = [0u8; SECTOR_SIZE];
 
-    if ata::read_sector(0, &mut sector).is_err()
-        || sector[510] != 0x55
-        || sector[511] != 0xAA
-    {
+    if ata::read_sector(0, &mut sector).is_err() {
         return 0;
+    }
+
+    // Том exFAT на диске целиком (без таблицы разделов) — это один раздел.
+    // Раньше такие диски видел только драйвер exFAT, а listpart/cdpart
+    // умели работать лишь с MBR и сообщали, что разделов нет.
+    if is_exfat_boot(&sector) {
+        if out.is_empty() {
+            return 0;
+        }
+
+        let volume_length = read_u64(&sector, 72).min(u32::MAX as u64) as u32;
+
+        out[0] = DiskPartition {
+            number: 1,
+            kind: FsKind::Exfat,
+            start_lba: 0,
+            sectors: volume_length,
+        };
+
+        return 1;
+    }
+
+    if sector[510] != 0x55 || sector[511] != 0xAA {
+        return 0;
+    }
+
+    // GPT: таблицу разделов разбирает драйвер exFAT (MBR/GPT/extended MBR),
+    // поэтому для защитного MBR берём список из него.
+    if sector[PARTITION_TABLE_OFFSET + 4] == 0xEE {
+        let count = read_exfat_partitions(out);
+
+        if count > 0 {
+            return count;
+        }
     }
 
     let mut count = 0;
@@ -228,6 +277,39 @@ pub fn read_partitions(out: &mut [DiskPartition]) -> usize {
             kind,
             start_lba,
             sectors,
+        };
+
+        count += 1;
+    }
+
+    count
+}
+
+/// Заполняет `out` разделами exFAT, найденными драйвером файловой системы.
+///
+/// Драйвер умеет MBR, extended MBR и GPT; номера разделов идут с единицы,
+/// как их показывает listpart и принимает cdpart.
+fn read_exfat_partitions(out: &mut [DiskPartition]) -> usize {
+    let mut found =
+        [crate::fs::exfat::PartitionInfo::empty(); crate::fs::exfat::MAX_PARTITIONS];
+
+    let found_count = match crate::fs::exfat::partition_list(&mut found) {
+        Ok(count) => count,
+        Err(_) => 0,
+    };
+
+    let mut count = 0usize;
+
+    for partition in found[..found_count].iter() {
+        if count >= out.len() {
+            break;
+        }
+
+        out[count] = DiskPartition {
+            number: count + 1,
+            kind: FsKind::Exfat,
+            start_lba: partition.base_lba,
+            sectors: partition.sectors.min(u32::MAX as u64) as u32,
         };
 
         count += 1;

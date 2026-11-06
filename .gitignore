@@ -1,4 +1,6 @@
 /target/
 /build/
 /kernel/target/
+/pdesk/target/
+/pdesk/Cargo.lock
 /tools/exfat-check/target/

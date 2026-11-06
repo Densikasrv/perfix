@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "pdesk"
+version = "0.1.0"
+
+[[package]]
 name = "perfix"
-version = "0.2.3"
+version = "0.2.4"
+dependencies = [
+ "pdesk",
+]

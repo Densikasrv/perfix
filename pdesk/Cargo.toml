@@ -1,0 +1,9 @@
+[package]
+name = "pdesk"
+version = "0.1.0"
+edition = "2024"
+description = "pdesk — графическая оболочка Perfix"
+
+[lib]
+name = "pdesk"
+path = "src/lib.rs"

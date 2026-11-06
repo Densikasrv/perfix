@@ -217,10 +217,24 @@ pub fn prompt_width() -> usize {
 }
 
 pub fn prompt(row: usize) {
+    // В окне pterm приглашение рисует сама оболочка, а консольный вывод
+    // только собирается в виртуальный экран.
+    if vga::is_capturing() {
+        return;
+    }
+
     let mut buffer = [0u8; 80];
     let len = build_prompt(&mut buffer);
 
     vga::print_at(row, 0, &buffer[..len]);
+}
+
+/// Копирует текущее приглашение в буфер и возвращает его длину.
+///
+/// Используется pdesk: приглашение в pterm показывает раскладку и
+/// текущий каталог так же, как консольная оболочка.
+pub fn prompt_text(out: &mut [u8; 80]) -> usize {
+    build_prompt(out)
 }
 
 /// Отделяет аргумент команды: `ls /SYSTEM` -> `/SYSTEM`.
@@ -446,9 +460,125 @@ fn transfer_command(argument: &[u8], row: usize, moving: bool) -> usize {
 }
 
 /// Сколько строк вывода резервировать под команду до её выполнения.
+/// Дописывает число с ведущим нулём (для даты и времени).
+fn push_fixed2<const N: usize>(out: &mut [u8; N], len: &mut usize, value: u32) {
+    if value < 10 {
+        push_message(out, len, b"0");
+    }
+
+    push_dec_message(out, len, value as usize);
+}
+
+/// Дописывает часовой пояс в формате GMT+3:00.
+fn push_timezone<const N: usize>(out: &mut [u8; N], len: &mut usize, minutes: i32) {
+    push_message(out, len, b"GMT");
+
+    if minutes < 0 {
+        push_message(out, len, b"-");
+    } else {
+        push_message(out, len, b"+");
+    }
+
+    let total = minutes.abs();
+    push_dec_message(out, len, (total / 60) as usize);
+    push_message(out, len, b":");
+    push_fixed2(out, len, (total % 60) as u32);
+}
+
+/// Разбирает часовой пояс: GMT+3, GMT-5, GMT+3:30, +2.
+fn parse_timezone(input: &[u8]) -> Option<i32> {
+    let input = trim_ascii_space(input);
+    let mut rest = input;
+
+    if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case(b"GMT") {
+        rest = &rest[3..];
+    }
+
+    if rest.is_empty() {
+        return None;
+    }
+
+    let sign = if rest[0] == b'-' { -1 } else { 1 };
+
+    if rest[0] == b'+' || rest[0] == b'-' {
+        rest = &rest[1..];
+    }
+
+    let mut hours = 0i32;
+    let mut minutes = 0i32;
+    let mut part = 0usize;
+    let mut digits = 0usize;
+
+    for &byte in rest {
+        if byte.is_ascii_digit() {
+            if part == 0 {
+                hours = hours
+                    .saturating_mul(10)
+                    .saturating_add((byte - b'0') as i32);
+            } else {
+                minutes = minutes
+                    .saturating_mul(10)
+                    .saturating_add((byte - b'0') as i32);
+            }
+
+            digits += 1;
+        } else if byte == b':' && part == 0 && digits > 0 {
+            part = 1;
+            digits = 0;
+        } else {
+            return None;
+        }
+    }
+
+    if digits == 0 || hours > 14 || minutes > 59 {
+        return None;
+    }
+
+    Some(sign * (hours * 60 + minutes))
+}
+
+/// Разбирает дату и время в формате dd/mm/yyyy/hh/mm/ss.
+fn parse_datetime(input: &[u8]) -> Option<(u32, u32, u32, u32, u32, u32)> {
+    let mut values = [0u32; 6];
+    let mut index = 0usize;
+    let mut digits = 0usize;
+    let mut value = 0u32;
+
+    for &byte in input {
+        if byte.is_ascii_digit() {
+            value = value
+                .saturating_mul(10)
+                .saturating_add((byte - b'0') as u32);
+            digits += 1;
+        } else if byte == b'/' {
+            if digits == 0 || index >= 5 {
+                return None;
+            }
+
+            values[index] = value;
+            index += 1;
+            value = 0;
+            digits = 0;
+        } else {
+            return None;
+        }
+    }
+
+    if digits == 0 || index != 5 {
+        return None;
+    }
+
+    values[5] = value;
+
+    // В команде порядок dd/mm/yyyy/hh/mm/ss, наружу отдаём год/месяц/день.
+    Some((
+        values[2], values[1], values[0], values[3], values[4], values[5],
+    ))
+}
+
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
-        27
+        31
     } else if input == b"version" {
         5
     } else if input == b"diskinfo" {
@@ -627,10 +757,111 @@ pub fn execute(input: &[u8], row: &mut usize) {
         return;
     }
 
+    if input == b"guinit" {
+        // Ранняя версия pdesk: запускается вручную, а не при загрузке.
+        match crate::gui::run() {
+            Ok(()) => show_screen(Some(b"pdesk: session finished")),
+            Err(message) => show_screen(Some(message)),
+        }
+
+        *row = 6;
+        return;
+    }
+
+    if input == b"mouse" {
+        // Освобождаем место под две строки демонстрации.
+        while *row + 3 >= vga::height() && *row > 0 {
+            vga::scroll_screen();
+            *row -= 1;
+        }
+
+        let used = crate::mouse::demo(*row + 1);
+        *row += 1 + used;
+
+        if *row >= vga::height() {
+            vga::scroll_screen();
+            *row = vga::height() - 1;
+        }
+
+        prompt(*row);
+        return;
+    }
+
+    if let Some(argument) = command_arg(input, b"timezone") {
+        // Освобождаем место под строку вывода и приглашение.
+        while *row + 2 > vga::height() - 1 && *row > 0 {
+            vga::scroll_screen();
+            *row -= 1;
+        }
+
+        let output_row = *row + 1;
+        let mut line = [b' '; 80];
+        let mut len = 0usize;
+
+        if argument.is_empty() {
+            push_message(&mut line, &mut len, b"timezone: ");
+            push_timezone(&mut line, &mut len, crate::rtc::timezone_minutes());
+        } else if let Some(minutes) = parse_timezone(argument) {
+            crate::rtc::set_timezone_minutes(minutes);
+            push_message(&mut line, &mut len, b"timezone set: ");
+            push_timezone(&mut line, &mut len, crate::rtc::timezone_minutes());
+        } else {
+            push_message(&mut line, &mut len, b"Usage: timezone <GMT+3>");
+        }
+
+        vga::print_at(output_row, 0, &line[..len]);
+        *row = output_row + 1;
+        prompt(*row);
+        return;
+    }
+
+    if let Some(argument) = command_arg(input, b"time") {
+        // Освобождаем место под строку вывода и приглашение.
+        while *row + 2 > vga::height() - 1 && *row > 0 {
+            vga::scroll_screen();
+            *row -= 1;
+        }
+
+        let output_row = *row + 1;
+        let mut line = [b' '; 80];
+        let mut len = 0usize;
+
+        match parse_datetime(argument) {
+            Some((year, month, day, hour, minute, second)) => {
+                let (utc_year, utc_month, utc_day, utc_hour, utc_minute) =
+                    crate::rtc::local_to_utc(year, month, day, hour, minute);
+
+                if crate::rtc::set_datetime(
+                    utc_year, utc_month, utc_day, utc_hour, utc_minute, second,
+                ) {
+                    push_message(&mut line, &mut len, b"time set: ");
+                    push_fixed2(&mut line, &mut len, day);
+                    push_message(&mut line, &mut len, b"/");
+                    push_fixed2(&mut line, &mut len, month);
+                    push_message(&mut line, &mut len, b"/");
+                    push_dec_message(&mut line, &mut len, year as usize);
+                    push_message(&mut line, &mut len, b" ");
+                    push_fixed2(&mut line, &mut len, hour);
+                    push_message(&mut line, &mut len, b":");
+                    push_fixed2(&mut line, &mut len, minute);
+                    push_message(&mut line, &mut len, b":");
+                    push_fixed2(&mut line, &mut len, second);
+                } else {
+                    push_message(&mut line, &mut len, b"time: invalid date or time");
+                }
+            }
+            None => push_message(&mut line, &mut len, b"Usage: time <dd/mm/yyyy/hh/mm/ss>"),
+        }
+
+        vga::print_at(output_row, 0, &line[..len]);
+        *row = output_row + 1;
+        prompt(*row);
+        return;
+    }
+
     if input == b"divzero" {
         crate::idt::test_divzero();
     }
-
     if input == b"pagefault" {
         crate::paging::test_page_fault();
     }
@@ -712,6 +943,10 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 24, 0, b"calc      - simple calculator");
         vga::print_at(output_row + 25, 0, b"cp <src> <dst> - copy file");
         vga::print_at(output_row + 26, 0, b"mv <src> <dst> - move file");
+        vga::print_at(output_row + 27, 0, b"mouse     - PS/2 mouse demo");
+        vga::print_at(output_row + 28, 0, b"guinit    - start pdesk (GUI)");
+        vga::print_at(output_row + 29, 0, b"timezone <GMT+N> - set time zone");
+        vga::print_at(output_row + 30, 0, b"time <dd/mm/yyyy/hh/mm/ss> - set clock");
     } else if input == b"about" {
         vga::print_at(output_row, 0, b"Perfix");
         vga::print_at(output_row + 1, 0, b"Copyright (C) 2026 Densikasrv");
@@ -753,7 +988,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         kind: crate::disk::FsKind::Other,
         start_lba: 0,
         sectors: 0,
-    }; 4];
+    }; crate::fs::exfat::MAX_PARTITIONS];
 
     let count = crate::disk::read_partitions(&mut partitions);
 
@@ -769,32 +1004,19 @@ pub fn execute(input: &[u8], row: &mut usize) {
                 crate::disk::FsKind::Other => b"Other".as_slice(),
             };
 
-            vga::print_at(output_row + 1 + i, 0, b"Partition");
+            let mut line = [b' '; 80];
+            let mut len = 0usize;
 
-            let mut digits = [0u8; 10];
-            let mut n = p.number;
-            let mut len = 0;
+            push_message(&mut line, &mut len, b"Partition ");
+            push_dec_message(&mut line, &mut len, p.number);
+            push_message(&mut line, &mut len, b"  ");
+            push_message(&mut line, &mut len, name);
+            push_message(&mut line, &mut len, b"  LBA ");
+            push_dec_message(&mut line, &mut len, p.start_lba as usize);
+            push_message(&mut line, &mut len, b"  sectors ");
+            push_dec_message(&mut line, &mut len, p.sectors as usize);
 
-            if n == 0 {
-                digits[0] = b'0';
-                len = 1;
-            } else {
-                while n > 0 {
-                    digits[len] = b'0' + (n % 10) as u8;
-                    n /= 10;
-                    len += 1;
-                }
-            }
-
-            for j in 0..len {
-                vga::print_at(
-                    output_row + 1 + i,
-                    10 + j,
-                    &[digits[len - j - 1]],
-                );
-            }
-
-            vga::print_at(output_row + 1 + i, 14, name);
+            vga::print_at(output_row + 1 + i, 0, &line[..len]);
         }
     }
 

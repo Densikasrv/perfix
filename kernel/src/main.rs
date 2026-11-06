@@ -26,6 +26,10 @@ mod font_cp866;
 mod font_8x16;
 mod rtc;
 mod utf8;
+mod mouse;
+mod gui;
+mod pterm;
+
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memset(
@@ -195,7 +199,17 @@ vga::init(framebuffer);
 // полная таблица font_8x16.
 vga::load_glyphs(&font_cp866::GLYPHS);
 
+// PS/2-мышь опрашивается из основного цикла, прерывания не используются.
+let (mouse_area_width, mouse_area_height) = if vga::is_graphics() {
+    (vga::pixel_width(), vga::pixel_height())
+} else {
+    (vga::width() * 8, vga::height() * 16)
+};
+
+mouse::init(mouse_area_width, mouse_area_height);
+
 shell::show_screen(None);
+
 
 const INPUT_CAPACITY: usize = shell::INPUT_CAPACITY;
 

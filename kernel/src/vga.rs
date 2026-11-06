@@ -97,10 +97,18 @@ pub fn init(info: Option<FramebufferInfo>) {
 }
 
 pub fn width() -> usize {
+    if is_capturing() {
+        return CAPTURE_WIDTH;
+    }
+
     unsafe { SCREEN_WIDTH }
 }
 
 pub fn height() -> usize {
+    if is_capturing() {
+        return CAPTURE_HEIGHT;
+    }
+
     unsafe { SCREEN_HEIGHT }
 }
 
@@ -252,6 +260,11 @@ fn draw_cursor(row: usize, col: usize) {
 }
 
 fn put_byte_color(row: usize, col: usize, byte: u8, color: u8) {
+    if is_capturing() {
+        capture_store(row, col, byte);
+        return;
+    }
+
     if row >= height() || col >= width() {
         return;
     }
@@ -295,6 +308,14 @@ fn put_byte_color(row: usize, col: usize, byte: u8, color: u8) {
 ///
 /// Недостающие до ширины экрана символы заполняются пробелами.
 pub fn write_row(row: usize, text: &[u8], color: u8) {
+    if is_capturing() {
+        for col in 0..CAPTURE_WIDTH {
+            capture_store(row, col, text.get(col).copied().unwrap_or(b' '));
+        }
+
+        return;
+    }
+
     if row >= height() {
         return;
     }
@@ -353,6 +374,14 @@ pub fn fill_row(row: usize, color: u8) {
 }
 
 pub fn clear_screen() {
+    if is_capturing() {
+        if let Some(console) = capture_console() {
+            console.clear();
+        }
+
+        return;
+    }
+
     match mode() {
         Mode::Text => {
             for row in 0..height() {
@@ -403,6 +432,14 @@ fn repaint_nonblank() {
 }
 
 pub fn scroll_screen() {
+    if is_capturing() {
+        if let Some(console) = capture_console() {
+            console.scroll();
+        }
+
+        return;
+    }
+
     match mode() {
         Mode::Text => {
             let width = width();
@@ -500,6 +537,14 @@ pub fn scroll_screen() {
 
 /// Показывает курсор консоли.
 pub fn set_cursor(row: usize, col: usize) {
+    if is_capturing() {
+        if let Some(console) = capture_console() {
+            console.set_cursor(Some((row, col)));
+        }
+
+        return;
+    }
+
     if row >= height() || col >= width() {
         hide_cursor();
         return;
@@ -521,6 +566,14 @@ pub fn set_cursor(row: usize, col: usize) {
 
 /// Скрывает курсор консоли.
 pub fn hide_cursor() {
+    if is_capturing() {
+        if let Some(console) = capture_console() {
+            console.set_cursor(None);
+        }
+
+        return;
+    }
+
     match mode() {
         Mode::Text => text_hide_cursor(),
         Mode::Framebuffer => unsafe {
@@ -684,3 +737,294 @@ fn crtc_cell_height() -> usize {
 
     (inb(0x3d5) & 0x1f) as usize + 1
 }
+
+/// Признак графического режима (линейный framebuffer).
+pub fn is_graphics() -> bool {
+    mode() == Mode::Framebuffer
+}
+
+/// Ширина экрана в пикселях (0 в текстовом режиме).
+pub fn pixel_width() -> usize {
+    unsafe { PITCH / BYTES_PER_PIXEL }
+}
+
+/// Высота экрана в пикселях (0 в текстовом режиме).
+pub fn pixel_height() -> usize {
+    unsafe { PIXEL_HEIGHT }
+}
+
+/// Отсекает прямоугольник по границам экрана.
+///
+/// Возвращает `(x0, y0, x1, y1)` в пикселях, где `x1` и `y1` не включены.
+fn clip_rect(x: i32, y: i32, width: i32, height: i32) -> Option<(usize, usize, usize, usize)> {
+    if mode() != Mode::Framebuffer || width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let screen_width = pixel_width() as i32;
+    let screen_height = pixel_height() as i32;
+
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = x.saturating_add(width).min(screen_width);
+    let y1 = y.saturating_add(height).min(screen_height);
+
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+
+    Some((x0 as usize, y0 as usize, x1 as usize, y1 as usize))
+}
+
+/// Записывает пиксель с проверкой границ экрана.
+pub fn put_pixel(x: i32, y: i32, color: u32) {
+    if clip_rect(x, y, 1, 1).is_none() {
+        return;
+    }
+
+    fb_pixel(x as usize, y as usize, color);
+}
+
+/// Читает цвет пикселя. Вне экрана и в текстовом режиме возвращает 0.
+pub fn get_pixel(x: i32, y: i32) -> u32 {
+    if clip_rect(x, y, 1, 1).is_none() {
+        return 0;
+    }
+
+    let pitch = unsafe { PITCH };
+    let framebuffer = unsafe { FRAMEBUFFER };
+
+    if framebuffer.is_null() {
+        return 0;
+    }
+
+    let offset = y as usize * pitch + x as usize * BYTES_PER_PIXEL;
+
+    unsafe { (framebuffer.add(offset) as *const u32).read_volatile() }
+}
+
+/// Заливает `count` 32-битных слов значением `color`.
+///
+/// Используется `rep stosd`: QEMU выполняет его как быстрый memfill,
+/// тогда как отдельные записи в видеопамять обрабатываются попиксельно
+/// и оказываются на порядок медленнее.
+fn fill_dwords(destination: usize, count: usize, color: u32) {
+    if count == 0 {
+        return;
+    }
+
+    unsafe {
+        asm!(
+            "cld",
+            "rep stosd",
+            in("edi") destination as u32,
+            in("eax") color,
+            inout("ecx") count as u32 => _,
+            options(nostack)
+        );
+    }
+}
+
+/// Заливает горизонтальный отрезок строки экрана.
+fn fb_span(x: i32, y: i32, width: i32, color: u32) {
+    if width <= 0 {
+        return;
+    }
+
+    let screen_width = pixel_width() as i32;
+    let screen_height = pixel_height() as i32;
+
+    if y < 0 || y >= screen_height {
+        return;
+    }
+
+    let x0 = x.max(0) as usize;
+    let x1 = x.saturating_add(width).min(screen_width) as usize;
+
+    if x1 <= x0 {
+        return;
+    }
+
+    let pitch = unsafe { PITCH };
+    let framebuffer = unsafe { FRAMEBUFFER };
+
+    if framebuffer.is_null() {
+        return;
+    }
+
+    let offset = y as usize * pitch + x0 * BYTES_PER_PIXEL;
+
+    fill_dwords(framebuffer as usize + offset, x1 - x0, color);
+}
+
+/// Заливает прямоугольник сплошным цветом.
+pub fn fill_rect(x: i32, y: i32, width: i32, height: i32, color: u32) {
+    let (x0, y0, x1, y1) = match clip_rect(x, y, width, height) {
+        Some(bounds) => bounds,
+        None => return,
+    };
+
+    let count = x1 - x0;
+
+    for row in y0..y1 {
+        fb_span(x0 as i32, row as i32, count as i32, color);
+    }
+}
+
+/// Рисует один глиф шрифта 8x16 в пиксельных координатах.
+pub fn draw_glyph(x: i32, y: i32, byte: u8, foreground: u32, background: u32) {
+    if mode() != Mode::Framebuffer {
+        return;
+    }
+
+    let glyph = &font_8x16::GLYPHS[byte as usize];
+
+    for (row_index, bits) in glyph.iter().enumerate() {
+        let row_y = y + row_index as i32;
+        let mut column = 0usize;
+
+        // Пиксели одного цвета собираются в отрезки: меньше записей.
+        while column < GLYPH_WIDTH {
+            let on = bits & (0x80 >> column) != 0;
+            let mut end = column + 1;
+
+            while end < GLYPH_WIDTH && (bits & (0x80 >> end) != 0) == on {
+                end += 1;
+            }
+
+            let color = if on { foreground } else { background };
+            fb_span(
+                x + column as i32,
+                row_y,
+                (end - column) as i32,
+                color,
+            );
+
+            column = end;
+        }
+    }
+}
+
+
+/// Рисует рамку толщиной в один пиксель.
+pub fn draw_rect(x: i32, y: i32, width: i32, height: i32, color: u32) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    fill_rect(x, y, width, 1, color);
+    fill_rect(x, y + height - 1, width, 1, color);
+    fill_rect(x, y, 1, height, color);
+    fill_rect(x + width - 1, y, 1, height, color);
+}
+
+/// Рисует строку шрифтом 8x16 в пиксельных координатах.
+pub fn draw_text(x: i32, y: i32, text: &[u8], foreground: u32, background: u32) {
+    for (index, &byte) in text.iter().enumerate() {
+        draw_glyph(
+            x + index as i32 * GLYPH_WIDTH as i32,
+            y,
+            byte,
+            foreground,
+            background,
+        );
+    }
+}
+
+/// Ширина виртуальной консоли pterm в символах.
+pub const CAPTURE_WIDTH: usize = 80;
+/// Высота виртуальной консоли pterm в символах.
+pub const CAPTURE_HEIGHT: usize = 40;
+
+/// Виртуальная консоль: текстовый экран 80x40, в который перенаправляется
+/// вывод оболочки, когда команда выполняется в окне pterm.
+pub struct CaptureConsole {
+    cells: [u8; CAPTURE_WIDTH * CAPTURE_HEIGHT],
+    cursor: Option<(usize, usize)>,
+}
+
+impl CaptureConsole {
+    pub const fn new() -> Self {
+        Self {
+            cells: [b' '; CAPTURE_WIDTH * CAPTURE_HEIGHT],
+            cursor: None,
+        }
+    }
+
+    /// Очищает экран.
+    pub fn clear(&mut self) {
+        self.cells = [b' '; CAPTURE_WIDTH * CAPTURE_HEIGHT];
+        self.cursor = None;
+    }
+
+    /// Содержимое экрана по строкам, символы CP866.
+    pub fn cells(&self) -> &[u8] {
+        &self.cells
+    }
+
+    /// Позиция текстового курсора, если он видим.
+    fn set_cursor(&mut self, cursor: Option<(usize, usize)>) {
+        self.cursor = cursor;
+    }
+
+    fn store(&mut self, row: usize, col: usize, byte: u8) {
+        if row < CAPTURE_HEIGHT && col < CAPTURE_WIDTH {
+            self.cells[row * CAPTURE_WIDTH + col] = byte;
+        }
+    }
+
+    fn scroll(&mut self) {
+        // Сдвигаем строки вверх вручную: copy_within требует memmove,
+        // которого в ядре нет.
+        for index in 0..(CAPTURE_HEIGHT - 1) * CAPTURE_WIDTH {
+            self.cells[index] = self.cells[index + CAPTURE_WIDTH];
+        }
+
+        let last_row = (CAPTURE_HEIGHT - 1) * CAPTURE_WIDTH;
+        self.cells[last_row..].fill(b' ');
+
+        if let Some((row, col)) = self.cursor {
+            if row > 0 {
+                self.cursor = Some((row - 1, col));
+            }
+        }
+    }
+}
+
+static mut CAPTURE: *mut CaptureConsole = core::ptr::null_mut();
+
+fn capture_ptr() -> *mut CaptureConsole {
+    unsafe { core::ptr::addr_of!(CAPTURE).read() }
+}
+
+fn capture_console() -> Option<&'static mut CaptureConsole> {
+    unsafe { capture_ptr().as_mut() }
+}
+
+fn capture_store(row: usize, col: usize, byte: u8) {
+    if let Some(console) = capture_console() {
+        console.store(row, col, byte);
+    }
+}
+
+/// Включает перенаправление текстового вывода в `console`.
+pub fn begin_capture(console: &mut CaptureConsole) {
+    console.clear();
+
+    unsafe {
+        core::ptr::addr_of_mut!(CAPTURE).write(console);
+    }
+}
+
+/// Выключает перенаправление текстового вывода.
+pub fn end_capture() {
+    unsafe {
+        core::ptr::addr_of_mut!(CAPTURE).write(core::ptr::null_mut());
+    }
+}
+
+/// Возвращает `true`, если текстовый вывод идёт в виртуальную консоль.
+pub fn is_capturing() -> bool {
+    !capture_ptr().is_null()
+}
+

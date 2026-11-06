@@ -1,7 +1,12 @@
 [package]
 name = "perfix"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
+
+[dependencies]
+# Графическая оболочка собирается отдельным crate-ом.
+pdesk = { path = "../pdesk" }
+
 
 
 
