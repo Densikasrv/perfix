@@ -13,4 +13,12 @@ impl BlockDevice for AtaDevice {
         ata::read_sector(lba, buffer)
             .map_err(|_| Ext4Error::Io)
     }
+    fn write_sector(
+    &self,
+    lba: u32,
+    buffer: &[u8; SECTOR_SIZE],
+) -> Result<(), Ext4Error> {
+    ata::write_sector(lba, buffer)
+        .map_err(|_| Ext4Error::Io)
+}
 }

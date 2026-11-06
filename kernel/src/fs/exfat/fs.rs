@@ -1332,14 +1332,13 @@ impl<'a> BitmapWindow<'a> {
         }
 
         while self.cluster_index < target_cluster {
-            let Some(next) = self
-                .volume
-                .next_cluster(self.device, self.cluster, false)?
-            else {
-                return Err(FsError::TruncatedChain);
-            };
-
-            self.cluster = next;
+            // По спецификации exFAT битовая карта распределения всегда
+            // занимает непрерывный диапазон кластеров. Windows-тома могут
+            // не заполнять для неё цепочку FAT, поэтому на неё не опираемся.
+            self.cluster = self
+                .cluster
+                .checked_add(1)
+                .ok_or(FsError::BadGeometry)?;
             self.cluster_index += 1;
         }
 

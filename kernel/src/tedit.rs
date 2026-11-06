@@ -150,6 +150,85 @@ pub struct Outcome {
     pub saved: bool,
 }
 
+fn load_ext4_file(
+    path: &[u8],
+    output: &mut [u8],
+) -> Result<(usize, bool), FsError> {
+    use crate::fs::ext4::{AtaDevice, Ext4};
+
+    let device = AtaDevice;
+    let ext4 = Ext4::mount(
+        &device,
+        crate::disk::selected_lba(),
+        crate::disk::selected_sectors(),
+    )
+    .map_err(|_| FsError::BadGeometry)?;
+
+    let mut inode_number = 2u32;
+
+    for component in path.split(|&byte| byte == b'/') {
+        if component.is_empty() || component == b"." {
+            continue;
+        }
+
+        inode_number = ext4
+            .find_directory_entry(inode_number, component)
+            .map_err(|_| FsError::BadGeometry)?
+            .ok_or(FsError::PathNotFound)?;
+    }
+
+    let inode = ext4
+        .read_inode(inode_number)
+        .map_err(|_| FsError::BadGeometry)?;
+
+    if inode.is_directory || inode.mode & 0xF000 != 0x8000 {
+        return Err(FsError::NotAFile);
+    }
+
+    let utf8 = unsafe { &mut *core::ptr::addr_of_mut!(UTF8) };
+    let mut offset = 0u64;
+
+    while offset < inode.size && (offset as usize) < utf8.len() {
+        let count = ext4
+            .read_file(
+                inode_number,
+                offset,
+                &mut utf8[offset as usize..],
+            )
+            .map_err(|_| FsError::BadGeometry)?;
+
+        if count == 0 {
+            break;
+        }
+
+        offset += count as u64;
+    }
+
+    let mut decoder = crate::utf8::Decoder::new();
+    let mut decoded = [0u8; 4];
+    let mut output_len = 0usize;
+
+    for &byte in &utf8[..offset as usize] {
+        let count = decoder.feed(
+            byte,
+            &mut decoded,
+            crate::fs::exfat::fs::utf16_to_cp866,
+        );
+
+        if output_len + count > output.len() {
+            break;
+        }
+
+        output[output_len..output_len + count]
+            .copy_from_slice(&decoded[..count]);
+
+        output_len += count;
+    }
+
+    let truncated = offset < inode.size || output_len == output.len();
+
+    Ok((output_len, truncated))
+}
 /// Запускает редактор для файла `path`.
 ///
 /// Отсутствующий файл считается новым. Возвращает ошибку только если
@@ -164,12 +243,33 @@ pub fn run(name: &[u8]) -> Result<Outcome, FsError> {
 
     let mut editor = Editor::new(name);
 
-    match exfat::load_text_file(name, &mut buffer.data) {
+    let is_exfat = matches!(
+        crate::disk::selected_kind(),
+        crate::disk::FsKind::Exfat
+    );
+    let is_ext4 = matches!(
+        crate::disk::selected_kind(),
+        crate::disk::FsKind::Ext4
+    );
+
+    let loaded = match crate::disk::selected_kind() {
+        crate::disk::FsKind::Exfat => {
+            exfat::load_text_file(name, &mut buffer.data)
+        }
+        crate::disk::FsKind::Ext4 => {
+            load_ext4_file(name, &mut buffer.data)
+        }
+        crate::disk::FsKind::Other => {
+            return Err(FsError::NotExfat);
+        }
+    };
+
+    match loaded {
         Ok((len, truncated)) => {
             buffer.len = len;
             editor.truncated = truncated;
         }
-        Err(FsError::PathNotFound) => {
+        Err(FsError::PathNotFound) if is_exfat || is_ext4 => {
             editor.new_file = true;
         }
         Err(error) => return Err(error),
@@ -490,11 +590,53 @@ fn paste(buffer: &mut Buffer, editor: &mut Editor) {
     }
 }
 
+fn save_ext4_file(path: &[u8], text: &[u8]) -> Result<(), &'static [u8]> {
+    use crate::fs::ext4::{AtaDevice, Ext4, Ext4Error};
+
+    let device = AtaDevice;
+    let ext4 = Ext4::mount_read_write(
+        &device,
+        crate::disk::selected_lba(),
+        crate::disk::selected_sectors(),
+    )
+    .map_err(|error| match error {
+        Ext4Error::UnsafeWrite => {
+            b"ext4 write disabled: unsafe features" as &'static [u8]
+        }
+        Ext4Error::ReadOnly => b"ext4 is read-only" as &'static [u8],
+        _ => b"ext4 mount failed" as &'static [u8],
+    })?;
+
+    match ext4.write_file_path(path, text) {
+        Ok(_) => Ok(()),
+        Err(Ext4Error::NoSpace) => Err(b"ext4: no free space"),
+        Err(Ext4Error::UnsupportedFeature) => {
+            Err(b"ext4: operation not supported")
+        }
+        Err(Ext4Error::ReadOnly) => Err(b"ext4 is read-only"),
+        Err(_) => Err(b"ext4 write failed"),
+    }
+}
+
 fn save(buffer: &Buffer, editor: &mut Editor) -> bool {
     let utf8 = unsafe { &mut *core::ptr::addr_of_mut!(UTF8) };
     let utf8_len = exfat::cp866_to_utf8(&buffer.data[..buffer.len], utf8);
 
-    match exfat::save_file(editor.name, &utf8[..utf8_len]) {
+    let result: Result<(), &'static [u8]> =
+        match crate::disk::selected_kind() {
+            crate::disk::FsKind::Exfat => {
+                exfat::save_file(editor.name, &utf8[..utf8_len])
+                    .map_err(|error| error.message())
+            }
+            crate::disk::FsKind::Ext4 => {
+                save_ext4_file(editor.name, &utf8[..utf8_len])
+            }
+            crate::disk::FsKind::Other => {
+                Err(b"unsupported filesystem")
+            }
+        };
+
+    match result {
         Ok(()) => {
             editor.dirty = false;
             editor.saved = true;
@@ -515,7 +657,7 @@ fn save(buffer: &Buffer, editor: &mut Editor) -> bool {
             let mut line = [b' '; MAX_WIDTH];
             let mut len = 0usize;
             push(&mut line, &mut len, b"Save failed: ");
-            push(&mut line, &mut len, error.message());
+            push(&mut line, &mut len, error);
             editor.set_status(&line[..len]);
 
             false

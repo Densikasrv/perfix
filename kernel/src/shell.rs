@@ -1,4 +1,4 @@
-use crate::fs::{self, FileSystem, CAT_LINES};
+use crate::fs::{self, FileLocation, FileSystem, CAT_LINES};
 use crate::power;
 use crate::vga;
 use crate::version;
@@ -29,6 +29,17 @@ pub const INPUT_CAPACITY: usize = 256;
 /// Сколько последних команд хранит история.
 const HISTORY_DEPTH: usize = 16;
 
+/// Буфер для копирования файлов командами `cp` и `mv`.
+///
+/// Ядро отображает первые 4 MiB физической памяти, а BSS начинается
+/// чуть ниже 2 MiB. Буфер обязан помещаться в это отображение, иначе
+/// обращение к нему вызовет page fault.
+const COPY_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+static mut COPY_BUFFER: [u8; COPY_BUFFER_SIZE] = [0; COPY_BUFFER_SIZE];
+
+/// Сообщение о попытке обратиться к `/dsk` как к обычному каталогу.
+const RESERVED_DSK: &[u8] = b"dsk is a reserved system path";
+
 /// Первая зарегистрированная файловая система (по умолчанию exFAT).
 fn primary_fs() -> &'static dyn FileSystem {
     fs::filesystems()[0]
@@ -48,20 +59,42 @@ where
 
 /// Выполняет операцию по пути на первой ФС, где путь существует.
 /// Для операций создания (create = true) используется первая ФС.
-fn with_path_fs<F>(path: &[u8], row: usize, create: bool, mut f: F) -> usize
+fn with_path_fs<F>(
+    path: &[u8],
+    row: usize,
+    create: bool,
+    mut f: F,
+) -> usize
 where
-    F: FnMut(&dyn FileSystem) -> usize,
+    F: FnMut(&dyn fs::DirectoryFileSystem) -> usize,
 {
-    if !create {
-        for fs in fs::filesystems() {
-            if (*fs).path_is_directory(path).is_ok() {
-                return f(fs);
-            }
-        }
-        vga::print_at(row, 0, b"Path not found on any filesystem");
+    if create {
+        vga::print_at(row, 0, b"Create operation not supported here");
         return 1;
     }
-    f(primary_fs())
+
+    let filesystems = fs::directory_filesystems();
+
+    let filesystem = match crate::disk::selected_kind() {
+        crate::disk::FsKind::Exfat => filesystems[0],
+        crate::disk::FsKind::Ext4 => filesystems[1],
+        crate::disk::FsKind::Other => {
+            vga::print_at(row, 0, b"Unsupported filesystem");
+            return 1;
+        }
+    };
+
+    match filesystem.path_is_directory(path) {
+        Ok(true) => f(filesystem),
+        Ok(false) => {
+            vga::print_at(row, 0, b"Not a directory");
+            1
+        }
+        Err(_) => {
+            vga::print_at(row, 0, b"Path not found");
+            1
+        }
+    }
 }
 
 static mut HISTORY: [[u8; INPUT_CAPACITY]; HISTORY_DEPTH] =
@@ -220,10 +253,202 @@ fn trim_ascii_space(input: &[u8]) -> &[u8] {
     &input[start..end]
 }
 
+/// Является ли нормализованный путь системным пространством `/dsk`.
+fn is_reserved_dsk(path: &[u8]) -> bool {
+    path == b"/dsk" || path.starts_with(b"/dsk/")
+}
+
+fn parse_partition_number(input: &[u8]) -> Option<usize> {
+    if input.is_empty() {
+        return None;
+    }
+
+    let mut value = 0usize;
+
+    for &byte in input {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+
+        value = value.checked_mul(10)?;
+        value = value.checked_add((byte - b'0') as usize)?;
+    }
+
+    Some(value)
+}
+
+/// Разбирает аргумент в расположение файла.
+///
+/// Путь `/dsk/N/...` адресует раздел `N`; остальные пути относятся
+/// к текущему выбранному разделу.
+fn parse_file_location(
+    argument: &[u8],
+    out: &mut [u8; PATH_MAX],
+) -> Result<FileLocation, &'static [u8]> {
+    let kind;
+    let start_lba;
+    let sectors;
+    let path_len;
+
+    if argument.starts_with(b"/dsk/") {
+        let rest = &argument[5..];
+        let mut digits_end = 0usize;
+
+        while digits_end < rest.len() && rest[digits_end].is_ascii_digit() {
+            digits_end += 1;
+        }
+
+        if digits_end == 0 {
+            return Err(RESERVED_DSK);
+        }
+
+        let number = parse_partition_number(&rest[..digits_end])
+            .ok_or(b"Partition not found" as &'static [u8])?;
+        let tail = &rest[digits_end..];
+
+        if !tail.is_empty() && tail[0] != b'/' {
+            return Err(RESERVED_DSK);
+        }
+
+        // Собираем путь внутри раздела и нормализуем его.
+        let mut raw = [0u8; PATH_MAX];
+        raw[0] = b'/';
+        let remainder = if tail.is_empty() { tail } else { &tail[1..] };
+
+        if remainder.len() + 1 > raw.len() {
+            return Err(b"Path is too long" as &'static [u8]);
+        }
+
+        raw[1..1 + remainder.len()].copy_from_slice(remainder);
+        path_len = absolute_path(&raw[..1 + remainder.len()], out)
+            .ok_or(b"Path is too long" as &'static [u8])?;
+
+        // Внутри раздела каталог `dsk` тоже зарезервирован.
+        if is_reserved_dsk(&out[..path_len]) {
+            return Err(RESERVED_DSK);
+        }
+
+        let mut partitions = [crate::disk::DiskPartition {
+            number: 0,
+            kind: crate::disk::FsKind::Other,
+            start_lba: 0,
+            sectors: 0,
+        }; 4];
+        let count = crate::disk::read_partitions(&mut partitions);
+        let partition = partitions[..count]
+            .iter()
+            .find(|p| p.number == number)
+            .ok_or(b"Partition not found" as &'static [u8])?;
+
+        if partition.kind == crate::disk::FsKind::Other {
+            return Err(b"Unsupported filesystem" as &'static [u8]);
+        }
+
+        kind = partition.kind;
+        start_lba = partition.start_lba;
+        sectors = partition.sectors;
+    } else {
+        path_len = absolute_path(argument, out)
+            .ok_or(b"Path is too long" as &'static [u8])?;
+
+        if is_reserved_dsk(&out[..path_len]) {
+            return Err(RESERVED_DSK);
+        }
+
+        kind = crate::disk::selected_kind();
+
+        if kind == crate::disk::FsKind::Other {
+            return Err(b"Unsupported filesystem" as &'static [u8]);
+        }
+
+        start_lba = crate::disk::selected_lba();
+        sectors = crate::disk::selected_sectors();
+    }
+
+    FileLocation::new(kind, start_lba, sectors, &out[..path_len])
+        .ok_or(b"Path is too long" as &'static [u8])
+}
+
+/// Выполняет `cp` или `mv`. Возвращает число занятых строк вывода.
+fn transfer_command(argument: &[u8], row: usize, moving: bool) -> usize {
+    let (source_arg, destination_arg) = split_first_space(argument);
+
+    if source_arg.is_empty() || destination_arg.is_empty() {
+        if moving {
+            vga::print_at(row, 0, b"Usage: mv <source> <destination>");
+        } else {
+            vga::print_at(row, 0, b"Usage: cp <source> <destination>");
+        }
+
+        return 1;
+    }
+
+    let mut source_path = [0u8; PATH_MAX];
+    let mut destination_path = [0u8; PATH_MAX];
+
+    let source = match parse_file_location(source_arg, &mut source_path) {
+        Ok(location) => location,
+        Err(message) => {
+            vga::print_at(row, 0, message);
+            return 1;
+        }
+    };
+
+    let destination =
+        match parse_file_location(destination_arg, &mut destination_path) {
+            Ok(location) => location,
+            Err(message) => {
+                vga::print_at(row, 0, message);
+                return 1;
+            }
+        };
+
+    if source.same_file(&destination) {
+        vga::print_at(row, 0, b"source and destination are the same");
+        return 1;
+    }
+
+    // Ядро однопоточное, поэтому статический буфер можно использовать
+    // напрямую без блокировки.
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(COPY_BUFFER) };
+
+    let result = if moving {
+        fs::move_file(&source, &destination, buffer)
+    } else {
+        fs::copy_file(&source, &destination, buffer)
+    };
+
+    let mut message = [b' '; 80];
+    let mut len = 0usize;
+
+    match result {
+        Ok(size) => {
+            push_message(
+                &mut message,
+                &mut len,
+                if moving { b"mv: moved " } else { b"cp: copied " },
+            );
+            push_dec_message(&mut message, &mut len, size as usize);
+            push_message(&mut message, &mut len, b" bytes");
+        }
+        Err(error) => {
+            push_message(
+                &mut message,
+                &mut len,
+                if moving { b"mv: " } else { b"cp: " },
+            );
+            push_message(&mut message, &mut len, error.message());
+        }
+    }
+
+    vga::print_at(row, 0, &message[..len]);
+    1
+}
+
 /// Сколько строк вывода резервировать под команду до её выполнения.
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
-        25
+        27
     } else if input == b"version" {
         5
     } else if input == b"diskinfo" {
@@ -341,9 +566,14 @@ fn change_directory(argument: &[u8], row: usize) {
         return;
     };
 
+    if is_reserved_dsk(&path[..target_len]) {
+        vga::print_at(row, 0, RESERVED_DSK);
+        return;
+    }
+
     let mut cd_handled = false;
-    for fs in fs::filesystems() {
-        match fs.path_is_directory(&path[..target_len]) {
+    for filesystem in fs::directory_filesystems() {
+    match filesystem.path_is_directory(&path[..target_len]) {
             Ok(true) => {
                 set_cwd(&path[..target_len]);
 
@@ -413,21 +643,26 @@ pub fn execute(input: &[u8], row: &mut usize) {
         if argument.is_empty() {
             push_message(&mut message, &mut len, b"tedit: usage: tedit <file>");
         } else if let Some(path_len) = absolute_path(argument, &mut path) {
-            match crate::tedit::run(&path[..path_len]) {
-                Ok(outcome) => {
-                    push_message(&mut message, &mut len, b"tedit: ");
+            if is_reserved_dsk(&path[..path_len]) {
+                push_message(&mut message, &mut len, b"tedit: ");
+                push_message(&mut message, &mut len, RESERVED_DSK);
+            } else {
+                match crate::tedit::run(&path[..path_len]) {
+                    Ok(outcome) => {
+                        push_message(&mut message, &mut len, b"tedit: ");
 
-                    if outcome.saved {
-                        push_message(&mut message, &mut len, b"saved ");
-                    } else {
-                        push_message(&mut message, &mut len, b"closed ");
+                        if outcome.saved {
+                            push_message(&mut message, &mut len, b"saved ");
+                        } else {
+                            push_message(&mut message, &mut len, b"closed ");
+                        }
+
+                        push_message(&mut message, &mut len, &path[..path_len]);
                     }
-
-                    push_message(&mut message, &mut len, &path[..path_len]);
-                }
-                Err(error) => {
-                    push_message(&mut message, &mut len, b"tedit: ");
-                    push_message(&mut message, &mut len, error.message());
+                    Err(error) => {
+                        push_message(&mut message, &mut len, b"tedit: ");
+                        push_message(&mut message, &mut len, error.message());
+                    }
                 }
             }
         } else {
@@ -457,9 +692,9 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 4, 0, b"clear     - clear the screen");
         vga::print_at(output_row + 5, 0, b"divzero   - test CPU exception");
         vga::print_at(output_row + 6, 0, b"pagefault - test page fault");
-        vga::print_at(output_row + 7, 0, b"diskinfo  - read exFAT boot sector");
-        vga::print_at(output_row + 8, 0, b"mount     - show exFAT volume info");
-        vga::print_at(output_row + 9, 0, b"ls [path] - list exFAT directory");
+        vga::print_at(output_row + 7, 0, b"diskinfo  - read boot sector");
+        vga::print_at(output_row + 8, 0, b"mount     - show volume info");
+        vga::print_at(output_row + 9, 0, b"ls [path] - list directory contents");
         vga::print_at(output_row + 10, 0, b"cat <file>- print file contents");
         vga::print_at(output_row + 11, 0, b"charset   - show CP866 glyphs");
         vga::print_at(output_row + 12, 0, b"write <f> <text> - create/overwrite file");
@@ -470,11 +705,13 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 17, 0, b"cd <dir>  - change directory");
         vga::print_at(output_row + 18, 0, b"pwd       - print working directory");
         vga::print_at(output_row + 19, 0, b"Up/Down   - command history");
-        vga::print_at(output_row + 20, 0, b"listpart  - list exFAT partitions");
+        vga::print_at(output_row + 20, 0, b"listpart  - list partitions");
         vga::print_at(output_row + 21, 0, b"cdpart <n>- select partition");
         vga::print_at(output_row + 22, 0, b"fetch     - system information");
         vga::print_at(output_row + 23, 0, b"halt      - turn off the computer");
         vga::print_at(output_row + 24, 0, b"calc      - simple calculator");
+        vga::print_at(output_row + 25, 0, b"cp <src> <dst> - copy file");
+        vga::print_at(output_row + 26, 0, b"mv <src> <dst> - move file");
     } else if input == b"about" {
         vga::print_at(output_row, 0, b"Perfix");
         vga::print_at(output_row + 1, 0, b"Copyright (C) 2026 Densikasrv");
@@ -576,7 +813,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         }
 
         if i == 0 || n < 0 {
-            vga::print_at(output_row, 0, b"Usage: setup <partiton number>");
+            vga::print_at(output_row, 0, b"Usage: setup <partiton number>"); // тут будет установщик
             *row = output_row + 1;
             prompt(*row);
             return;
@@ -674,14 +911,61 @@ match crate::disk::read_ext4_root_directory_block(
             }
 
             if inode_number != 0 && name_length > 0 {
-                vga::print_at(
-                    output_row + 7 + entries,
-                    2,
-                    &directory_block[offset + 8..offset + 8 + name_length],
-                );
+    vga::print_at(
+        output_row + 7 + entries,
+        2,
+        &directory_block[offset + 8..offset + 8 + name_length],
+    );
 
-                entries += 1;
+    let mut inode_hex = [b'0'; 8];
+    let digits = b"0123456789ABCDEF";
+    let mut value = inode_number;
+
+    for i in (0..8).rev() {
+        inode_hex[i] = digits[(value & 0xF) as usize];
+        value >>= 4;
+    }
+
+    vga::print_at(
+        output_row + 7 + entries,
+        20,
+        b"inode 0x",
+    );
+    vga::print_at(
+        output_row + 7 + entries,
+        28,
+        &inode_hex,
+    );
+
+    if inode_number == 11 {
+    let test_row = output_row + 7 + entries;
+
+    match crate::disk::read_ext4_inode(number, inode_number) {
+        Ok(_info) => {
+            vga::print_at(test_row, 40, b"INODE READ OK");
+
+            let mut test_block = [0u8; 4096];
+
+            match crate::disk::read_ext4_directory_block(
+                number,
+                inode_number,
+                &mut test_block,
+            ) {
+                Ok(_size) => {
+                    vga::print_at(test_row, 54, b"DIR READ OK");
+                }
+                Err(message) => {
+                    vga::print_at(test_row, 54, message);
+                }
             }
+        }
+        Err(message) => {
+            vga::print_at(test_row, 40, message);
+        }
+    }
+}
+entries += 1;
+}
 
             offset += record_length;
         }
@@ -740,6 +1024,13 @@ match crate::disk::read_ext4_root_directory_block(
         };
 
         if let Some(target_len) = target_len {
+            if is_reserved_dsk(&path[..target_len]) {
+                vga::print_at(output_row, 0, RESERVED_DSK);
+                *row = output_row + 1;
+                prompt(*row);
+                return;
+            }
+
             let used = with_path_fs(&path[..target_len], output_row, false, |fs| fs.shell_list(&path[..target_len], output_row));
             *row = output_row + used;
             prompt(*row);
@@ -748,31 +1039,86 @@ match crate::disk::read_ext4_root_directory_block(
 
         path_too_long(output_row);
     } else if let Some(argument) = command_arg(input, b"cat") {
-        if argument.is_empty() {
-            let used = with_path_fs(b"", output_row, false, |fs| fs.shell_cat(b"", output_row));
-            *row = output_row + used;
-            prompt(*row);
-            return;
-        }
-
         let mut path = [0u8; PATH_MAX];
 
-        if let Some(len) = absolute_path(argument, &mut path) {
-            let used = with_path_fs(&path[..len], output_row, false, |fs| fs.shell_cat(&path[..len], output_row));
-            *row = output_row + used;
+        let len = if argument.is_empty() {
+            0
+        } else {
+            match absolute_path(argument, &mut path) {
+                Some(len) => len,
+                None => {
+                    path_too_long(output_row);
+                    return;
+                }
+            }
+        };
+
+        if len > 0 && is_reserved_dsk(&path[..len]) {
+            vga::print_at(output_row, 0, RESERVED_DSK);
+            *row = output_row + 1;
             prompt(*row);
             return;
         }
 
-        path_too_long(output_row);
+        let filesystems = fs::directory_filesystems();
+
+        let filesystem = match crate::disk::selected_kind() {
+            crate::disk::FsKind::Exfat => filesystems[0],
+            crate::disk::FsKind::Ext4 => filesystems[1],
+            crate::disk::FsKind::Other => {
+                vga::print_at(output_row, 0, b"Unsupported filesystem");
+                prompt(output_row + 1);
+                return;
+            }
+        };
+
+        let used = filesystem.shell_cat(&path[..len], output_row);
+        *row = output_row + used;
+        prompt(*row);
+        return;
     } else if let Some(argument) = command_arg(input, b"write") {
         let (name, text) = split_first_space(argument);
         let mut path = [0u8; PATH_MAX];
 
-        if name.is_empty() {
-            with_path_fs(b"", output_row, true, |fs| fs.shell_write(b"", text, output_row));
-        } else if let Some(len) = absolute_path(name, &mut path) {
-            with_path_fs(&path[..len], output_row, true, |fs| fs.shell_write(&path[..len], text, output_row));
+        let path_len = if name.is_empty() {
+            Some(0)
+        } else {
+            absolute_path(name, &mut path)
+        };
+
+        if let Some(len) = path_len {
+            let write_path = &path[..len];
+
+            if is_reserved_dsk(write_path) {
+                vga::print_at(output_row, 0, RESERVED_DSK);
+                *row = output_row + 1;
+                prompt(*row);
+                return;
+            }
+
+            match crate::disk::selected_kind() {
+                crate::disk::FsKind::Exfat => {
+                    for_each_fs(output_row, |fs, row| {
+                        fs.shell_write(write_path, text, row)
+                    });
+                }
+                crate::disk::FsKind::Ext4 => {
+                    let filesystem = fs::directory_filesystems()[1];
+                    let used = filesystem.shell_write(
+                        write_path,
+                        text,
+                        output_row,
+                    );
+                    *row = output_row + used;
+                    prompt(*row);
+                    return;
+                }
+                crate::disk::FsKind::Other => {
+                    vga::print_at(output_row, 0, b"Unsupported filesystem");
+                    prompt(output_row + 1);
+                    return;
+                }
+            }
         } else {
             path_too_long(output_row);
         }
@@ -780,9 +1126,16 @@ match crate::disk::read_ext4_root_directory_block(
         let mut path = [0u8; PATH_MAX];
 
         if argument.is_empty() {
-            with_path_fs(b"", output_row, false, |fs| fs.shell_remove(b"", output_row));
+            for_each_fs(output_row, |fs, row| fs.shell_remove(b"", row));
         } else if let Some(len) = absolute_path(argument, &mut path) {
-            with_path_fs(&path[..len], output_row, false, |fs| fs.shell_remove(&path[..len], output_row));
+            if is_reserved_dsk(&path[..len]) {
+                vga::print_at(output_row, 0, RESERVED_DSK);
+                *row = output_row + 1;
+                prompt(*row);
+                return;
+            }
+
+            for_each_fs(output_row, |fs, row| fs.shell_remove(&path[..len], row));
         } else {
             path_too_long(output_row);
         }
@@ -790,9 +1143,16 @@ match crate::disk::read_ext4_root_directory_block(
         let mut path = [0u8; PATH_MAX];
 
         if argument.is_empty() {
-            with_path_fs(b"", output_row, true, |fs| fs.shell_mkdir(b"", output_row));
+            for_each_fs(output_row, |fs, row| fs.shell_mkdir(b"", row));
         } else if let Some(len) = absolute_path(argument, &mut path) {
-            with_path_fs(&path[..len], output_row, true, |fs| fs.shell_mkdir(&path[..len], output_row));
+            if is_reserved_dsk(&path[..len]) {
+                vga::print_at(output_row, 0, RESERVED_DSK);
+                *row = output_row + 1;
+                prompt(*row);
+                return;
+            }
+
+            for_each_fs(output_row, |fs, row| fs.shell_mkdir(&path[..len], row));
         } else {
             path_too_long(output_row);
         }
@@ -800,12 +1160,29 @@ match crate::disk::read_ext4_root_directory_block(
         let mut path = [0u8; PATH_MAX];
 
         if argument.is_empty() {
-            with_path_fs(b"", output_row, false, |fs| fs.shell_rmdir(b"", output_row));
+            for_each_fs(output_row, |fs, row| fs.shell_rmdir(b"", row));
         } else if let Some(len) = absolute_path(argument, &mut path) {
-            with_path_fs(&path[..len], output_row, false, |fs| fs.shell_rmdir(&path[..len], output_row));
+            if is_reserved_dsk(&path[..len]) {
+                vga::print_at(output_row, 0, RESERVED_DSK);
+                *row = output_row + 1;
+                prompt(*row);
+                return;
+            }
+
+            for_each_fs(output_row, |fs, row| fs.shell_rmdir(&path[..len], row));
         } else {
             path_too_long(output_row);
         }
+    } else if let Some(argument) = command_arg(input, b"cp") {
+        let used = transfer_command(argument, output_row, false);
+        *row = output_row + used;
+        prompt(*row);
+        return;
+    } else if let Some(argument) = command_arg(input, b"mv") {
+        let used = transfer_command(argument, output_row, true);
+        *row = output_row + used;
+        prompt(*row);
+        return;
     } else if input == b"halt" {
         vga::print_at(output_row, 0, b"Shutting down...");
         if !power::shutdown() {

@@ -11,8 +11,8 @@ pub use fs::{cp866_to_utf8, FsError, PartitionInfo, Volume, MAX_PARTITIONS};
 use crate::ata::{self, AtaError};
 use crate::vga;
 
-/// Устройство чтения секторов через ATA PIO (primary master).
-struct AtaDevice;
+/// Устройство чтения/записи секторов через ATA PIO (primary master).
+pub struct AtaDevice;
 
 fn map_ata_error(error: AtaError) -> fs::BlockError {
     match error {

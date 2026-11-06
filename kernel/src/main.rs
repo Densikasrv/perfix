@@ -370,9 +370,14 @@ fn test_ext4() {
     use crate::fs::ext4::{AtaDevice, Ext4};
 
     let device = AtaDevice;
-    let partition_start = 2048; // ЗАМЕНИ на реальный LBA раздела
+     let partition_start = crate::disk::selected_lba();
+     let partition_sectors = crate::disk::selected_sectors();
 
-    match Ext4::mount(&device, partition_start) {
+    match Ext4::mount(
+    &device,
+    partition_start,
+    partition_sectors,
+) {
         Ok(ext4) => {
             // Файловая система распознана.
             let _block_size = ext4.block_size();

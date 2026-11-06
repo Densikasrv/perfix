@@ -238,6 +238,7 @@ pub fn read_partitions(out: &mut [DiskPartition]) -> usize {
 
 static mut SELECTED_KIND: FsKind = FsKind::Exfat;
 static mut SELECTED_LBA: u32 = 0;
+static mut SELECTED_SECTORS: u32 = 0;
 
 pub fn selected_kind() -> FsKind {
     unsafe { SELECTED_KIND }
@@ -245,6 +246,10 @@ pub fn selected_kind() -> FsKind {
 
 pub fn selected_lba() -> u32 {
     unsafe { SELECTED_LBA }
+}
+
+pub fn selected_sectors() -> u32 {
+    unsafe { SELECTED_SECTORS }
 }
 
 pub fn select_partition(number: usize) -> Result<FsKind, &'static [u8]> {
@@ -284,7 +289,7 @@ pub fn select_partition(number: usize) -> Result<FsKind, &'static [u8]> {
         FsKind::Ext4 => {
             let device = crate::fs::ext4::AtaDevice;
 
-            crate::fs::ext4::Ext4::mount(&device, partition.start_lba)
+            crate::fs::ext4::Ext4::mount(&device, partition.start_lba, partition.sectors)
                 .map_err(|_| b"ext4 superblock validation failed" as &'static [u8])?;
         }
 
@@ -296,9 +301,9 @@ pub fn select_partition(number: usize) -> Result<FsKind, &'static [u8]> {
     unsafe {
         SELECTED_KIND = partition.kind;
         SELECTED_LBA = partition.start_lba;
+        SELECTED_SECTORS = partition.sectors;
     }
-
-    Ok(partition.kind)
+    Ok(partition.kind) 
 }
 pub fn read_ext4_root_inode(
     number: usize,
@@ -320,12 +325,43 @@ pub fn read_ext4_root_inode(
     let device = crate::fs::ext4::AtaDevice;
 
     let filesystem =
-        crate::fs::ext4::Ext4::mount(&device, partition.start_lba)
+        crate::fs::ext4::Ext4::mount(&device, partition.start_lba, partition.sectors)
             .map_err(|_| b"ext4 mount failed" as &'static [u8])?;
 
     filesystem
         .read_inode(2)
         .map_err(|_| b"could not read root inode" as &'static [u8])
+}
+
+pub fn read_ext4_inode(
+    partition_number: usize,
+    inode_number: u32,
+) -> Result<crate::fs::ext4::InodeInfo, &'static [u8]> {
+    let mut partitions = [DiskPartition {
+        number: 0,
+        kind: FsKind::Other,
+        start_lba: 0,
+        sectors: 0,
+    }; 4];
+
+    let count = read_partitions(&mut partitions);
+
+    let partition = partitions[..count]
+        .iter()
+        .find(|p| {
+            p.number == partition_number && p.kind == FsKind::Ext4
+        })
+        .ok_or(b"ext4 partition not found" as &'static [u8])?;
+
+    let device = crate::fs::ext4::AtaDevice;
+
+    let filesystem =
+        crate::fs::ext4::Ext4::mount(&device, partition.start_lba, partition.sectors)
+            .map_err(|_| b"ext4 mount failed" as &'static [u8])?;
+
+    filesystem
+        .read_inode(inode_number)
+        .map_err(|_| b"could not read inode" as &'static [u8])
 }
 pub fn read_ext4_root_directory_block(
     number: usize,
@@ -348,7 +384,7 @@ pub fn read_ext4_root_directory_block(
     let device = crate::fs::ext4::AtaDevice;
 
     let filesystem =
-        crate::fs::ext4::Ext4::mount(&device, partition.start_lba)
+        crate::fs::ext4::Ext4::mount(&device, partition.start_lba, partition.sectors)
             .map_err(|_| b"ext4 mount failed" as &'static [u8])?;
 
     let inode = filesystem
@@ -363,6 +399,51 @@ pub fn read_ext4_root_directory_block(
 
     if block_size > buffer.len() || inode.first_extent_block == 0 {
         return Err(b"invalid root directory extent");
+    }
+
+    filesystem
+        .read_block(inode.first_extent_block, buffer)
+        .map_err(|_| b"could not read directory block" as &'static [u8])?;
+
+    Ok(block_size)
+}
+pub fn read_ext4_directory_block(
+    number: usize,
+    inode_number: u32,
+    buffer: &mut [u8; 4096],
+) -> Result<usize, &'static [u8]> {
+    let mut partitions = [DiskPartition {
+        number: 0,
+        kind: FsKind::Other,
+        start_lba: 0,
+        sectors: 0,
+    }; 4];
+
+    let count = read_partitions(&mut partitions);
+
+    let partition = partitions[..count]
+        .iter()
+        .find(|p| p.number == number && p.kind == FsKind::Ext4)
+        .ok_or(b"ext4 partition not found" as &'static [u8])?;
+
+    let device = crate::fs::ext4::AtaDevice;
+
+    let filesystem =
+        crate::fs::ext4::Ext4::mount(&device, partition.start_lba, partition.sectors)
+            .map_err(|_| b"ext4 mount failed" as &'static [u8])?;
+
+    let inode = filesystem
+        .read_inode(inode_number)
+        .map_err(|_| b"could not read directory inode" as &'static [u8])?;
+
+    if !inode.is_directory {
+        return Err(b"inode is not a directory");
+    }
+
+    let block_size = filesystem.block_size() as usize;
+
+    if block_size > buffer.len() || inode.first_extent_block == 0 {
+        return Err(b"invalid directory extent");
     }
 
     filesystem
