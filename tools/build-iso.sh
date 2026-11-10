@@ -17,13 +17,20 @@ TARGET_SPEC="$KERNEL_DIR/i686-perfix.json"
 TARGET_DIR="$KERNEL_DIR/target"
 ELF="$TARGET_DIR/i686-perfix/debug/perfix"
 ISO="$BUILD_DIR/perfix-min.iso"
+GRUB_DIR="/usr/lib/grub/i386-pc"
+BOOT_IMG="$GRUB_DIR/boot.img"
 
-for tool in nasm cargo rustc grub-mkrescue xorriso; do
+for tool in nasm cargo rustc grub-mkrescue grub-mkimage xorriso; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "error: не найден '$tool'" >&2
         exit 1
     fi
 done
+
+if [ ! -f "$BOOT_IMG" ]; then
+    echo "error: не найден $BOOT_IMG (нужен пакет grub i386-pc)" >&2
+    exit 1
+fi
 
 if ! rustc +nightly --version >/dev/null 2>&1; then
     echo "error: нет toolchain nightly (rustup toolchain install nightly)" >&2
@@ -37,12 +44,12 @@ fi
 
 mkdir -p "$TARGET_DIR" "$BUILD_DIR/iso/boot/grub"
 
-echo "[1/4] Объектные файлы загрузчика"
+echo "[1/5] Объектные файлы загрузчика"
 nasm -f elf32 "$ROOT/boot/boot.asm" -o "$TARGET_DIR/boot.o"
 nasm -f elf32 "$ROOT/boot/gdt.asm" -o "$TARGET_DIR/boot-gdt.o"
 nasm -f elf32 "$ROOT/boot/idt.asm" -o "$TARGET_DIR/boot-idt.o"
 
-echo "[2/4] Сборка ядра"
+echo "[2/5] Сборка ядра"
 export RUSTFLAGS="-C link-arg=-T$KERNEL_DIR/linker.ld \
 -C link-arg=-m -C link-arg=elf_i386 \
 -C link-arg=$TARGET_DIR/boot.o \
@@ -72,7 +79,7 @@ printf '%s\n' "$BUILD_OUTPUT"
 
 if [ "$BUILD_STATUS" -ne 0 ]; then
     if printf '%s' "$BUILD_OUTPUT" | grep -q 'json-target-spec'; then
-        echo "[2/4] Повторная сборка с -Z json-target-spec"
+        echo "[2/5] Повторная сборка с -Z json-target-spec"
         build_kernel -Z build-std=core -Z json-target-spec
     else
         exit "$BUILD_STATUS"
@@ -84,8 +91,30 @@ if [ ! -f "$ELF" ]; then
     exit 1
 fi
 
-echo "[3/4] Подготовка каталога ISO"
+echo "[3/5] Подготовка каталога ISO и установщика"
 cp "$ELF" "$BUILD_DIR/iso/boot/perfix.elf"
+cp "$BOOT_IMG" "$BUILD_DIR/iso/boot/boot.img"
+
+# core.img ищет установленное ядро на любом разделе по файлу /perfix.elf,
+# поэтому номер раздела не зашивается в загрузчик.
+echo "[4/5] Генерация core.img"
+cat > "$BUILD_DIR/early.cfg" <<'EOF'
+set timeout=0
+set default=0
+menuentry "Perfix" {
+    search --no-floppy --file --set=root /perfix.elf
+    multiboot /perfix.elf
+    boot
+}
+EOF
+
+grub-mkimage \
+    -O i386-pc \
+    -o "$BUILD_DIR/iso/boot/core.img" \
+    -p '(hd0)/' \
+    -c "$BUILD_DIR/early.cfg" \
+    biosdisk part_msdos part_gpt ext2 search search_fs_file \
+    search_fs_uuid multiboot normal configfile echo test boot
 
 cat > "$BUILD_DIR/iso/boot/grub/grub.cfg" <<'EOF'
 set timeout=0
@@ -95,18 +124,21 @@ menuentry "Perfix" {
     insmod all_video
     set gfxpayload=1920x1080x32
     multiboot /boot/perfix.elf
+    module /boot/perfix.elf
+    module /boot/boot.img
+    module /boot/core.img
     boot
 }
 EOF
 
-echo "[4/4] grub-mkrescue"
+echo "[5/5] grub-mkrescue"
 grub-mkrescue \
     --modules="multiboot" \
     --fonts="" \
     --locales="" \
     --themes="" \
     -o "$ISO" \
-    -d /usr/lib/grub/i386-pc \
+    -d "$GRUB_DIR" \
     "$BUILD_DIR/iso"
 
 echo

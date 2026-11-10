@@ -16,6 +16,8 @@
 
 pub mod cursor;
 pub mod dock;
+pub mod editor;
+pub mod installer;
 pub mod snake;
 pub mod terminal;
 pub mod tetris;
@@ -27,11 +29,22 @@ pub enum App {
     Terminal,
     Tetris,
     Snake,
+    Editor,
+    Installer,
 }
 
 impl App {
     /// Все приложения в порядке иконок дока.
-    pub const ALL: [App; 3] = [App::Terminal, App::Tetris, App::Snake];
+    ///
+    /// Установщик всегда последний: на установленной системе он скрывается
+    /// простым уменьшением количества видимых приложений на единицу.
+    pub const ALL: [App; 5] = [
+        App::Terminal,
+        App::Tetris,
+        App::Snake,
+        App::Editor,
+        App::Installer,
+    ];
 
     /// Номер приложения (индекс в [`App::ALL`]).
     pub const fn index(self) -> usize {
@@ -39,6 +52,8 @@ impl App {
             App::Terminal => 0,
             App::Tetris => 1,
             App::Snake => 2,
+            App::Editor => 3,
+            App::Installer => 4,
         }
     }
 
@@ -48,6 +63,8 @@ impl App {
             App::Terminal => b"pterm",
             App::Tetris => b"tetris",
             App::Snake => b"snake",
+            App::Editor => b"tedit",
+            App::Installer => b"install",
         }
     }
 
@@ -69,6 +86,14 @@ impl App {
             App::Snake => (
                 snake::CONTENT_WIDTH + chrome_width,
                 snake::CONTENT_HEIGHT + chrome_height,
+            ),
+            App::Editor => (
+                editor::CONTENT_WIDTH + chrome_width,
+                editor::CONTENT_HEIGHT + chrome_height,
+            ),
+            App::Installer => (
+                installer::CONTENT_WIDTH + chrome_width,
+                installer::CONTENT_HEIGHT + chrome_height,
             ),
         }
     }
@@ -93,6 +118,10 @@ pub enum Key {
     ArrowDown,
     ArrowLeft,
     ArrowRight,
+    PageUp,
+    PageDown,
+    /// Ctrl+<буква>; буква всегда латинская в нижнем регистре.
+    Control(u8),
     /// Сменилась раскладка клавиатуры.
     LayoutChanged,
     /// Запрос на выход из оболочки (Ctrl+Q).
@@ -135,6 +164,31 @@ pub struct CommandResult {
 }
 
 
+/// Раздел ext4, доступный установщику.
+#[derive(Clone, Copy, Default)]
+pub struct InstallTarget {
+    /// Номер раздела в таблице MBR (с единицы).
+    pub number: u32,
+    /// Размер раздела в секторах.
+    pub sectors: u32,
+    /// Раздел уже содержит ext4.
+    pub ext4: bool,
+}
+
+/// Результат загрузки текстового файла для GUI-редактора.
+#[derive(Clone, Copy, Default)]
+pub struct LoadedText {
+    /// Сколько байт текста записано в буфер.
+    pub length: usize,
+    /// Файл уже существовал (иначе это новый файл).
+    pub existed: bool,
+    /// Файл не поместился в буфер и был обрезан.
+    pub truncated: bool,
+    /// Длина абсолютного пути, записанного во второй буфер.
+    pub path_length: usize,
+}
+
+
 /// Интерфейс, через который pdesk работает с железом.
 ///
 /// Реализуется ядром Perfix; при необходимости можно подставить заглушку,
@@ -157,6 +211,12 @@ pub trait Platform {
 
     /// Записывает цвет пикселя.
     fn write_pixel(&mut self, x: i32, y: i32, color: u32);
+
+    /// Сохраняет прямоугольник экрана в буфер (по строкам, без отступа).
+    fn read_rect(&mut self, x: i32, y: i32, width: i32, height: i32, out: &mut [u32]);
+
+    /// Возвращает прямоугольник экрана из буфера [`Platform::read_rect`].
+    fn write_rect(&mut self, x: i32, y: i32, width: i32, height: i32, data: &[u32]);
 
     /// Следующее нажатие клавиши, если оно есть.
     fn read_key(&mut self) -> Option<Key>;
@@ -200,6 +260,45 @@ pub trait Platform {
     /// Ядро калибрует это значение по RTC при первом обращении.
     fn ticks_per_second(&mut self) -> u64;
 
+    /// Заполняет `out` списком разделов ext4, доступных для установки.
+    ///
+    /// Возвращает количество записей.
+    fn install_targets(&mut self, out: &mut [InstallTarget]) -> usize;
+
+    /// Устанавливает Perfix на раздел с указанным номером.
+    ///
+    /// При `format` раздел сначала форматируется в ext4 (данные теряются).
+    /// `Ok(())` — ядро и GRUB записаны; иначе возвращается текст ошибки.
+    fn install_perfix(
+        &mut self,
+        partition_number: u32,
+        format: bool,
+    ) -> Result<(), &'static [u8]>;
+
+    /// Доступен ли установщик Perfix.
+    ///
+    /// На уже установленной системе он скрыт из дока и меню.
+    fn installer_available(&mut self) -> bool {
+        true
+    }
+
+    /// Загружает текстовый файл для GUI-редактора.
+    ///
+    /// Текст пишется в `out` (CP866), абсолютный путь — в `path`.
+    /// Отсутствующий файл — это не ошибка: возвращается пустой текст
+    /// с `existed == false`.
+    fn load_text_file(
+        &mut self,
+        name: &[u8],
+        out: &mut [u8],
+        path: &mut [u8],
+    ) -> Result<LoadedText, &'static [u8]>;
+
+    /// Сохраняет текст GUI-редактора (CP866) в файл по абсолютному пути.
+    ///
+    /// Возвращает размер записанного UTF-8 текста в байтах.
+    fn save_text_file(&mut self, path: &[u8], text: &[u8]) -> Result<usize, &'static [u8]>;
+
     /// Вызывается, когда событий нет: позволяет ядру не грузить процессор.
     fn idle(&mut self) {}
 }
@@ -215,15 +314,17 @@ pub enum ExitReason {
 /// Какие области экрана нужно перерисовать.
 ///
 /// Порядок вариантов задаёт приоритет:
-/// `None < Cursor < Chrome < Window < Full`.
+/// `None < Cursor < Chrome < Window < Windows < Full`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Repaint {
     None,
     Cursor,
     /// Док, меню и часы (без окон).
     Chrome,
-    /// Окна приложений и док.
+    /// Только изменённое окно приложения (без очистки фона).
     Window,
+    /// Все окна без заливки всего рабочего стола.
+    Windows,
     /// Весь рабочий стол.
     Full,
 }
@@ -232,6 +333,8 @@ enum Repaint {
 enum KeyOutcome {
     Ignore,
     Redraw,
+    /// Нужно перерисовать все окна (например, открылось новое).
+    Windows,
     /// Нужна полная перерисовка (команда работала на всём экране).
     Fullscreen,
     Quit,
@@ -296,12 +399,16 @@ struct Desktop {
     screen_width: i32,
     screen_height: i32,
     /// Окна приложений в порядке [`App::ALL`].
-    windows: [AppWindow; 3],
+    windows: [AppWindow; 5],
+    /// Сколько приложений видно в доке и меню (установщик скрывается).
+    app_count: usize,
     /// Активное приложение: получает клавиатуру и рисуется поверх остальных.
     focus: App,
     terminal: terminal::Terminal,
     tetris: tetris::Tetris,
     snake: snake::Snake,
+    editor: editor::Editor,
+    installer: installer::Installer,
     cursor: cursor::Cursor,
     /// Док с иконками приложений.
     dock: dock::Dock,
@@ -326,12 +433,153 @@ struct Desktop {
     next_snake: u64,
     /// Окно, которое нужно перерисовать отдельно (шаг игры).
     dirty_app: Option<App>,
+    /// Область, которую перед перерисовкой окон нужно залить фоном
+    /// рабочего стола (старое место окна или закрытого меню).
+    damage: Option<window::Rect>,
+    /// Фон, снятый из-под перетаскиваемого окна.
+    drag_background_rect: Option<window::Rect>,
+    /// Новое положение окна, которое нужно отрисовать в этом кадре.
+    pending_drag: Option<(App, i32, i32)>,
+}
+
+/// Максимальный размер окна, которое можно перетаскивать.
+const DRAG_BACKGROUND_WIDTH: usize = 768;
+const DRAG_BACKGROUND_HEIGHT: usize = 768;
+const DRAG_BACKGROUND_AREA: usize = DRAG_BACKGROUND_WIDTH * DRAG_BACKGROUND_HEIGHT;
+
+/// Фон под перетаскиваемым окном.
+///
+/// Хранится отдельно от [`Desktop`], потому что рабочий стол создаётся на
+/// стеке, а несколько мегабайт фона туда класть нельзя.
+static mut DRAG_BACKGROUND: [u32; DRAG_BACKGROUND_AREA] = [0; DRAG_BACKGROUND_AREA];
+
+fn drag_background() -> &'static mut [u32] {
+    let background = core::ptr::addr_of_mut!(DRAG_BACKGROUND);
+
+    unsafe { &mut (&mut *background)[..] }
+}
+
+/// Части `a`, не покрытые `b`. Оба прямоугольника одного размера.
+fn difference_rects(a: window::Rect, b: window::Rect) -> [Option<window::Rect>; 4] {
+    let top_height = (b.y - a.y).clamp(0, a.height);
+    let bottom_start = (b.y + b.height - a.y).clamp(0, a.height);
+    let middle_top = b.y.max(a.y);
+    let middle_bottom = (b.y + b.height).min(a.y + a.height);
+    let left_width = (b.x - a.x).clamp(0, a.width);
+    let right_start = (b.x + b.width - a.x).clamp(0, a.width);
+
+    [
+        (top_height > 0).then_some(window::Rect {
+            x: a.x,
+            y: a.y,
+            width: a.width,
+            height: top_height,
+        }),
+        (bottom_start < a.height).then_some(window::Rect {
+            x: a.x,
+            y: a.y + bottom_start,
+            width: a.width,
+            height: a.height - bottom_start,
+        }),
+        (middle_bottom > middle_top && left_width > 0).then_some(window::Rect {
+            x: a.x,
+            y: middle_top,
+            width: left_width,
+            height: middle_bottom - middle_top,
+        }),
+        (middle_bottom > middle_top && right_start < a.width).then_some(window::Rect {
+            x: a.x + right_start,
+            y: middle_top,
+            width: a.width - right_start,
+            height: middle_bottom - middle_top,
+        }),
+    ]
+}
+
+/// Возвращает часть сохранённого фона на экран.
+fn write_drag_strip(
+    platform: &mut dyn Platform,
+    buffer: &[u32],
+    origin: window::Rect,
+    area: window::Rect,
+) {
+    let stride = DRAG_BACKGROUND_WIDTH;
+
+    for row in area.y..area.y + area.height {
+        let start = (row - origin.y) as usize * stride + (area.x - origin.x) as usize;
+        let end = start + area.width as usize;
+
+        platform.write_rect(area.x, row, area.width, 1, &buffer[start..end]);
+    }
+}
+
+/// Снимает с экрана часть фона в буфер, выровненный по `origin`.
+fn read_drag_strip(
+    platform: &mut dyn Platform,
+    buffer: &mut [u32],
+    origin: window::Rect,
+    area: window::Rect,
+) {
+    let stride = DRAG_BACKGROUND_WIDTH;
+
+    for row in area.y..area.y + area.height {
+        let start = (row - origin.y) as usize * stride + (area.x - origin.x) as usize;
+        let end = start + area.width as usize;
+
+        platform.read_rect(area.x, row, area.width, 1, &mut buffer[start..end]);
+    }
+}
+
+/// Сдвигает сохранённый фон из положения `old` в положение `new`.
+///
+/// `copy_within` сводится к `memmove`, который реализован в ядре,
+/// поэтому даже полный прямоугольник сдвигается быстро.
+fn shift_drag_background(old: window::Rect, new: window::Rect) {
+    let stride = DRAG_BACKGROUND_WIDTH;
+    let width = old.width as usize;
+    let height = old.height as usize;
+    let dx = new.x - old.x;
+    let dy = new.y - old.y;
+
+    if dx == 0 && dy == 0 {
+        return;
+    }
+
+    let background = drag_background();
+
+    if dy > 0 && (dy as usize) < height {
+        let shift = dy as usize * stride;
+        background.copy_within(shift..height * stride, 0);
+    } else if dy < 0 && ((-dy) as usize) < height {
+        let shift = (-dy) as usize * stride;
+        background.copy_within(0..(height - (-dy) as usize) * stride, shift);
+    }
+
+    if dx > 0 && (dx as usize) < width {
+        let shift = dx as usize;
+
+        for row in 0..height {
+            let start = row * stride;
+            background.copy_within(start + shift..start + width, start);
+        }
+    } else if dx < 0 && ((-dx) as usize) < width {
+        let shift = (-dx) as usize;
+
+        for row in 0..height {
+            let start = row * stride;
+            background.copy_within(start..start + width - shift, start + shift);
+        }
+    }
 }
 
 impl Desktop {
-    fn new(screen_width: i32, screen_height: i32) -> Self {
+    fn new(screen_width: i32, screen_height: i32, app_count: usize) -> Self {
+        let app_count = app_count.min(App::ALL.len());
         let mut terminal = terminal::Terminal::new();
         terminal.reset();
+
+        let mut editor = editor::Editor::new();
+        editor.reset();
 
         Self {
             screen_width,
@@ -340,13 +588,18 @@ impl Desktop {
                 AppWindow::new(App::Terminal, screen_width, screen_height, true),
                 AppWindow::new(App::Tetris, screen_width, screen_height, false),
                 AppWindow::new(App::Snake, screen_width, screen_height, false),
+                AppWindow::new(App::Editor, screen_width, screen_height, false),
+                AppWindow::new(App::Installer, screen_width, screen_height, false),
             ],
+            app_count,
             focus: App::Terminal,
             terminal,
             tetris: tetris::Tetris::new(),
             snake: snake::Snake::new(),
+            editor,
+            installer: installer::Installer::new(),
             cursor: cursor::Cursor::new(screen_width / 2, screen_height / 2),
-            dock: dock::Dock::new(screen_width, screen_height),
+            dock: dock::Dock::new(screen_width, screen_height, app_count),
             menu_open: false,
             hover: None,
             control_hover: None,
@@ -363,11 +616,14 @@ impl Desktop {
             next_tetris: 0,
             next_snake: 0,
             dirty_app: None,
+            damage: None,
+            drag_background_rect: None,
+            pending_drag: None,
         }
     }
 
     /// Порядок отрисовки: активное окно последним (оно сверху).
-    fn draw_order(&self) -> [App; 3] {
+    fn draw_order(&self) -> [App; 5] {
         let mut order = App::ALL;
 
         let mut index = 0;
@@ -408,6 +664,103 @@ impl Desktop {
         }
     }
 
+    /// Перерисовка всех окон, кроме `skip` (перетаскиваемого).
+    fn paint_windows_except(&mut self, platform: &mut dyn Platform, skip: App) {
+        for app in self.draw_order() {
+            if app != skip {
+                self.paint_app(platform, app);
+            }
+        }
+    }
+
+    /// Отрисовывает шаг перетаскивания окна.
+    ///
+    /// Старый фон возвращается из сохранённой копии, поэтому на экране не
+    /// бывает кадра с залитым рабочим столом — именно он и давал мигание.
+    fn render_drag(&mut self, platform: &mut dyn Platform, app: App, x: i32, y: i32) {
+        let index = app.index();
+
+        if !self.windows[index].open || self.windows[index].maximized {
+            self.drag = None;
+            self.drag_background_rect = None;
+            return;
+        }
+
+        let width = self.windows[index].window.width;
+        let height = self.windows[index].window.height;
+        let area = width as usize * height as usize;
+
+        if width > DRAG_BACKGROUND_WIDTH as i32
+            || height > DRAG_BACKGROUND_HEIGHT as i32
+            || area > DRAG_BACKGROUND_AREA
+        {
+            // Не должны сюда попадать: перетаскивание развёрнутого окна
+            // запрещено, а остальные окна меньше буфера.
+            self.windows[index].window.x = x;
+            self.windows[index].window.y = y;
+            self.paint_windows(platform);
+            self.paint_chrome(platform);
+            return;
+        }
+
+        let old = window_rect(&self.windows[index].window);
+        let new = window::Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+
+        match self.drag_background_rect {
+            Some(previous) => {
+                // Возвращаем только те части старого окна, которые не будут
+                // закрыты новым положением. Пересечение остаётся на экране,
+                // поэтому при мелких шагах не видно кадра с пустым фоном.
+                let background = drag_background();
+
+                for area in difference_rects(previous, new).iter().flatten() {
+                    write_drag_strip(platform, background, previous, *area);
+                }
+
+                shift_drag_background(previous, new);
+
+                let background = drag_background();
+
+                for area in difference_rects(new, previous).iter().flatten() {
+                    read_drag_strip(platform, background, new, *area);
+                }
+            }
+            None => {
+                // Первый шаг: под окном ещё нет снимка фона. Восстанавливаем
+                // его один раз, перерисовав всё, что находится ниже окна.
+                platform.fill_rect(old.x, old.y, old.width, old.height, DESKTOP_COLOR);
+                self.paint_windows_except(platform, app);
+                self.paint_chrome(platform);
+
+                let background = drag_background();
+
+                for row in 0..height {
+                    let start = row as usize * DRAG_BACKGROUND_WIDTH;
+                    let end = start + width as usize;
+
+                    platform.read_rect(
+                        x,
+                        y + row,
+                        width,
+                        1,
+                        &mut background[start..end],
+                    );
+                }
+            }
+        }
+
+        self.drag_background_rect = Some(new);
+        self.windows[index].window.x = x;
+        self.windows[index].window.y = y;
+        self.paint_app(platform, app);
+        self.paint_chrome(platform);
+    }
+
     /// Перерисовка одного окна вместе с содержимым приложения.
     fn paint_app(&mut self, platform: &mut dyn Platform, app: App) {
         let index = app.index();
@@ -422,15 +775,25 @@ impl Desktop {
             _ => None,
         };
 
+        if app == App::Editor {
+            let mut title = [0u8; window::TITLE_CAPACITY];
+            let length = self.editor.title(&mut title);
+            self.windows[index].window.set_title(&title[..length]);
+        }
+
         self.windows[index].window.paint(platform, maximized, hover);
 
+        // Каждое приложение само заливает свою клиентскую область, поэтому
+        // здесь нет промежуточной тёмной заливки — она давала заметное
+        // мерцание при вводе, игре и перетаскивании окна.
         let area = self.windows[index].window.content();
-        platform.fill_rect(area.x, area.y, area.width, area.height, WINDOW_COLOR);
 
         match app {
             App::Terminal => self.terminal.paint(platform, area.x, area.y),
             App::Tetris => self.tetris.paint(platform, area.x, area.y),
             App::Snake => self.snake.paint(platform, area.x, area.y),
+            App::Editor => self.editor.paint(platform, area),
+            App::Installer => self.installer.paint(platform, area),
         }
     }
 
@@ -445,7 +808,7 @@ impl Desktop {
 
         if self.menu_open {
             let menu = dock::menu_rect(&self.dock, self.screen_width);
-            dock::paint_menu(platform, &menu, self.hover);
+            dock::paint_menu(platform, &menu, self.hover, self.dock.apps);
         }
     }
 
@@ -457,20 +820,50 @@ impl Desktop {
 
         self.cursor.erase(platform);
 
-        match repaint {
-            Repaint::None => {}
-            Repaint::Cursor => {}
-            Repaint::Chrome => self.paint_chrome(platform),
-            Repaint::Window => {
-                // Шаг игры меняет только одно окно — остальные не трогаем.
-                match self.dirty_app.take() {
-                    Some(app) => self.paint_app(platform, app),
-                    None => self.paint_windows(platform),
-                }
+        // Старое место сдвинутого/закрытого окна или меню заливаем фоном,
+        // а не перерисовываем весь экран.
+        if let Some(rect) = self.damage.take() {
+            platform.fill_rect(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                DESKTOP_COLOR,
+            );
+        }
 
-                self.paint_chrome(platform);
+        if let Some((app, x, y)) = self.pending_drag.take() {
+            // Перетаскивание рисует себя само: возвращает фон из копии и
+            // перерисовывает только перемещаемое окно.
+            self.dirty_app = None;
+            self.render_drag(platform, app, x, y);
+        } else {
+            match repaint {
+                Repaint::None => {}
+                Repaint::Cursor => {}
+                Repaint::Chrome => self.paint_chrome(platform),
+                Repaint::Window => {
+                    // Шаг игры или ввод меняет только активное окно.
+                    match self.dirty_app.take() {
+                        Some(app) => self.paint_app(platform, app),
+                        None => self.paint_windows(platform),
+                    }
+
+                    // Открытое меню дока рисуется поверх окон.
+                    if self.menu_open {
+                        self.paint_chrome(platform);
+                    }
+                }
+                Repaint::Windows => {
+                    self.dirty_app = None;
+                    self.paint_windows(platform);
+                    self.paint_chrome(platform);
+                }
+                Repaint::Full => {
+                    self.dirty_app = None;
+                    self.paint_all(platform);
+                }
             }
-            Repaint::Full => self.paint_all(platform),
         }
 
         self.cursor.draw(platform);
@@ -478,6 +871,10 @@ impl Desktop {
 
     /// Показывает окно приложения и делает его активным.
     fn open_app(&mut self, app: App) {
+        if app.index() >= self.app_count {
+            return;
+        }
+
         self.windows[app.index()].open = true;
         self.focus = app;
         self.menu_open = false;
@@ -557,6 +954,25 @@ impl Desktop {
                     KeyOutcome::Ignore
                 }
             }
+            App::Editor => match self.editor.handle_key(platform, key) {
+                editor::EditorOutcome::Ignored => KeyOutcome::Ignore,
+                editor::EditorOutcome::Redraw => KeyOutcome::Redraw,
+                editor::EditorOutcome::Close => {
+                    let index = App::Editor.index();
+                    self.windows[index].open = false;
+                    self.editor.reset();
+                    self.ensure_focus();
+                    // Закрытое окно нужно затереть фоном рабочего стола.
+                    KeyOutcome::Fullscreen
+                }
+            },
+            App::Installer => {
+                if self.installer.handle_key(platform, key) {
+                    KeyOutcome::Redraw
+                } else {
+                    KeyOutcome::Ignore
+                }
+            }
         }
     }
 
@@ -581,6 +997,7 @@ impl Desktop {
         }
 
         let command = &command[..command_len];
+        self.terminal.history_add(command);
 
         // Локальные команды окна: очистка и выход из pdesk.
         if command == b"exit" {
@@ -590,6 +1007,11 @@ impl Desktop {
         if command == b"clear" {
             self.terminal.clear();
             return KeyOutcome::Redraw;
+        }
+
+        // tedit в pterm открывает графический редактор, а не консольный.
+        if let Some(argument) = command_argument(command, b"tedit") {
+            return self.open_editor(platform, argument);
         }
 
         let mut output = [0u8; terminal::OUTPUT_CAPACITY];
@@ -610,12 +1032,58 @@ impl Desktop {
         }
     }
 
+    /// Открывает GUI-редактор с файлом из команды `tedit`.
+    ///
+    /// Без аргумента открывается пустой документ без имени (как кнопка
+    /// «Создать» в «Блокноте»); сохранить его можно после `tedit <файл>`.
+    fn open_editor(
+        &mut self,
+        platform: &mut dyn Platform,
+        argument: &[u8],
+    ) -> KeyOutcome {
+        if self.editor.is_dirty() {
+            self.terminal
+                .push_line(b"tedit: unsaved changes in the editor");
+            return KeyOutcome::Redraw;
+        }
+
+        if argument.is_empty() {
+            self.editor.reset();
+            self.open_app(App::Editor);
+            return KeyOutcome::Windows;
+        }
+
+        let mut data = [0u8; editor::MAX_TEXT];
+        let mut path = [0u8; editor::PATH_CAPACITY];
+
+        match platform.load_text_file(argument, &mut data, &mut path) {
+            Ok(info) => {
+                let length = info.path_length.min(path.len());
+                self.editor.open(
+                    &path[..length],
+                    &data[..info.length],
+                    info.existed,
+                    info.truncated,
+                );
+                self.open_app(App::Editor);
+                KeyOutcome::Windows
+            }
+            Err(message) => {
+                let mut line = [0u8; 96];
+                let mut length = push_text(&mut line, 0, b"tedit: ");
+                length = push_text(&mut line, length, message);
+                self.terminal.push_line(&line[..length]);
+                KeyOutcome::Redraw
+            }
+        }
+    }
+
     /// Элемент дока или меню под указателем.
     fn hit_chrome(&self, x: i32, y: i32) -> Option<dock::Hover> {
         if self.menu_open {
             let menu = dock::menu_rect(&self.dock, self.screen_width);
 
-            if let Some(index) = dock::menu_hit(&menu, x, y) {
+            if let Some(index) = dock::menu_hit(&menu, x, y, self.dock.apps) {
                 return Some(dock::Hover::Menu(index));
             }
 
@@ -737,13 +1205,14 @@ impl Desktop {
             if self.menu_open {
                 let menu = dock::menu_rect(&self.dock, self.screen_width);
 
-                if let Some(index) = dock::menu_hit(&menu, mouse.x, mouse.y) {
+                if let Some(index) = dock::menu_hit(&menu, mouse.x, mouse.y, self.dock.apps) {
                     self.menu_open = false;
                     self.drag = None;
+                    self.damage = Some(dock_rect(menu));
 
-                    if index < dock::APP_COUNT {
+                    if index < self.dock.apps {
                         self.open_app(App::ALL[index]);
-                    } else if index == dock::MENU_SHUTDOWN {
+                    } else if index == self.dock.apps {
                         if !platform.shutdown() {
                             self.terminal.push_line(b"shutdown: failed");
                         }
@@ -752,7 +1221,7 @@ impl Desktop {
                         self.quit_requested = true;
                     }
 
-                    return repaint.max(Repaint::Full);
+                    return repaint.max(Repaint::Windows);
                 }
 
                 if menu.contains(mouse.x, mouse.y) {
@@ -763,7 +1232,8 @@ impl Desktop {
                 // Клик мимо меню закрывает его.
                 self.menu_open = false;
                 closed_menu = true;
-                repaint = repaint.max(Repaint::Full);
+                self.damage = Some(dock_rect(menu));
+                repaint = repaint.max(Repaint::Windows);
             }
 
             // 2. Иконки дока.
@@ -772,13 +1242,20 @@ impl Desktop {
 
                 if index == 0 {
                     // Перфоратор: открыть или закрыть меню.
+                    let was_open = self.menu_open;
                     self.menu_open = !closed_menu;
+
+                    if was_open || !self.menu_open {
+                        return repaint.max(Repaint::Windows);
+                    }
+
+                    return repaint.max(Repaint::Chrome);
                 } else {
                     // Приложение: показать окно и вывести его на передний план.
                     self.open_app(App::ALL[index - 1]);
                 }
 
-                return repaint.max(Repaint::Full);
+                return repaint.max(Repaint::Windows);
             }
 
             // 3. Кнопки управления окна в заголовке.
@@ -786,9 +1263,17 @@ impl Desktop {
                 self.drag = None;
                 self.focus = app;
                 let index = app.index();
+                let old = window_rect(&self.windows[index].window);
 
                 match control {
                     window::Control::Close => {
+                        // Несохранённый документ сначала спрашивает Y/N.
+                        if app == App::Editor && !self.editor.close_requested() {
+                            self.focus = app;
+                            self.dirty_app = Some(App::Editor);
+                            return repaint.max(Repaint::Window);
+                        }
+
                         self.windows[index].open = false;
 
                         // Закрытие терминала начинает новую сессию.
@@ -796,34 +1281,94 @@ impl Desktop {
                             self.terminal.reset();
                         }
 
+                        // Закрытие редактора сбрасывает документ.
+                        if app == App::Editor {
+                            self.editor.reset();
+                        }
+
+                        self.damage = Some(old);
                         self.ensure_focus();
                     }
                     window::Control::Minimize => {
                         self.windows[index].open = false;
+                        self.damage = Some(old);
                         self.ensure_focus();
                     }
                     window::Control::Maximize => {
-                        self.windows[index].toggle_maximize(self.screen_width, self.screen_height)
+                        self.damage = Some(old);
+                        self.windows[index].toggle_maximize(self.screen_width, self.screen_height);
                     }
                 }
 
-                return repaint.max(Repaint::Full);
+                return repaint.max(Repaint::Windows);
             }
 
             // 4. Окно под указателем: фокус и перетаскивание за заголовок.
             if let Some(app) = self.window_at(mouse.x, mouse.y) {
+                let focus_changed = self.focus != app;
                 self.focus = app;
                 self.menu_open = false;
                 let index = app.index();
+
+                if app == App::Installer {
+                    let content = self.windows[index].window.content();
+
+                    if content.contains(mouse.x, mouse.y) {
+                        self.installer
+                            .handle_click(platform, content, mouse.x, mouse.y);
+
+                        if focus_changed {
+                            return repaint.max(Repaint::Windows);
+                        }
+
+                        self.dirty_app = Some(App::Installer);
+                        return repaint.max(Repaint::Window);
+                    }
+                }
+
+                if app == App::Editor {
+                    let content = self.windows[index].window.content();
+
+                    // Клик в заголовке оставляем перетаскиванию окна.
+                    if content.contains(mouse.x, mouse.y) {
+                        let old = window_rect(&self.windows[index].window);
+
+                        return match self.editor.handle_click(platform, content, mouse.x, mouse.y) {
+                            editor::ClickOutcome::Ignored => {
+                                if focus_changed {
+                                    repaint.max(Repaint::Windows)
+                                } else {
+                                    repaint
+                                }
+                            }
+                            editor::ClickOutcome::Redraw => {
+                                if focus_changed {
+                                    repaint.max(Repaint::Windows)
+                                } else {
+                                    self.dirty_app = Some(App::Editor);
+                                    repaint.max(Repaint::Window)
+                                }
+                            }
+                            editor::ClickOutcome::Close => {
+                                self.windows[index].open = false;
+                                self.editor.reset();
+                                self.damage = Some(old);
+                                self.ensure_focus();
+                                repaint.max(Repaint::Windows)
+                            }
+                        };
+                    }
+                }
 
                 if !self.windows[index].maximized
                     && self.windows[index].window.contains_title(mouse.x, mouse.y)
                 {
                     let window = &self.windows[index].window;
                     self.drag = Some((app, mouse.x - window.x, mouse.y - window.y));
+                    self.drag_background_rect = None;
                 }
 
-                return repaint.max(Repaint::Full);
+                return repaint.max(Repaint::Windows);
             }
         } else if !left_is && left_was {
             self.drag = None;
@@ -832,6 +1377,7 @@ impl Desktop {
         if let Some((app, offset_x, offset_y)) = self.drag {
             if !left_is {
                 self.drag = None;
+                self.drag_background_rect = None;
                 return repaint;
             }
 
@@ -839,6 +1385,7 @@ impl Desktop {
 
             if !self.windows[index].open || self.windows[index].maximized {
                 self.drag = None;
+                self.drag_background_rect = None;
                 return repaint;
             }
 
@@ -850,14 +1397,64 @@ impl Desktop {
             );
 
             if x != self.windows[index].window.x || y != self.windows[index].window.y {
-                self.windows[index].window.x = x;
-                self.windows[index].window.y = y;
-                repaint = Repaint::Full;
+                // Отрисовку откладываем до apply: сначала нужно убрать
+                // указатель, чтобы он не попал в сохранённый фон.
+                self.pending_drag = Some((app, x, y));
+                repaint = repaint.max(Repaint::Cursor);
             }
         }
 
         repaint
     }
+}
+
+/// Переводит прямоугольник дока в общий прямоугольник экрана.
+fn dock_rect(rect: dock::Rect) -> window::Rect {
+    window::Rect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+/// Прямоугольник окна на экране.
+fn window_rect(window: &window::Window) -> window::Rect {
+    window::Rect {
+        x: window.x,
+        y: window.y,
+        width: window.width,
+        height: window.height,
+    }
+}
+
+/// Возвращает аргумент команды `name` (текст после имени).
+///
+/// Повторяет разбор консольной оболочки: имя должно совпадать целиком,
+/// аргумент отделяется пробелом или табуляцией.
+fn command_argument<'a>(input: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let rest = input.strip_prefix(name)?;
+
+    if rest.is_empty() {
+        return Some(rest);
+    }
+
+    if rest[0] != b' ' && rest[0] != b'\t' {
+        return None;
+    }
+
+    let mut start = 0usize;
+    let mut end = rest.len();
+
+    while start < end && (rest[start] == b' ' || rest[start] == b'\t') {
+        start += 1;
+    }
+
+    while end > start && (rest[end - 1] == b' ' || rest[end - 1] == b'\t') {
+        end -= 1;
+    }
+
+    Some(&rest[start..end])
 }
 
 /// Дописывает текст в буфер и возвращает новую длину.
@@ -913,7 +1510,13 @@ pub fn run(platform: &mut dyn Platform) -> ExitReason {
     let screen_width = screen_width.max(1);
     let screen_height = screen_height.max(1);
 
-    let mut desktop = Desktop::new(screen_width, screen_height);
+    let app_count = if platform.installer_available() {
+        App::ALL.len()
+    } else {
+        App::ALL.len() - 1
+    };
+
+    let mut desktop = Desktop::new(screen_width, screen_height, app_count);
 
     let mut prompt = [0u8; terminal::PROMPT_CAPACITY];
     let prompt_len = platform.prompt(&mut prompt);
@@ -930,7 +1533,12 @@ pub fn run(platform: &mut dyn Platform) -> ExitReason {
         while let Some(key) = platform.read_key() {
             match desktop.handle_key(platform, key) {
                 KeyOutcome::Ignore => {}
-                KeyOutcome::Redraw => repaint = repaint.max(Repaint::Window),
+                KeyOutcome::Redraw => {
+                    // Ввод и шаги игр меняют только активное окно.
+                    desktop.dirty_app = Some(desktop.focus);
+                    repaint = repaint.max(Repaint::Window);
+                }
+                KeyOutcome::Windows => repaint = repaint.max(Repaint::Windows),
                 KeyOutcome::Fullscreen => repaint = Repaint::Full,
                 KeyOutcome::Quit => {
                     desktop.cursor.erase(platform);

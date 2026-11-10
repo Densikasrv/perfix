@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "pdesk"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "perfix"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "pdesk",
 ]

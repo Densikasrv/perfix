@@ -283,6 +283,18 @@ impl Tetris {
         let field_y = y + HUD_HEIGHT;
         let field_width = COLS as i32 * CELL;
         let field_height = ROWS as i32 * CELL;
+        let panel_x = field_x + field_width + 12;
+
+        // Поле заливается своим цветом ниже; фон нужен для строки счёта
+        // и панели «NEXT» справа.
+        platform.fill_rect(x, y, CONTENT_WIDTH, HUD_HEIGHT, WINDOW_COLOR);
+        platform.fill_rect(
+            panel_x,
+            field_y,
+            CONTENT_WIDTH - (panel_x - x),
+            field_height,
+            WINDOW_COLOR,
+        );
 
         // Счёт и число линий.
         let mut buffer = [0u8; 24];
@@ -339,7 +351,6 @@ impl Tetris {
         }
 
         // Панель: следующая фигура.
-        let panel_x = field_x + field_width + 12;
         platform.draw_text(panel_x, field_y + 4, b"NEXT", LABEL_COLOR, WINDOW_COLOR);
 
         let next_mask = SHAPES[self.next][0];

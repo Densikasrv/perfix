@@ -38,6 +38,14 @@ impl pdesk::Platform for KernelPlatform {
         vga::put_pixel(x, y, color);
     }
 
+    fn read_rect(&mut self, x: i32, y: i32, width: i32, height: i32, out: &mut [u32]) {
+        vga::read_rect(x, y, width, height, out);
+    }
+
+    fn write_rect(&mut self, x: i32, y: i32, width: i32, height: i32, data: &[u32]) {
+        vga::write_rect(x, y, width, height, data);
+    }
+
     fn read_key(&mut self) -> Option<pdesk::Key> {
         loop {
             match keyboard::read_key() {
@@ -54,11 +62,11 @@ impl pdesk::Platform for KernelPlatform {
                 keyboard::Key::ArrowDown => return Some(pdesk::Key::ArrowDown),
                 keyboard::Key::ArrowLeft => return Some(pdesk::Key::ArrowLeft),
                 keyboard::Key::ArrowRight => return Some(pdesk::Key::ArrowRight),
+                keyboard::Key::PageUp => return Some(pdesk::Key::PageUp),
+                keyboard::Key::PageDown => return Some(pdesk::Key::PageDown),
                 keyboard::Key::LayoutChanged => return Some(pdesk::Key::LayoutChanged),
                 keyboard::Key::Control(b'q') => return Some(pdesk::Key::Quit),
-                // Остальные комбинации оболочке пока не нужны.
-                keyboard::Key::Control(_) => continue,
-                keyboard::Key::PageUp | keyboard::Key::PageDown => continue,
+                keyboard::Key::Control(ch) => return Some(pdesk::Key::Control(ch)),
             }
         }
     }
@@ -102,6 +110,63 @@ impl pdesk::Platform for KernelPlatform {
 
     fn ticks_per_second(&mut self) -> u64 {
         ticks_per_second()
+    }
+
+    fn install_targets(&mut self, out: &mut [pdesk::InstallTarget]) -> usize {
+        let mut targets =
+            [crate::installer::InstallTarget::EMPTY; 8];
+        let count = crate::installer::targets(&mut targets);
+        let copy = count.min(out.len());
+
+        for index in 0..copy {
+            out[index] = pdesk::InstallTarget {
+                number: targets[index].number as u32,
+                sectors: targets[index].sectors,
+                ext4: targets[index].ext4,
+            };
+        }
+
+        copy
+    }
+
+    fn install_perfix(
+        &mut self,
+        partition_number: u32,
+        format: bool,
+    ) -> Result<(), &'static [u8]> {
+        crate::installer::install_with_format(partition_number as usize, format)
+            .map_err(|error| error.message())
+    }
+
+    fn installer_available(&mut self) -> bool {
+        crate::installer::available()
+    }
+
+    fn load_text_file(
+        &mut self,
+        name: &[u8],
+        out: &mut [u8],
+        path: &mut [u8],
+    ) -> Result<pdesk::LoadedText, &'static [u8]> {
+        match crate::tedit::gui_load(name, out, path) {
+            Ok((length, existed, truncated, path_length)) => {
+                let mut result = pdesk::LoadedText::default();
+                result.length = length;
+                result.existed = existed;
+                result.truncated = truncated;
+                result.path_length = path_length;
+                Ok(result)
+            }
+            Err(message) => Err(message),
+        }
+    }
+
+    fn save_text_file(
+        &mut self,
+        path: &[u8],
+        text: &[u8],
+    ) -> Result<usize, &'static [u8]> {
+        crate::tedit::gui_save(path, text)
     }
 
     fn clock(&mut self, out: &mut [u8]) -> usize {

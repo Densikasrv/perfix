@@ -30,6 +30,7 @@ pub enum Ext4Error {
     InvalidGeometry,
     BufferTooSmall,
     OutOfBounds,
+    NotEmpty,
 }
 
 /// Режим доступа, с которым смонтирована файловая система.
@@ -948,7 +949,15 @@ if end_offset > partition_bytes {
             GD_INODE_BITMAP_CSUM,
             descriptor.inode_bitmap_csum as u16,
         );
-        Self::write_u16(&mut desc, GD_ITABLE_UNUSED, descriptor.itable_unused as u16);
+        Self::write_u16(
+            &mut desc,
+            GD_ITABLE_UNUSED,
+            if self.superblock.has_metadata_csum {
+                descriptor.itable_unused as u16
+            } else {
+                0
+            },
+        );
         Self::write_u16(&mut desc, GD_CHECKSUM, 0);
 
         if desc_size >= 64 {
@@ -1296,9 +1305,22 @@ if end_offset > partition_bytes {
             return true;
         }
 
-        // Резервные копии только в нечётных группах, кратных 3, 5 или 7.
-        group % 2 == 1
-            && (group % 3 == 0 || group % 5 == 0 || group % 7 == 0)
+        // Резервные копии только в группах — степенях 3, 5 или 7.
+        if group % 2 == 0 {
+            return false;
+        }
+
+        fn power_of(base: u32, mut value: u32) -> bool {
+            if value < base {
+                return false;
+            }
+            while value % base == 0 {
+                value /= base;
+            }
+            value == 1
+        }
+
+        power_of(3, group) || power_of(5, group) || power_of(7, group)
     }
 
     fn metadata_blocks_per_group(&self) -> u64 {
@@ -2356,7 +2378,8 @@ where
 
     let block_size = self.block_size() as usize;
     let limit = self.dir_data_limit();
-    let blocks = (size as usize + block_size - 1) / block_size;
+    let blocks = ((size + block_size as u64 - 1) / block_size as u64)
+        as usize;
 
     for logical in 0..blocks {
         let physical = match self.inode_extent_map(
@@ -2574,7 +2597,8 @@ fn add_directory_entry(
     let generation = Self::read_u32(&directory, INODE_GENERATION)?;
     let block_size = self.block_size() as usize;
     let size = Self::read_u32(&directory, INODE_SIZE_LO)? as u64;
-    let blocks = (size as usize + block_size - 1) / block_size;
+    let blocks = ((size + block_size as u64 - 1) / block_size as u64)
+        as usize;
 
     for logical in 0..blocks {
         let physical = match self.inode_extent_map(
@@ -2681,11 +2705,18 @@ fn add_directory_entry(
     };
 
     let sectors = self.inode_blocks_sectors();
-    let delta = (1 + tree_blocks) as u64
-        - old_index_count as u64;
-    let new_blocks = old_blocks
-        .checked_add_signed((delta as i64) * sectors as i64)
-        .ok_or(Ext4Error::OutOfBounds)?;
+    let new_tree_blocks = 1 + tree_blocks;
+    let new_blocks = if new_tree_blocks >= old_index_count {
+        let added = (new_tree_blocks - old_index_count) as u64;
+        old_blocks
+            .checked_add(added.saturating_mul(sectors))
+            .ok_or(Ext4Error::OutOfBounds)?
+    } else {
+        let removed = (old_index_count - new_tree_blocks) as u64;
+        old_blocks
+            .checked_sub(removed.saturating_mul(sectors))
+            .ok_or(Ext4Error::OutOfBounds)?
+    };
 
     self.set_inode_size(&mut directory, size + block_size as u64)?;
     self.set_inode_blocks(&mut directory, new_blocks)?;
@@ -2832,6 +2863,250 @@ pub fn create_file(
     }
 
     Ok(inode_number)
+}
+
+/// Создаёт каталог по пути. Родительский каталог должен существовать.
+pub fn mkdir_path(&self, path: &[u8]) -> Result<u32, Ext4Error> {
+    self.ensure_writable()?;
+
+    let mut parent = 2u32;
+    let mut name: &[u8] = b"";
+
+    for component in path.split(|&byte| byte == b'/') {
+        if component.is_empty() || component == b"." {
+            continue;
+        }
+
+        if !name.is_empty() {
+            parent = self
+                .find_directory_entry(parent, name)?
+                .ok_or(Ext4Error::OutOfBounds)?;
+            let inode = self.read_inode(parent)?;
+            if !inode.is_directory {
+                return Err(Ext4Error::InvalidGeometry);
+            }
+        }
+
+        name = component;
+    }
+
+    if name.is_empty() || name.len() > 255 || name == b"." || name == b".." {
+        return Err(Ext4Error::InvalidGeometry);
+    }
+
+    self.create_directory(parent, name)
+}
+
+/// Создаёт каталог в существующем каталоге.
+///
+/// Новый каталог получает один блок с записями `.` и `..`, поэтому
+/// его можно сразу использовать как родительский для файлов.
+pub fn create_directory(
+    &self,
+    parent_inode: u32,
+    name: &[u8],
+) -> Result<u32, Ext4Error> {
+    self.ensure_writable()?;
+
+    if name.is_empty() || name.len() > 255 || name == b"." || name == b".." {
+        return Err(Ext4Error::InvalidGeometry);
+    }
+
+    let parent = self.read_inode(parent_inode)?;
+    if !parent.is_directory {
+        return Err(Ext4Error::InvalidGeometry);
+    }
+
+    if self.find_directory_entry(parent_inode, name)?.is_some() {
+        return Err(Ext4Error::InvalidGeometry);
+    }
+
+    let inode_number = self.allocate_inode(true)?;
+    let block = match self.allocate_block() {
+        Ok(block) => block,
+        Err(error) => {
+            let _ = self.free_inode(inode_number, true);
+            return Err(error);
+        }
+    };
+
+    let block_size = self.block_size() as usize;
+    let limit = self.dir_data_limit();
+    let mut data = [0u8; 4096];
+
+    // Запись "." указывает на сам каталог.
+    Self::write_u32(&mut data, 0, inode_number);
+    Self::write_u16(&mut data, 4, 12);
+    data[6] = 1;
+    data[7] = 2;
+    data[8] = b'.';
+
+    // Запись ".." указывает на родительский каталог.
+    Self::write_u32(&mut data, 12, parent_inode);
+    Self::write_u16(&mut data, 16, (limit - 12) as u16);
+    data[18] = 2;
+    data[19] = 2;
+    data[20] = b'.';
+    data[21] = b'.';
+
+    if self.superblock.has_metadata_csum {
+        Self::write_u32(&mut data, limit, 0);
+        Self::write_u16(&mut data, limit + 4, 12);
+        data[limit + 6] = 0;
+        data[limit + 7] = 0xDE;
+    }
+
+    self.set_dir_tail_checksum(inode_number, 0, &mut data);
+
+    if let Err(error) = self.write_block(block, &data) {
+        let _ = self.free_block(block);
+        let _ = self.free_inode(inode_number, true);
+        return Err(error);
+    }
+
+    let inode_size = self.superblock.inode_size as usize;
+    let mut inode = [0u8; INODE_SIZE_MAX];
+    let mut extents = [ExtentRecord {
+        logical: 0,
+        physical: 0,
+        length: 0,
+    }; MAX_EXTENTS];
+    extents[0] = ExtentRecord {
+        logical: 0,
+        physical: block,
+        length: 1,
+    };
+
+    Self::write_u16(&mut inode, INODE_MODE, 0x41ED);
+    Self::write_u16(&mut inode, INODE_LINKS, 2);
+    Self::write_u32(&mut inode, INODE_FLAGS, EXT4_EXTENTS_FL);
+    Self::write_u32(&mut inode, INODE_DTIME, 0);
+
+    if inode_size > 128 {
+        let mut extra = self.superblock.want_extra_isize as usize;
+        if extra < 32 {
+            extra = 32;
+        }
+        extra &= !3;
+        if extra > inode_size - 128 {
+            extra = inode_size - 128;
+        }
+        Self::write_u16(&mut inode, INODE_EXTRA_ISIZE, extra as u16);
+    }
+
+    let tree_blocks = match self.build_extent_tree(
+        &mut inode,
+        &extents[..1],
+        inode_number,
+    ) {
+        Ok(blocks) => blocks,
+        Err(error) => {
+            let _ = self.free_tree_blocks(&extents[..1], &[]);
+            let _ = self.free_inode(inode_number, true);
+            return Err(error);
+        }
+    };
+
+    self.set_inode_size(&mut inode, block_size as u64)?;
+    let blocks = (1 + tree_blocks) as u64 * self.inode_blocks_sectors();
+    self.set_inode_blocks(&mut inode, blocks)?;
+    self.touch_inode_times(&mut inode);
+
+    if let Err(error) = self.write_inode_raw(inode_number, &mut inode) {
+        let _ = self.free_tree_blocks(&extents[..1], &[]);
+        let _ = self.free_inode(inode_number, true);
+        return Err(error);
+    }
+
+    if let Err(error) = self.add_directory_entry(parent_inode, name, inode_number, 2) {
+        let _ = self.free_tree_blocks(&extents[..1], &[]);
+        let _ = self.free_inode(inode_number, true);
+        return Err(error);
+    }
+
+    // Каталог ".." нового каталога ссылается на родителя, поэтому у
+    // родителя увеличивается число ссылок.
+    let mut parent_raw = [0u8; INODE_SIZE_MAX];
+    self.read_inode_raw(parent_inode, &mut parent_raw)?;
+    let links = Self::read_u16(&parent_raw, INODE_LINKS)?;
+    Self::write_u16(&mut parent_raw, INODE_LINKS, links.saturating_add(1));
+    self.touch_inode_times(&mut parent_raw);
+    self.write_inode_raw(parent_inode, &mut parent_raw)?;
+
+    Ok(inode_number)
+}
+
+/// Проверяет, существует ли путь в файловой системе.
+pub fn path_exists(&self, path: &[u8]) -> Result<bool, Ext4Error> {
+    let mut current = 2u32;
+    let mut name: &[u8] = b"";
+
+    for component in path.split(|&byte| byte == b'/') {
+        if component.is_empty() || component == b"." {
+            continue;
+        }
+
+        if !name.is_empty() {
+            current = match self.find_directory_entry(current, name)? {
+                Some(inode_number) => inode_number,
+                None => return Ok(false),
+            };
+
+            if !self.read_inode(current)?.is_directory {
+                return Ok(false);
+            }
+        }
+
+        name = component;
+    }
+
+    if name.is_empty() {
+        return Ok(true);
+    }
+
+    Ok(self.find_directory_entry(current, name)?.is_some())
+}
+
+/// Создаёт все отсутствующие каталоги пути и возвращает inode последнего.
+pub fn ensure_directory_path(&self, path: &[u8]) -> Result<u32, Ext4Error> {
+    self.ensure_writable()?;
+
+    let mut current = 2u32;
+    let mut name: &[u8] = b"";
+
+    for component in path.split(|&byte| byte == b'/') {
+        if component.is_empty() || component == b"." {
+            continue;
+        }
+
+        if !name.is_empty() {
+            current = match self.find_directory_entry(current, name)? {
+                Some(inode_number) => {
+                    if !self.read_inode(inode_number)?.is_directory {
+                        return Err(Ext4Error::InvalidGeometry);
+                    }
+                    inode_number
+                }
+                None => self.create_directory(current, name)?,
+            };
+        }
+
+        name = component;
+    }
+
+    if !name.is_empty() {
+        current = match self.find_directory_entry(current, name)? {
+            Some(inode_number) => {
+                if !self.read_inode(inode_number)?.is_directory {
+                    return Err(Ext4Error::InvalidGeometry);
+                }
+                inode_number
+            }
+            None => self.create_directory(current, name)?,
+        };
+    }
+
+    Ok(current)
 }
 
 pub fn write_file_contents(
@@ -2991,7 +3266,8 @@ fn clear_directory_entry(
     let generation = Self::read_u32(&directory, INODE_GENERATION)?;
     let block_size = self.block_size() as usize;
     let size = Self::read_u32(&directory, INODE_SIZE_LO)? as u64;
-    let blocks = (size as usize + block_size - 1) / block_size;
+    let blocks = ((size + block_size as u64 - 1) / block_size as u64)
+        as usize;
 
     for logical in 0..blocks {
         let physical = match self.inode_extent_map(
@@ -3138,6 +3414,117 @@ pub fn remove_file_path(&self, path: &[u8]) -> Result<(), Ext4Error> {
     }
     self.write_inode_raw(inode_number, &mut raw)?;
     self.free_inode(inode_number, false)?;
+
+    Ok(())
+}
+
+/// Удаляет пустой каталог по пути и освобождает его блоки и inode.
+pub fn remove_directory_path(&self, path: &[u8]) -> Result<(), Ext4Error> {
+    self.ensure_writable()?;
+
+    let mut parent = 2u32;
+    let mut name: &[u8] = b"";
+
+    for component in path.split(|&byte| byte == b'/') {
+        if component.is_empty() || component == b"." {
+            continue;
+        }
+
+        if !name.is_empty() {
+            parent = self
+                .find_directory_entry(parent, name)?
+                .ok_or(Ext4Error::OutOfBounds)?;
+            let inode = self.read_inode(parent)?;
+            if !inode.is_directory {
+                return Err(Ext4Error::InvalidGeometry);
+            }
+        }
+
+        name = component;
+    }
+
+    if name.is_empty() || name == b"." || name == b".." {
+        return Err(Ext4Error::InvalidGeometry);
+    }
+
+    let inode_number = self
+        .find_directory_entry(parent, name)?
+        .ok_or(Ext4Error::OutOfBounds)?;
+
+    if inode_number == 2 {
+        return Err(Ext4Error::InvalidGeometry);
+    }
+
+    let inode = self.read_inode(inode_number)?;
+    if !inode.is_directory {
+        return Err(Ext4Error::InvalidGeometry);
+    }
+
+    let mut not_empty = false;
+    self.for_each_directory_entry(
+        inode_number,
+        |_, entry_name, _| {
+            if entry_name == b"." || entry_name == b".." {
+                true
+            } else {
+                not_empty = true;
+                false
+            }
+        },
+    )?;
+
+    if not_empty {
+        return Err(Ext4Error::NotEmpty);
+    }
+
+    let inode_size = self.superblock.inode_size as usize;
+    if inode_size > INODE_SIZE_MAX {
+        return Err(Ext4Error::UnsupportedFeature);
+    }
+
+    let mut raw = [0u8; INODE_SIZE_MAX];
+    self.read_inode_raw(inode_number, &mut raw)?;
+
+    let mut extents = [ExtentRecord {
+        logical: 0,
+        physical: 0,
+        length: 0,
+    }; MAX_EXTENTS];
+    let mut extent_count = 0usize;
+    let mut indexes = [0u64; MAX_INDEX_NODES];
+    let mut index_count = 0usize;
+
+    self.collect_inode_tree(
+        &raw[..inode_size],
+        &mut extents,
+        &mut extent_count,
+        &mut indexes,
+        &mut index_count,
+    )?;
+
+    self.clear_directory_entry(parent, name)?;
+    self.free_tree_blocks(
+        &extents[..extent_count],
+        &indexes[..index_count],
+    )?;
+
+    for byte in &mut raw[..inode_size] {
+        *byte = 0;
+    }
+    self.write_inode_raw(inode_number, &mut raw)?;
+    self.free_inode(inode_number, true)?;
+
+    // Удалённый каталог больше не ссылается на родителя через "..".
+    let mut parent_raw = [0u8; INODE_SIZE_MAX];
+    self.read_inode_raw(parent, &mut parent_raw)?;
+    let links = Self::read_u16(&parent_raw, INODE_LINKS)?;
+    Self::write_u16(
+        &mut parent_raw,
+        INODE_LINKS,
+        links.saturating_sub(1),
+    );
+    self.touch_inode_times(&mut parent_raw);
+    self.write_inode_raw(parent, &mut parent_raw)?;
 
     Ok(())
 }

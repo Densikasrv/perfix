@@ -45,6 +45,22 @@ pub unsafe fn init(fb_address: u64, fb_size: u64) {
         );
     }
 
+    // Identity-map the next 252 MiB with 4 MiB pages. Multiboot modules
+    // (the installer payloads and a copy of the kernel) are loaded by GRUB
+    // above the kernel image, so the first 4 MiB covered by 4 KiB pages is
+    // not enough. Modules stay well below this limit.
+    const IDENTITY_LARGE_PAGES: u32 = 64;
+
+    for index in 1..IDENTITY_LARGE_PAGES {
+        let address = index * LARGE_PAGE_SIZE;
+
+        unsafe {
+            directory
+                .add(index as usize)
+                .write_volatile(address | PAGE_LARGE);
+        }
+    }
+
     // Map the linear framebuffer with 4 MiB pages (requires PSE).
     if fb_address != 0 && fb_size != 0 && fb_address <= u32::MAX as u64 {
         let start = (fb_address & !(LARGE_PAGE_SIZE as u64 - 1)) as u32;

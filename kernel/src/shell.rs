@@ -57,6 +57,21 @@ where
     offset
 }
 
+/// Вызывает операцию на файловой системе выбранного раздела.
+fn for_selected_fs<F>(row: usize, mut f: F) -> usize
+where
+    F: FnMut(&dyn fs::DirectoryFileSystem, usize) -> usize,
+{
+    match crate::disk::selected_kind() {
+        crate::disk::FsKind::Exfat => f(fs::directory_filesystems()[0], row),
+        crate::disk::FsKind::Ext4 => f(fs::directory_filesystems()[1], row),
+        crate::disk::FsKind::Other => {
+            vga::print_at(row, 0, b"Unsupported filesystem");
+            1
+        }
+    }
+}
+
 /// Выполняет операцию по пути на первой ФС, где путь существует.
 /// Для операций создания (create = true) используется первая ФС.
 fn with_path_fs<F>(
@@ -270,6 +285,19 @@ fn trim_ascii_space(input: &[u8]) -> &[u8] {
 /// Является ли нормализованный путь системным пространством `/dsk`.
 fn is_reserved_dsk(path: &[u8]) -> bool {
     path == b"/dsk" || path.starts_with(b"/dsk/")
+}
+
+/// Строит абсолютный путь из текущего каталога и аргумента.
+///
+/// Публичная обёртка нужна GUI-редактору, который работает через pdesk
+/// и не имеет доступа к внутреннему состоянию оболочки.
+pub(crate) fn resolve_path(input: &[u8], out: &mut [u8; PATH_MAX]) -> Option<usize> {
+    absolute_path(input, out)
+}
+
+/// Зарезервирован ли путь под системное пространство `/dsk`.
+pub(crate) fn reserved_path(path: &[u8]) -> bool {
+    is_reserved_dsk(path)
 }
 
 fn parse_partition_number(input: &[u8]) -> Option<usize> {
@@ -578,7 +606,11 @@ fn parse_datetime(input: &[u8]) -> Option<(u32, u32, u32, u32, u32, u32)> {
 
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
-        31
+        if crate::installer::available() {
+            34
+        } else {
+            32
+        }
     } else if input == b"version" {
         5
     } else if input == b"diskinfo" {
@@ -750,6 +782,25 @@ fn push_dec_message<const N: usize>(out: &mut [u8; N], len: &mut usize, value: u
     }
 }
 
+/// Освобождает на экране место под `extra` строк, прокручивая его сразу
+/// на нужное количество строк (а не по одной).
+fn make_room(row: &mut usize, extra: usize) {
+    let height = vga::height();
+
+    if height == 0 {
+        return;
+    }
+
+    let limit = height - 1;
+
+    if *row + extra > limit {
+        let needed = (*row + extra - limit).min(*row);
+
+        vga::scroll_screen_lines(needed);
+        *row -= needed;
+    }
+}
+
 pub fn execute(input: &[u8], row: &mut usize) {
     if input == b"clear" {
         show_screen(None);
@@ -770,10 +821,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
 
     if input == b"mouse" {
         // Освобождаем место под две строки демонстрации.
-        while *row + 3 >= vga::height() && *row > 0 {
-            vga::scroll_screen();
-            *row -= 1;
-        }
+        make_room(row, 3);
 
         let used = crate::mouse::demo(*row + 1);
         *row += 1 + used;
@@ -789,10 +837,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
 
     if let Some(argument) = command_arg(input, b"timezone") {
         // Освобождаем место под строку вывода и приглашение.
-        while *row + 2 > vga::height() - 1 && *row > 0 {
-            vga::scroll_screen();
-            *row -= 1;
-        }
+        make_room(row, 2);
 
         let output_row = *row + 1;
         let mut line = [b' '; 80];
@@ -817,10 +862,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
 
     if let Some(argument) = command_arg(input, b"time") {
         // Освобождаем место под строку вывода и приглашение.
-        while *row + 2 > vga::height() - 1 && *row > 0 {
-            vga::scroll_screen();
-            *row -= 1;
-        }
+        make_room(row, 2);
 
         let output_row = *row + 1;
         let mut line = [b' '; 80];
@@ -907,11 +949,8 @@ pub fn execute(input: &[u8], row: &mut usize) {
 
     let lines = command_lines(input);
 
-    // Освобождаем место ДО вывода всей команды.
-    while *row + 1 + lines > vga::height() - 1 && *row > 0 {
-        vga::scroll_screen();
-        *row -= 1;
-    }
+    // Освобождаем место ДО вывода всей команды — одним сдвигом экрана.
+    make_room(row, 1 + lines);
 
     let output_row = *row + 1;
 
@@ -947,6 +986,12 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 28, 0, b"guinit    - start pdesk (GUI)");
         vga::print_at(output_row + 29, 0, b"timezone <GMT+N> - set time zone");
         vga::print_at(output_row + 30, 0, b"time <dd/mm/yyyy/hh/mm/ss> - set clock");
+        vga::print_at(output_row + 31, 0, b"mkfs.ext4 <n> - format partition as ext4");
+
+        if crate::installer::available() {
+            vga::print_at(output_row + 32, 0, b"install [n] [format] - install Perfix");
+            vga::print_at(output_row + 33, 0, b"setup [n] [format]   - alias for install");
+        }
     } else if input == b"about" {
         vga::print_at(output_row, 0, b"Perfix");
         vga::print_at(output_row + 1, 0, b"Copyright (C) 2026 Densikasrv");
@@ -1025,23 +1070,24 @@ pub fn execute(input: &[u8], row: &mut usize) {
     return;
 
 
-    } else if let Some(argument) = command_arg(input, b"setup") {
-        let mut n: i32 = 0;
-        let mut i = 0;
-
-        while i < argument.len() && argument[i].is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((argument[i] - b'0') as i32);
-            i += 1;
-        }
-
-        if i == 0 || n < 0 {
-            vga::print_at(output_row, 0, b"Usage: setup <partiton number>"); // тут будет установщик
-            *row = output_row + 1;
-            prompt(*row);
-            return;
-        }
-
-        let used = primary_fs().shell_setup(n as usize);
+    } else if let Some(argument) = command_arg(input, b"mkfs.ext4") {
+        let used = crate::installer::mkfs_shell_command(argument, output_row);
+        *row = output_row + used;
+        prompt(*row);
+        return;
+    } else if crate::installer::available()
+        && command_arg(input, b"setup").is_some()
+    {
+        let argument = command_arg(input, b"setup").unwrap_or(b"");
+        let used = crate::installer::shell_command(argument, output_row);
+        *row = output_row + used;
+        prompt(*row);
+        return;
+    } else if crate::installer::available()
+        && command_arg(input, b"install").is_some()
+    {
+        let argument = command_arg(input, b"install").unwrap_or(b"");
+        let used = crate::installer::shell_command(argument, output_row);
         *row = output_row + used;
         prompt(*row);
         return;
@@ -1348,7 +1394,7 @@ entries += 1;
         let mut path = [0u8; PATH_MAX];
 
         if argument.is_empty() {
-            for_each_fs(output_row, |fs, row| fs.shell_remove(b"", row));
+            for_selected_fs(output_row, |fs, row| fs.shell_remove(b"", row));
         } else if let Some(len) = absolute_path(argument, &mut path) {
             if is_reserved_dsk(&path[..len]) {
                 vga::print_at(output_row, 0, RESERVED_DSK);
@@ -1357,7 +1403,9 @@ entries += 1;
                 return;
             }
 
-            for_each_fs(output_row, |fs, row| fs.shell_remove(&path[..len], row));
+            for_selected_fs(output_row, |fs, row| {
+                fs.shell_remove(&path[..len], row)
+            });
         } else {
             path_too_long(output_row);
         }
@@ -1365,7 +1413,7 @@ entries += 1;
         let mut path = [0u8; PATH_MAX];
 
         if argument.is_empty() {
-            for_each_fs(output_row, |fs, row| fs.shell_mkdir(b"", row));
+            for_selected_fs(output_row, |fs, row| fs.shell_mkdir(b"", row));
         } else if let Some(len) = absolute_path(argument, &mut path) {
             if is_reserved_dsk(&path[..len]) {
                 vga::print_at(output_row, 0, RESERVED_DSK);
@@ -1374,7 +1422,9 @@ entries += 1;
                 return;
             }
 
-            for_each_fs(output_row, |fs, row| fs.shell_mkdir(&path[..len], row));
+            for_selected_fs(output_row, |fs, row| {
+                fs.shell_mkdir(&path[..len], row)
+            });
         } else {
             path_too_long(output_row);
         }
@@ -1382,7 +1432,7 @@ entries += 1;
         let mut path = [0u8; PATH_MAX];
 
         if argument.is_empty() {
-            for_each_fs(output_row, |fs, row| fs.shell_rmdir(b"", row));
+            for_selected_fs(output_row, |fs, row| fs.shell_rmdir(b"", row));
         } else if let Some(len) = absolute_path(argument, &mut path) {
             if is_reserved_dsk(&path[..len]) {
                 vga::print_at(output_row, 0, RESERVED_DSK);
@@ -1391,7 +1441,9 @@ entries += 1;
                 return;
             }
 
-            for_each_fs(output_row, |fs, row| fs.shell_rmdir(&path[..len], row));
+            for_selected_fs(output_row, |fs, row| {
+                fs.shell_rmdir(&path[..len], row)
+            });
         } else {
             path_too_long(output_row);
         }

@@ -7,15 +7,11 @@
 
 use crate::{App, Platform, PROMPT_COLOR, TEXT_COLOR};
 
-/// Количество GUI-приложений pdesk (pterm, тетрис, змейка).
-pub const APP_COUNT: usize = 3;
+/// Максимальное количество GUI-приложений pdesk.
+pub const APP_COUNT: usize = App::ALL.len();
 
-/// Сколько пунктов в меню: все приложения, выключение и выход в оболочку.
-pub const MENU_ITEMS: usize = APP_COUNT + 2;
-/// Индекс кнопки выключения в меню.
-pub const MENU_SHUTDOWN: usize = APP_COUNT;
-/// Индекс пункта выхода в консольную оболочку.
-pub const MENU_EXIT_SHELL: usize = APP_COUNT + 1;
+/// Сколько пунктов в меню: все видимые приложения, выключение и выход.
+pub const MENU_EXTRA: usize = 2;
 
 /// Размер иконки в доке.
 pub const ICON_SIZE: i32 = 48;
@@ -50,6 +46,10 @@ pub enum Icon {
     Tetris,
     /// Змейка.
     Snake,
+    /// Текстовый редактор.
+    Editor,
+    /// Установщик Perfix на ext4.
+    Installer,
 }
 
 /// Элемент дока или меню под указателем мыши.
@@ -83,13 +83,16 @@ pub struct Dock {
     pub y: i32,
     pub width: i32,
     pub height: i32,
-    /// Количество иконок: лончер и все приложения.
+    /// Количество иконок: лончер и видимые приложения.
     pub items: usize,
+    /// Количество видимых приложений (без лончера).
+    pub apps: usize,
 }
 
 impl Dock {
-    pub fn new(screen_width: i32, screen_height: i32) -> Self {
-        let items = APP_COUNT + 1;
+    pub fn new(screen_width: i32, screen_height: i32, apps: usize) -> Self {
+        let apps = apps.min(APP_COUNT);
+        let items = apps + 1;
         let count = items as i32;
         let icons_width = count * ICON_SIZE + (count - 1) * ICON_GAP;
         let width = 2 * DOCK_PADDING + icons_width + 2 * CLOCK_GAP + 1 + CLOCK_WIDTH;
@@ -102,6 +105,7 @@ impl Dock {
             width,
             height: DOCK_HEIGHT,
             items,
+            apps,
         }
     }
 
@@ -111,7 +115,9 @@ impl Dock {
             0 => Icon::Perforator,
             1 => Icon::Terminal,
             2 => Icon::Tetris,
-            _ => Icon::Snake,
+            3 => Icon::Snake,
+            4 => Icon::Editor,
+            _ => Icon::Installer,
         }
     }
 
@@ -221,6 +227,8 @@ fn paint_icon(platform: &mut dyn Platform, icon: Icon, rect: Rect, highlighted: 
         Icon::Terminal => paint_terminal(platform, rect),
         Icon::Tetris => paint_tetris(platform, rect),
         Icon::Snake => paint_snake(platform, rect),
+        Icon::Editor => paint_editor(platform, rect),
+        Icon::Installer => paint_installer(platform, rect),
     }
 }
 
@@ -267,6 +275,32 @@ fn paint_snake(platform: &mut dyn Platform, rect: Rect) {
     platform.fill_rect(x + 20, y + 30, 8, 8, 0x00f05050);
 }
 
+/// Иконка редактора: белый лист в синей рамке со строками текста.
+fn paint_editor(platform: &mut dyn Platform, rect: Rect) {
+    let x = rect.x;
+    let y = rect.y;
+
+    platform.fill_rect(x + 12, y + 8, 24, 32, 0x00ffffff);
+    platform.fill_rect(x + 12, y + 8, 24, 5, 0x003060c0);
+    platform.fill_rect(x + 16, y + 18, 16, 2, 0x00404040);
+    platform.fill_rect(x + 16, y + 23, 16, 2, 0x00404040);
+    platform.fill_rect(x + 16, y + 28, 12, 2, 0x00404040);
+    platform.fill_rect(x + 16, y + 33, 9, 2, 0x00404040);
+}
+/// Иконка установщика: диск с направленной вниз стрелкой.
+fn paint_installer(platform: &mut dyn Platform, rect: Rect) {
+    let x = rect.x;
+    let y = rect.y;
+
+    platform.fill_rect(x + 10, y + 14, 28, 20, 0x00b0b8c0);
+    platform.fill_rect(x + 10, y + 24, 28, 4, 0x00506070);
+    platform.fill_rect(x + 32, y + 17, 3, 3, 0x0060e080);
+
+    // Стрелка вниз.
+    platform.fill_rect(x + 23, y + 6, 3, 10, 0x00f0d020);
+    platform.fill_rect(x + 20, y + 12, 9, 3, 0x00f0d020);
+}
+
 /// Иконка перфоратора: корпус, сверло, рукоятка и шнур.
 fn paint_perforator(platform: &mut dyn Platform, rect: Rect) {
     let x = rect.x;
@@ -290,10 +324,15 @@ const MENU_ITEM_HEIGHT: i32 = 26;
 const MENU_PADDING: i32 = 4;
 const MENU_SEPARATOR: i32 = 8;
 
+/// Сколько пунктов в меню при заданном числе приложений.
+pub fn menu_items(apps: usize) -> usize {
+    apps.min(APP_COUNT) + MENU_EXTRA
+}
+
 /// Прямоугольник меню — над иконкой перфоратора.
 pub fn menu_rect(dock: &Dock, screen_width: i32) -> Rect {
-    let apps = APP_COUNT as i32;
-    let system = MENU_ITEMS as i32 - apps;
+    let apps = dock.apps as i32;
+    let system = MENU_EXTRA as i32;
     let height = 2 * MENU_PADDING
         + apps * MENU_ITEM_HEIGHT
         + MENU_SEPARATOR
@@ -309,8 +348,8 @@ pub fn menu_rect(dock: &Dock, screen_width: i32) -> Rect {
 }
 
 /// Прямоугольник пункта меню: сначала приложения, затем системные пункты.
-pub fn menu_item_rect(menu: &Rect, index: usize) -> Rect {
-    let apps = APP_COUNT as i32;
+pub fn menu_item_rect(menu: &Rect, index: usize, apps: usize) -> Rect {
+    let apps = apps.min(APP_COUNT) as i32;
     let index = index as i32;
 
     let offset = if index < apps {
@@ -328,9 +367,9 @@ pub fn menu_item_rect(menu: &Rect, index: usize) -> Rect {
 }
 
 /// Номер пункта меню под указателем.
-pub fn menu_hit(menu: &Rect, x: i32, y: i32) -> Option<usize> {
-    for index in 0..MENU_ITEMS {
-        if menu_item_rect(menu, index).contains(x, y) {
+pub fn menu_hit(menu: &Rect, x: i32, y: i32, apps: usize) -> Option<usize> {
+    for index in 0..menu_items(apps) {
+        if menu_item_rect(menu, index, apps).contains(x, y) {
             return Some(index);
         }
     }
@@ -339,10 +378,12 @@ pub fn menu_hit(menu: &Rect, x: i32, y: i32) -> Option<usize> {
 }
 
 /// Название пункта меню.
-pub fn menu_label(index: usize) -> &'static [u8] {
-    if index < APP_COUNT {
+pub fn menu_label(index: usize, apps: usize) -> &'static [u8] {
+    let apps = apps.min(APP_COUNT);
+
+    if index < apps {
         App::ALL[index].title()
-    } else if index == MENU_SHUTDOWN {
+    } else if index == apps {
         b"Shutdown".as_slice()
     } else {
         b"Exit to shell".as_slice()
@@ -350,7 +391,12 @@ pub fn menu_label(index: usize) -> &'static [u8] {
 }
 
 /// Рисует меню лончера.
-pub fn paint_menu(platform: &mut dyn Platform, menu: &Rect, hover: Option<Hover>) {
+pub fn paint_menu(
+    platform: &mut dyn Platform,
+    menu: &Rect,
+    hover: Option<Hover>,
+    apps: usize,
+) {
     platform.fill_rect(menu.x, menu.y, menu.width, menu.height, DOCK_BORDER);
     platform.fill_rect(
         menu.x + 2,
@@ -360,8 +406,10 @@ pub fn paint_menu(platform: &mut dyn Platform, menu: &Rect, hover: Option<Hover>
         MENU_COLOR,
     );
 
-    for index in 0..MENU_ITEMS {
-        let rect = menu_item_rect(menu, index);
+    let apps = apps.min(APP_COUNT);
+
+    for index in 0..menu_items(apps) {
+        let rect = menu_item_rect(menu, index, apps);
         let highlighted = matches!(hover, Some(Hover::Menu(hovered)) if hovered == index);
         let background = if highlighted { ICON_HOVER_COLOR } else { MENU_COLOR };
 
@@ -372,7 +420,7 @@ pub fn paint_menu(platform: &mut dyn Platform, menu: &Rect, hover: Option<Hover>
         platform.draw_text(
             rect.x + 8,
             rect.y + (rect.height - 16) / 2,
-            menu_label(index),
+            menu_label(index, apps),
             TEXT_COLOR,
             background,
         );
@@ -380,6 +428,6 @@ pub fn paint_menu(platform: &mut dyn Platform, menu: &Rect, hover: Option<Hover>
 
     // Разделитель между приложениями и системными пунктами.
     let separator_y =
-        menu.y + MENU_PADDING + APP_COUNT as i32 * MENU_ITEM_HEIGHT + MENU_SEPARATOR / 2;
+        menu.y + MENU_PADDING + apps as i32 * MENU_ITEM_HEIGHT + MENU_SEPARATOR / 2;
     platform.fill_rect(menu.x + 6, separator_y, menu.width - 12, 1, DOCK_BORDER);
 }

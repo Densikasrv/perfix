@@ -23,15 +23,20 @@ align 4
     dd 1080
     dd 32
 
-; Reserve 64 KiB for the initial kernel stack.
+; Reserve 256 KiB for the initial kernel stack.
+; Перед стеком оставлен защитный промежуток: при переполнении стек растёт
+; вниз и затирает guard, а не статические переменные ядра (VGA, клавиатура
+; и т. п.), которые лежат в .bss непосредственно перед ним.
 section .bss
 align 16
 
 multiboot_info:
     resd 1
 
-stack_bottom:
+stack_guard:
     resb 65536
+stack_bottom:
+    resb 262144
 stack_top:
 
 ; Actual kernel entry point.

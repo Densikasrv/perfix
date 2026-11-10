@@ -229,6 +229,45 @@ fn load_ext4_file(
 
     Ok((output_len, truncated))
 }
+
+/// Загружает текст файла с выбранного тома.
+///
+/// Отсутствующий файл возвращается как `FsError::PathNotFound`.
+pub fn load_text(path: &[u8], output: &mut [u8]) -> Result<(usize, bool), FsError> {
+    match crate::disk::selected_kind() {
+        crate::disk::FsKind::Exfat => exfat::load_text_file(path, output),
+        crate::disk::FsKind::Ext4 => load_ext4_file(path, output),
+        crate::disk::FsKind::Other => Err(FsError::NotExfat),
+    }
+}
+
+/// Загружает файл для GUI-редактора.
+///
+/// Возвращает `(длина, существовал, обрезан, длина пути)`, а в `resolved`
+/// пишет абсолютный путь, по которому файл можно сохранить позже.
+pub fn gui_load(
+    name: &[u8],
+    output: &mut [u8],
+    resolved: &mut [u8],
+) -> Result<(usize, bool, bool, usize), &'static [u8]> {
+    let mut path = [0u8; 512];
+    let Some(path_len) = crate::shell::resolve_path(name, &mut path) else {
+        return Err(b"path is too long");
+    };
+
+    if crate::shell::reserved_path(&path[..path_len]) {
+        return Err(b"reserved path");
+    }
+
+    let copy = path_len.min(resolved.len());
+    resolved[..copy].copy_from_slice(&path[..copy]);
+
+    match load_text(&path[..path_len], output) {
+        Ok((length, truncated)) => Ok((length, true, truncated, copy)),
+        Err(FsError::PathNotFound) => Ok((0, false, false, copy)),
+        Err(error) => Err(error.message()),
+    }
+}
 /// Запускает редактор для файла `path`.
 ///
 /// Отсутствующий файл считается новым. Возвращает ошибку только если
@@ -252,17 +291,7 @@ pub fn run(name: &[u8]) -> Result<Outcome, FsError> {
         crate::disk::FsKind::Ext4
     );
 
-    let loaded = match crate::disk::selected_kind() {
-        crate::disk::FsKind::Exfat => {
-            exfat::load_text_file(name, &mut buffer.data)
-        }
-        crate::disk::FsKind::Ext4 => {
-            load_ext4_file(name, &mut buffer.data)
-        }
-        crate::disk::FsKind::Other => {
-            return Err(FsError::NotExfat);
-        }
-    };
+    let loaded = load_text(name, &mut buffer.data);
 
     match loaded {
         Ok((len, truncated)) => {
@@ -618,26 +647,49 @@ fn save_ext4_file(path: &[u8], text: &[u8]) -> Result<(), &'static [u8]> {
     }
 }
 
-fn save(buffer: &Buffer, editor: &mut Editor) -> bool {
+/// Сохраняет текст (CP866) по указанному пути.
+///
+/// Возвращает размер записанного UTF-8 текста в байтах.
+pub fn save_text(path: &[u8], text: &[u8]) -> Result<usize, &'static [u8]> {
     let utf8 = unsafe { &mut *core::ptr::addr_of_mut!(UTF8) };
-    let utf8_len = exfat::cp866_to_utf8(&buffer.data[..buffer.len], utf8);
+    let utf8_len = exfat::cp866_to_utf8(text, utf8);
 
-    let result: Result<(), &'static [u8]> =
-        match crate::disk::selected_kind() {
-            crate::disk::FsKind::Exfat => {
-                exfat::save_file(editor.name, &utf8[..utf8_len])
-                    .map_err(|error| error.message())
-            }
-            crate::disk::FsKind::Ext4 => {
-                save_ext4_file(editor.name, &utf8[..utf8_len])
-            }
-            crate::disk::FsKind::Other => {
-                Err(b"unsupported filesystem")
-            }
-        };
+    match crate::disk::selected_kind() {
+        crate::disk::FsKind::Exfat => {
+            exfat::save_file(path, &utf8[..utf8_len])
+                .map_err(|error| error.message())?;
+        }
+        crate::disk::FsKind::Ext4 => {
+            save_ext4_file(path, &utf8[..utf8_len])?;
+        }
+        crate::disk::FsKind::Other => {
+            return Err(b"unsupported filesystem");
+        }
+    }
 
-    match result {
-        Ok(()) => {
+    Ok(utf8_len)
+}
+
+/// Сохраняет файл GUI-редактора.
+///
+/// Путь может быть относительным (тогда он считается от текущего каталога)
+/// или абсолютным, как в команде `tedit`.
+pub fn gui_save(path: &[u8], text: &[u8]) -> Result<usize, &'static [u8]> {
+    let mut resolved = [0u8; 512];
+    let Some(length) = crate::shell::resolve_path(path, &mut resolved) else {
+        return Err(b"path is too long");
+    };
+
+    if crate::shell::reserved_path(&resolved[..length]) {
+        return Err(b"reserved path");
+    }
+
+    save_text(&resolved[..length], text)
+}
+
+fn save(buffer: &Buffer, editor: &mut Editor) -> bool {
+    match save_text(editor.name, &buffer.data[..buffer.len]) {
+        Ok(utf8_len) => {
             editor.dirty = false;
             editor.saved = true;
             editor.new_file = false;

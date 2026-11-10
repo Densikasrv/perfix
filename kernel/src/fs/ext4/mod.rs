@@ -1,5 +1,6 @@
 pub mod fs;
 pub mod ata;
+pub mod mkfs;
 
 pub use fs::{
     AccessMode,
@@ -9,5 +10,7 @@ pub use fs::{
     InodeInfo,
     Superblock,
 };
+
+pub use mkfs::{format as format_ext4, FormatInfo};
 
 pub use ata::AtaDevice;

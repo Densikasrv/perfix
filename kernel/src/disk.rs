@@ -334,6 +334,60 @@ pub fn selected_sectors() -> u32 {
     unsafe { SELECTED_SECTORS }
 }
 
+/// Сколько разделов проверяет автоподключение при старте.
+const AUTO_PARTITIONS: usize = 8;
+
+/// Автоматически подключает файловую систему при старте.
+///
+/// Сначала ищется ext4-раздел с установленной системой Perfix (маркер
+/// `/etc/InstallSuccess` или ядро `/perfix.elf`), затем первый раздел exFAT.
+/// Если ничего не найдено, остаётся прежнее поведение: том exFAT на всём
+/// диске.
+pub fn auto_select() {
+    let mut partitions = [DiskPartition {
+        number: 0,
+        kind: FsKind::Other,
+        start_lba: 0,
+        sectors: 0,
+    }; AUTO_PARTITIONS];
+
+    let count = read_partitions(&mut partitions);
+
+    for partition in partitions[..count].iter() {
+        if partition.kind == FsKind::Ext4 && ext4_has_system(partition) {
+            let _ = select_partition(partition.number);
+            return;
+        }
+    }
+
+    for partition in partitions[..count].iter() {
+        if partition.kind == FsKind::Exfat {
+            let _ = select_partition(partition.number);
+            return;
+        }
+    }
+}
+
+/// Есть ли на ext4-разделе установленная система Perfix.
+fn ext4_has_system(partition: &DiskPartition) -> bool {
+    let device = crate::fs::ext4::AtaDevice;
+
+    let Ok(filesystem) = crate::fs::ext4::Ext4::mount(
+        &device,
+        partition.start_lba,
+        partition.sectors,
+    ) else {
+        return false;
+    };
+
+    filesystem
+        .path_exists(b"/etc/InstallSuccess")
+        .unwrap_or(false)
+        || filesystem
+            .path_exists(b"/perfix.elf")
+            .unwrap_or(false)
+}
+
 pub fn select_partition(number: usize) -> Result<FsKind, &'static [u8]> {
     let mut partitions = [DiskPartition {
         number: 0,

@@ -118,6 +118,10 @@ fn mode() -> Mode {
 
 /// Копирует `count` 32-битных слов с перекрытием вперёд (src > dst).
 fn copy_dwords(source: usize, destination: usize, count: usize) {
+    if count == 0 {
+        return;
+    }
+
     unsafe {
         core::arch::asm!(
             "push esi",
@@ -130,24 +134,6 @@ fn copy_dwords(source: usize, destination: usize, count: usize) {
             "pop esi",
             in("eax") source as u32,
             in("edx") destination as u32,
-            inout("ecx") count as u32 => _,
-        );
-    }
-}
-
-/// Заполняет `count` 32-битных слов нулями.
-fn clear_dwords(destination: usize, count: usize) {
-    unsafe {
-        core::arch::asm!(
-            "push eax",
-            "push edi",
-            "mov edi, eax",
-            "xor eax, eax",
-            "cld",
-            "rep stosd",
-            "pop edi",
-            "pop eax",
-            in("eax") destination as u32,
             inout("ecx") count as u32 => _,
         );
     }
@@ -415,77 +401,94 @@ pub fn clear_screen() {
     }
 }
 
-/// Перерисовывает только непустые знакоместа (после очистки framebuffer).
-fn repaint_nonblank() {
-    let width = width();
-    let height = height();
-
-    for row in 0..height {
-        for col in 0..width {
-            let (byte, color) = console_load(row, col);
-
-            if byte != b' ' || color != COLOR_NORMAL {
-                draw_cell(row, col, byte, color);
-            }
-        }
-    }
+pub fn scroll_screen() {
+    scroll_screen_lines(1);
 }
 
-pub fn scroll_screen() {
+/// Прокручивает экран сразу на `lines` строк.
+///
+/// Раньше оболочка прокручивала экран по одной строке в цикле, и команда
+/// вроде `help` копировала весь framebuffer 30+ раз. Один общий сдвиг
+/// делает то же самое, но в разы быстрее.
+pub fn scroll_screen_lines(lines: usize) {
+    if lines == 0 {
+        return;
+    }
+
     if is_capturing() {
         if let Some(console) = capture_console() {
-            console.scroll();
+            for _ in 0..lines {
+                console.scroll();
+            }
         }
 
         return;
     }
 
+    let width = width();
+    let height = height();
+
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let lines = lines.min(height);
+
+    if lines == height {
+        clear_screen();
+        return;
+    }
+
     match mode() {
         Mode::Text => {
-            let width = width();
-            let height = height();
+            let row_bytes = width * 2;
 
-            for row in 1..height {
-                for col in 0..width {
-                    let src = (row * width + col) * 2;
-                    let dst = ((row - 1) * width + col) * 2;
-
-                    unsafe {
-                        let character = VGA.add(src).read_volatile();
-                        let color = VGA.add(src + 1).read_volatile();
-
-                        VGA.add(dst).write_volatile(character);
-                        VGA.add(dst + 1).write_volatile(color);
+            unsafe {
+                if row_bytes % 4 == 0 {
+                    copy_dwords(
+                        VGA.add(lines * row_bytes) as usize,
+                        VGA as usize,
+                        ((height - lines) * row_bytes) / 4,
+                    );
+                } else {
+                    for index in 0..(height - lines) * row_bytes {
+                        VGA.add(index)
+                            .write_volatile(VGA.add(index + lines * row_bytes).read_volatile());
                     }
                 }
             }
 
-            for col in 0..width {
-                put_byte(height - 1, col, b' ');
+            for row in height - lines..height {
+                for col in 0..width {
+                    put_byte(row, col, b' ');
+                }
             }
         }
         Mode::Framebuffer => {
-            let width = width();
-            let height = height();
-
-            if height == 0 || width == 0 {
-                return;
-            }
-
             let row_bytes = width * 2;
             let console = core::ptr::addr_of_mut!(CONSOLE) as *mut u8;
 
             unsafe {
-                copy_dwords(
-                    console.add(row_bytes) as usize,
-                    console as usize,
-                    ((height - 1) * row_bytes) / 4,
-                );
+                if row_bytes % 4 == 0 {
+                    copy_dwords(
+                        console.add(lines * row_bytes) as usize,
+                        console as usize,
+                        ((height - lines) * row_bytes) / 4,
+                    );
+                } else {
+                    for index in 0..(height - lines) * row_bytes {
+                        console
+                            .add(index)
+                            .write(console.add(index + lines * row_bytes).read());
+                    }
+                }
 
-                for col in 0..width {
-                    let index = ((height - 1) * width + col) * 2;
-                    CONSOLE[index] = b' ';
-                    CONSOLE[index + 1] = COLOR_NORMAL;
+                for row in height - lines..height {
+                    for col in 0..width {
+                        let index = (row * width + col) * 2;
+                        CONSOLE[index] = b' ';
+                        CONSOLE[index + 1] = COLOR_NORMAL;
+                    }
                 }
 
                 // Также сдвигаем реальный framebuffer, чтобы экран оставался
@@ -496,41 +499,28 @@ pub fn scroll_screen() {
                 let pitch = PITCH;
                 if !framebuffer.is_null() && pitch > 0 {
                     let row_pitch_bytes = pitch * GLYPH_HEIGHT;
-                    let total_bytes = (height - 1) * row_pitch_bytes;
-                    // Копируем 32-битными словами (rep movsd) — быстро даже
-                    // для больших разрешений.
+                    let shift_bytes = lines * row_pitch_bytes;
+                    let total_bytes = (height - lines) * row_pitch_bytes;
+
                     copy_dwords(
-                        framebuffer.add(row_pitch_bytes) as usize,
+                        framebuffer.add(shift_bytes) as usize,
                         framebuffer as usize,
                         total_bytes / 4,
                     );
-                    // Остаток байт, если row_pitch_bytes не кратен 4.
-                    let dword_end = (total_bytes / 4) * 4;
-                    for i in dword_end..total_bytes {
-                        framebuffer.add(i).write(framebuffer.add(i + row_pitch_bytes).read());
-                    }
-                    // Зачищаем последнюю строку.
-                    for i in 0..row_pitch_bytes {
-                        framebuffer.add(total_bytes + i).write(0);
-                    }
+                    // Нижние строки очищаем одним быстрым заполнением.
+                    fill_dwords(
+                        framebuffer.add(total_bytes) as usize,
+                        shift_bytes / 4,
+                        0,
+                    );
                 }
 
                 CURSOR = None;
             }
 
-            let framebuffer = unsafe { FRAMEBUFFER };
-            let pitch = unsafe { PITCH };
-
-            if !framebuffer.is_null() && pitch != 0 {
-                let pixel_height = unsafe { PIXEL_HEIGHT };
-
-                clear_dwords(
-                    framebuffer as usize,
-                    (pitch * pixel_height) / 4,
-                );
-            }
-
-            repaint_nonblank();
+            // Изображение уже сдвинуто вместе с CONSOLE. Полная очистка
+            // экрана и повторная отрисовка здесь давали сильное мерцание
+            // при прокрутке длинного вывода команд.
         }
     }
 }
@@ -871,6 +861,93 @@ pub fn fill_rect(x: i32, y: i32, width: i32, height: i32, color: u32) {
     }
 }
 
+/// Сохраняет прямоугольник экрана в буфер (по строкам, без отступа).
+///
+/// Используется pdesk при перетаскивании окна: фон под окном снимается
+/// один раз, а затем быстро возвращается на место.
+pub fn read_rect(x: i32, y: i32, width: i32, height: i32, out: &mut [u32]) {
+    if mode() != Mode::Framebuffer || width <= 0 || height <= 0 {
+        return;
+    }
+
+    let screen_width = pixel_width() as i32;
+    let screen_height = pixel_height() as i32;
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = x.saturating_add(width).min(screen_width);
+    let y1 = y.saturating_add(height).min(screen_height);
+
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+
+    let stride = width as usize;
+
+    if out.len() < stride * height as usize {
+        return;
+    }
+
+    let pitch = unsafe { PITCH };
+    let framebuffer = unsafe { FRAMEBUFFER };
+
+    if framebuffer.is_null() {
+        return;
+    }
+
+    for row in y0..y1 {
+        let source = unsafe {
+            framebuffer.add(row as usize * pitch + x0 as usize * BYTES_PER_PIXEL)
+        } as usize;
+        let destination = out
+            .as_mut_ptr()
+            .wrapping_add((row - y) as usize * stride + (x0 - x) as usize) as usize;
+
+        copy_dwords(source, destination, (x1 - x0) as usize);
+    }
+}
+
+/// Восстанавливает прямоугольник экрана из буфера, снятого [`read_rect`].
+pub fn write_rect(x: i32, y: i32, width: i32, height: i32, data: &[u32]) {
+    if mode() != Mode::Framebuffer || width <= 0 || height <= 0 {
+        return;
+    }
+
+    let screen_width = pixel_width() as i32;
+    let screen_height = pixel_height() as i32;
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = x.saturating_add(width).min(screen_width);
+    let y1 = y.saturating_add(height).min(screen_height);
+
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+
+    let stride = width as usize;
+
+    if data.len() < stride * height as usize {
+        return;
+    }
+
+    let pitch = unsafe { PITCH };
+    let framebuffer = unsafe { FRAMEBUFFER };
+
+    if framebuffer.is_null() {
+        return;
+    }
+
+    for row in y0..y1 {
+        let source = data
+            .as_ptr()
+            .wrapping_add((row - y) as usize * stride + (x0 - x) as usize) as usize;
+        let destination = unsafe {
+            framebuffer.add(row as usize * pitch + x0 as usize * BYTES_PER_PIXEL)
+        } as usize;
+
+        copy_dwords(source, destination, (x1 - x0) as usize);
+    }
+}
+
 /// Рисует один глиф шрифта 8x16 в пиксельных координатах.
 pub fn draw_glyph(x: i32, y: i32, byte: u8, foreground: u32, background: u32) {
     if mode() != Mode::Framebuffer {
@@ -878,29 +955,76 @@ pub fn draw_glyph(x: i32, y: i32, byte: u8, foreground: u32, background: u32) {
     }
 
     let glyph = &font_8x16::GLYPHS[byte as usize];
+    let screen_width = pixel_width() as i32;
+    let screen_height = pixel_height() as i32;
+    let inside = x >= 0
+        && y >= 0
+        && x + GLYPH_WIDTH as i32 <= screen_width
+        && y + GLYPH_HEIGHT as i32 <= screen_height;
 
-    for (row_index, bits) in glyph.iter().enumerate() {
-        let row_y = y + row_index as i32;
-        let mut column = 0usize;
+    if !inside {
+        // Редкий случай: глиф на краю экрана. Рисуем по пикселям с
+        // проверкой границ, чтобы не потерять видимую часть.
+        for (row_index, bits) in glyph.iter().enumerate() {
+            let row_y = y + row_index as i32;
 
-        // Пиксели одного цвета собираются в отрезки: меньше записей.
-        while column < GLYPH_WIDTH {
-            let on = bits & (0x80 >> column) != 0;
-            let mut end = column + 1;
-
-            while end < GLYPH_WIDTH && (bits & (0x80 >> end) != 0) == on {
-                end += 1;
+            if row_y < 0 || row_y >= screen_height {
+                continue;
             }
 
-            let color = if on { foreground } else { background };
-            fb_span(
-                x + column as i32,
-                row_y,
-                (end - column) as i32,
-                color,
-            );
+            for column in 0..GLYPH_WIDTH {
+                let pixel_x = x + column as i32;
 
-            column = end;
+                if pixel_x < 0 || pixel_x >= screen_width {
+                    continue;
+                }
+
+                let color = if bits & (0x80 >> column) != 0 {
+                    foreground
+                } else {
+                    background
+                };
+
+                fb_pixel(pixel_x as usize, row_y as usize, color);
+            }
+        }
+
+        return;
+    }
+
+    let pitch = unsafe { PITCH };
+    let framebuffer = unsafe { FRAMEBUFFER };
+
+    if framebuffer.is_null() {
+        return;
+    }
+
+    // Строка глифа — ровно 8 пикселей (32 байта). Собираем её в два
+    // 128-битных значения и записываем двумя store вместо десятков
+    // вызовов fb_span. Это заметно ускоряет текст и в консоли, и в pdesk.
+    for (row_index, bits) in glyph.iter().enumerate() {
+        let mut colors = [background; GLYPH_WIDTH];
+
+        for column in 0..GLYPH_WIDTH {
+            if bits & (0x80 >> column) != 0 {
+                colors[column] = foreground;
+            }
+        }
+
+        let first = colors[0] as u128
+            | ((colors[1] as u128) << 32)
+            | ((colors[2] as u128) << 64)
+            | ((colors[3] as u128) << 96);
+        let second = colors[4] as u128
+            | ((colors[5] as u128) << 32)
+            | ((colors[6] as u128) << 64)
+            | ((colors[7] as u128) << 96);
+        let offset = (y + row_index as i32) as usize * pitch + x as usize * BYTES_PER_PIXEL;
+        let destination = unsafe { framebuffer.add(offset) as *mut u128 };
+
+        unsafe {
+            destination.write_unaligned(first);
+            destination.add(1).write_unaligned(second);
         }
     }
 }

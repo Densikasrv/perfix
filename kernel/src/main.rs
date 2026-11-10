@@ -16,6 +16,7 @@ mod paging;
 mod ata;
 mod fs;
 mod disk;
+mod installer;
 pub use fs::exfat;
 pub use fs::ext4;
 mod tedit;
@@ -53,21 +54,84 @@ count: usize,
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcpy(
-dest: *mut c_void,
-src: *const c_void,
-count: usize,
+    dest: *mut c_void,
+    src: *const c_void,
+    count: usize,
 ) -> *mut c_void {
-let dest = dest as *mut u8;
-let src = src as *const u8;
-
-for i in 0..count {
-    unsafe {
-        dest.add(i).write(src.add(i).read());
+    if count != 0 {
+        unsafe {
+            core::arch::asm!(
+                "push esi",
+                "push edi",
+                "mov esi, eax",
+                "mov edi, edx",
+                "cld",
+                "rep movsb",
+                "pop edi",
+                "pop esi",
+                in("eax") src as u32,
+                in("edx") dest as u32,
+                inout("ecx") count as u32 => _
+            );
+        }
     }
+
+    dest
 }
 
-dest as *mut c_void
+/// Копирование с возможным перекрытием диапазонов.
+///
+/// Нужно оптимизированному коду (`copy_within`, срезы и т.п.): без этой
+/// функции ядро и pdesk не линкуются с `opt-level > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memmove(
+    dest: *mut c_void,
+    src: *const c_void,
+    count: usize,
+) -> *mut c_void {
+    if count == 0 || dest as usize == src as usize {
+        return dest;
+    }
 
+    unsafe {
+        if (dest as usize) < (src as usize) {
+            core::arch::asm!(
+                "push esi",
+                "push edi",
+                "mov esi, eax",
+                "mov edi, edx",
+                "cld",
+                "rep movsb",
+                "pop edi",
+                "pop esi",
+                in("eax") src as u32,
+                in("edx") dest as u32,
+                inout("ecx") count as u32 => _
+            );
+        } else {
+            // Копируем с конца, чтобы не затереть ещё не прочитанные байты.
+            core::arch::asm!(
+                "push esi",
+                "push edi",
+                "mov esi, eax",
+                "mov edi, edx",
+                "add esi, ecx",
+                "add edi, ecx",
+                "dec esi",
+                "dec edi",
+                "std",
+                "rep movsb",
+                "cld",
+                "pop edi",
+                "pop esi",
+                in("eax") src as u32,
+                in("edx") dest as u32,
+                inout("ecx") count as u32 => _
+            );
+        }
+    }
+
+    dest
 }
 
 #[unsafe(no_mangle)]
@@ -191,6 +255,11 @@ gdt::init();
 idt::init();
 paging::init(framebuffer_address, framebuffer_size);
 }
+
+installer::init(multiboot_info);
+installer::detect_installed();
+// Системный ext4-раздел подключается автоматически, как и том exFAT.
+disk::auto_select();
 
 vga::init(framebuffer);
 

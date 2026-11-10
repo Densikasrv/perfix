@@ -54,7 +54,13 @@ pub struct Window {
     pub width: i32,
     pub height: i32,
     pub title: &'static [u8],
+    /// Динамический заголовок (например, имя файла в редакторе).
+    title_buffer: [u8; TITLE_CAPACITY],
+    title_length: usize,
 }
+
+/// Ёмкость динамического заголовка окна.
+pub const TITLE_CAPACITY: usize = 64;
 
 impl Window {
     pub const fn new(x: i32, y: i32, width: i32, height: i32, title: &'static [u8]) -> Self {
@@ -64,6 +70,24 @@ impl Window {
             width,
             height,
             title,
+            title_buffer: [0; TITLE_CAPACITY],
+            title_length: 0,
+        }
+    }
+
+    /// Задаёт динамический заголовок вместо статического.
+    pub fn set_title(&mut self, title: &[u8]) {
+        let length = title.len().min(self.title_buffer.len());
+        self.title_buffer[..length].copy_from_slice(&title[..length]);
+        self.title_length = length;
+    }
+
+    /// Текущий заголовок окна.
+    fn title_bytes(&self) -> &[u8] {
+        if self.title_length > 0 {
+            &self.title_buffer[..self.title_length]
+        } else {
+            self.title
         }
     }
 
@@ -195,14 +219,15 @@ impl Window {
         // Название окна — слева, чтобы не залезать на кнопки.
         let text_x = self.x + BORDER + 10;
         let available = self.width - 2 * BORDER - 3 * BUTTON_WIDTH - 16;
-        let max_chars = ((available.max(0) / crate::terminal::CHAR_WIDTH) as usize)
-            .min(self.title.len());
+        let title = self.title_bytes();
+        let max_chars =
+            ((available.max(0) / crate::terminal::CHAR_WIDTH) as usize).min(title.len());
 
         if max_chars > 0 {
             platform.draw_text(
                 text_x,
                 self.y + BORDER + (TITLE_HEIGHT - crate::terminal::CHAR_HEIGHT) / 2,
-                &self.title[..max_chars],
+                &title[..max_chars],
                 TITLE_TEXT_COLOR,
                 TITLE_COLOR,
             );

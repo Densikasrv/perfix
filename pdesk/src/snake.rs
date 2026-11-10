@@ -193,6 +193,9 @@ impl Snake {
 
     /// Рисует игру в прямоугольнике содержимого окна.
     pub fn paint(&self, platform: &mut dyn Platform, x: i32, y: i32) {
+        // Поле ниже заливается целиком, поэтому фон нужен только строке счёта.
+        platform.fill_rect(x, y, CONTENT_WIDTH, HUD_HEIGHT, WINDOW_COLOR);
+
         let mut buffer = [0u8; 24];
         let mut length = crate::push_text(&mut buffer, 0, b"SCORE ");
         length = crate::push_decimal(&mut buffer, length, self.score);

@@ -159,8 +159,25 @@ fn map_ext4_error(error: crate::fs::ext4::Ext4Error) -> TransferError {
         Ext4Error::Io => TransferError::Io,
         Ext4Error::UnsupportedBlockSize => TransferError::UnsupportedBlockSize,
         Ext4Error::InvalidSuperblock => TransferError::InvalidSuperblock,
+        Ext4Error::NotEmpty => TransferError::DirectoryNotEmpty,
         _ => TransferError::Fs,
     }
+}
+
+fn print_ext4_error(row: usize, error: crate::fs::ext4::Ext4Error) -> usize {
+    use crate::fs::ext4::Ext4Error;
+
+    let message: &[u8] = match error {
+        Ext4Error::ReadOnly => b"ext4 is read-only",
+        Ext4Error::UnsafeWrite => b"ext4 write disabled: unsafe features",
+        Ext4Error::NoSpace => b"ext4: no free space",
+        Ext4Error::UnsupportedFeature => b"ext4: operation not supported",
+        Ext4Error::InvalidGeometry => b"ext4: invalid path or inode",
+        _ => b"ext4 operation failed",
+    };
+
+    crate::vga::print_at(row, 0, message);
+    1
 }
 
 fn exfat_mount(location: &FileLocation) -> Result<exfat::fs::Volume, TransferError> {
@@ -509,6 +526,12 @@ pub trait DirectoryFileSystem {
 
     fn shell_write(&self, path: &[u8], text: &[u8], row: usize) -> usize;
 
+    fn shell_remove(&self, path: &[u8], row: usize) -> usize;
+
+    fn shell_mkdir(&self, path: &[u8], row: usize) -> usize;
+
+    fn shell_rmdir(&self, path: &[u8], row: usize) -> usize;
+
     fn path_is_directory(&self, path: &[u8]) -> Result<bool, DirectoryError>;
 }
 
@@ -530,6 +553,18 @@ impl DirectoryFileSystem for ExfatDirectoryFileSystem {
         let _ = (path, text);
         crate::vga::print_at(row, 0, b"Use exFAT write handler");
         1
+    }
+
+    fn shell_remove(&self, path: &[u8], row: usize) -> usize {
+        exfat::shell_remove(path, row)
+    }
+
+    fn shell_mkdir(&self, path: &[u8], row: usize) -> usize {
+        exfat::shell_mkdir(path, row)
+    }
+
+    fn shell_rmdir(&self, path: &[u8], row: usize) -> usize {
+        exfat::shell_rmdir(path, row)
     }
 }
 
@@ -972,6 +1007,160 @@ impl DirectoryFileSystem for Ext4DirectoryFileSystem {
                 crate::vga::print_at(row, 0, b"ext4 write failed");
                 1
             }
+        }
+    }
+
+    fn shell_remove(&self, path: &[u8], row: usize) -> usize {
+        use crate::fs::ext4::{AtaDevice, Ext4, Ext4Error};
+
+        if path.is_empty() {
+            crate::vga::print_at(row, 0, b"Usage: rm <file>");
+            return 1;
+        }
+
+        let device = AtaDevice;
+        let ext4 = match Ext4::mount_read_write(
+            &device,
+            crate::disk::selected_lba(),
+            crate::disk::selected_sectors(),
+        ) {
+            Ok(fs) => fs,
+            Err(Ext4Error::UnsafeWrite) => {
+                crate::vga::print_at(
+                    row,
+                    0,
+                    b"ext4 write disabled: unsafe features",
+                );
+                return 1;
+            }
+            Err(Ext4Error::ReadOnly) => {
+                crate::vga::print_at(row, 0, b"ext4 is read-only");
+                return 1;
+            }
+            Err(_) => {
+                crate::vga::print_at(row, 0, b"ext4 mount failed");
+                return 1;
+            }
+        };
+
+        match ext4.remove_file_path(path) {
+            Ok(()) => {
+                crate::vga::print_at(row, 0, b"File removed successfully");
+                1
+            }
+            Err(Ext4Error::OutOfBounds) => {
+                crate::vga::print_at(row, 0, b"Path not found");
+                1
+            }
+            Err(Ext4Error::InvalidGeometry) => {
+                crate::vga::print_at(row, 0, b"Not a file");
+                1
+            }
+            Err(error) => print_ext4_error(row, error),
+        }
+    }
+
+    fn shell_mkdir(&self, path: &[u8], row: usize) -> usize {
+        use crate::fs::ext4::{AtaDevice, Ext4, Ext4Error};
+
+        if path.is_empty() {
+            crate::vga::print_at(row, 0, b"Usage: mkdir <dir>");
+            return 1;
+        }
+
+        let device = AtaDevice;
+        let ext4 = match Ext4::mount_read_write(
+            &device,
+            crate::disk::selected_lba(),
+            crate::disk::selected_sectors(),
+        ) {
+            Ok(fs) => fs,
+            Err(Ext4Error::UnsafeWrite) => {
+                crate::vga::print_at(
+                    row,
+                    0,
+                    b"ext4 write disabled: unsafe features",
+                );
+                return 1;
+            }
+            Err(Ext4Error::ReadOnly) => {
+                crate::vga::print_at(row, 0, b"ext4 is read-only");
+                return 1;
+            }
+            Err(_) => {
+                crate::vga::print_at(row, 0, b"ext4 mount failed");
+                return 1;
+            }
+        };
+
+        match ext4.mkdir_path(path) {
+            Ok(_) => {
+                crate::vga::print_at(row, 0, b"Directory created successfully");
+                1
+            }
+            Err(Ext4Error::OutOfBounds) => {
+                crate::vga::print_at(row, 0, b"Parent path not found");
+                1
+            }
+            Err(Ext4Error::InvalidGeometry) => {
+                crate::vga::print_at(row, 0, b"Directory already exists");
+                1
+            }
+            Err(error) => print_ext4_error(row, error),
+        }
+    }
+
+    fn shell_rmdir(&self, path: &[u8], row: usize) -> usize {
+        use crate::fs::ext4::{AtaDevice, Ext4, Ext4Error};
+
+        if path.is_empty() {
+            crate::vga::print_at(row, 0, b"Usage: rmdir <dir>");
+            return 1;
+        }
+
+        let device = AtaDevice;
+        let ext4 = match Ext4::mount_read_write(
+            &device,
+            crate::disk::selected_lba(),
+            crate::disk::selected_sectors(),
+        ) {
+            Ok(fs) => fs,
+            Err(Ext4Error::UnsafeWrite) => {
+                crate::vga::print_at(
+                    row,
+                    0,
+                    b"ext4 write disabled: unsafe features",
+                );
+                return 1;
+            }
+            Err(Ext4Error::ReadOnly) => {
+                crate::vga::print_at(row, 0, b"ext4 is read-only");
+                return 1;
+            }
+            Err(_) => {
+                crate::vga::print_at(row, 0, b"ext4 mount failed");
+                return 1;
+            }
+        };
+
+        match ext4.remove_directory_path(path) {
+            Ok(()) => {
+                crate::vga::print_at(row, 0, b"Directory removed successfully");
+                1
+            }
+            Err(Ext4Error::OutOfBounds) => {
+                crate::vga::print_at(row, 0, b"Path not found");
+                1
+            }
+            Err(Ext4Error::NotEmpty) => {
+                crate::vga::print_at(row, 0, b"Directory not empty");
+                1
+            }
+            Err(Ext4Error::InvalidGeometry) => {
+                crate::vga::print_at(row, 0, b"Not a directory");
+                1
+            }
+            Err(error) => print_ext4_error(row, error),
         }
     }
 
