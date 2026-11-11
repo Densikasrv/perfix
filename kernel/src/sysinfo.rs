@@ -1,6 +1,8 @@
 //! Сведения о памяти, полученные из Multiboot info.
 
 static mut RAM_KB: u64 = 0;
+/// Конец области, занятой Multiboot-модулями (0, если их нет).
+static mut MODULES_END: u32 = 0;
 
 fn read_u32(address: u32, offset: usize) -> u32 {
     unsafe {
@@ -73,9 +75,35 @@ pub fn init(multiboot_info: u32) {
         total_kb = lower.saturating_add(upper);
     }
 
+    let mut modules_end = 0u32;
+
+    // Модули загрузчик кладёт в память сразу за ядром. Их нельзя
+    // затирать ареной или кадрами программы, иначе перестанет работать
+    // установщик, которому нужен образ ядра из модуля.
+    if flags & (1 << 3) != 0 {
+        let count = read_u32(multiboot_info, 20);
+        let address = read_u32(multiboot_info, 24);
+
+        for index in 0..count.min(64) {
+            let entry = match address.checked_add(index * 16) {
+                Some(entry) => entry,
+                None => break,
+            };
+            let end = read_u32(entry, 4);
+
+            modules_end = modules_end.max(end);
+        }
+    }
+
     unsafe {
         RAM_KB = total_kb;
+        MODULES_END = modules_end;
     }
+}
+
+/// Конец области Multiboot-модулей (0, если модулей нет).
+pub fn modules_end() -> u32 {
+    unsafe { MODULES_END }
 }
 
 /// Объём RAM в килобайтах (0, если неизвестен).

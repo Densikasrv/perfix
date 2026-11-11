@@ -45,6 +45,7 @@ static mut IDT: [IdtEntry; 256] = [IdtEntry::missing(); 256];
 
 unsafe extern "C" {
     static isr_stub_table: [u32; 32];
+    fn isr128();
 }
 
 pub unsafe fn init() {
@@ -59,6 +60,12 @@ pub unsafe fn init() {
         }
     }
 
+    // Системный вызов для запущенных ELF-программ.
+    unsafe {
+        idt.add(0x80)
+            .write(IdtEntry::new(isr128 as *const () as usize as u32));
+    }
+
     let pointer = IdtPointer {
         limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
         base: core::ptr::addr_of!(IDT) as u32,
@@ -70,6 +77,63 @@ pub unsafe fn init() {
             in(reg) &pointer,
             options(nostack, preserves_flags)
         );
+    }
+}
+
+/// Обработчик `int 0x80`.
+///
+/// `frame` указывает на сохранённые `pusha` регистры; запись в `frame[7]`
+/// (EAX) задаёт значение, которое получит программа после `iret`.
+#[unsafe(no_mangle)]
+pub extern "C" fn syscall_handler(frame: *mut u32) {
+    if frame.is_null() {
+        return;
+    }
+
+    let registers = unsafe { &mut *(frame as *mut [u32; 8]) };
+    let number = registers[7];
+
+    // Номера вызовов совпадают с Linux i386: так сторонние статические
+    // программы, собранные под Linux, работают без пересборки.
+    match number {
+        // exit / exit_group
+        0 | 1 | 252 => crate::exec::exit_program(registers[4]),
+        // write(fd, buf, count)
+        4 => {
+            crate::exec::write_output(registers[6], registers[5]);
+            registers[7] = 0;
+        }
+        // writev(fd, iovec *, iovcnt)
+        146 => {
+            registers[7] = crate::exec::writev_output(registers[6], registers[5]);
+        }
+        // uname(struct utsname *)
+        122 => {
+            registers[7] = crate::exec::uname_output(registers[4]) as u32;
+        }
+        // mprotect(addr, len, prot): страницы уже доступны на запись.
+        125 => {
+            registers[7] = 0;
+        }
+        // getpid
+        20 => {
+            registers[7] = 1;
+        }
+        // getuid / getgid / geteuid / getegid
+        24 | 47 | 49 | 50 => {
+            registers[7] = 0;
+        }
+        // brk(addr)
+        45 => {
+            registers[7] = crate::exec::set_break(registers[4]);
+        }
+        // set_thread_area(user_desc *)
+        243 => {
+            registers[7] = crate::gdt::set_thread_area(registers[4]) as u32;
+        }
+        _ => {
+            registers[7] = u32::MAX;
+        }
     }
 }
 
@@ -119,6 +183,12 @@ pub extern "C" fn idt_exception_handler(
     error: u32,
     eip: u32,
 ) -> ! {
+    // Ошибку загруженной программы не показываем как панику ядра:
+    // сообщаем и возвращаем управление оболочке.
+    if crate::exec::active() {
+        crate::exec::handle_exception(vector, error, eip);
+    }
+
     vga::clear_screen();
 
     vga::print_at(0, 0, b"Perfix - CPU Exception");

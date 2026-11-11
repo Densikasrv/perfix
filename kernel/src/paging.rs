@@ -7,6 +7,7 @@ const PAGE_LARGE: u32 = 0x083; // Present | Writable | Page Size (4 MiB)
 const LARGE_PAGE_SIZE: u32 = 0x0040_0000;
 const PAGE_COUNT: usize = 1024;
 
+#[derive(Clone, Copy)]
 #[repr(C, align(4096))]
 struct PageTable {
     entries: [u32; PAGE_COUNT],
@@ -124,6 +125,133 @@ pub unsafe fn init(fb_address: u64, fb_size: u64) {
             options(nostack, preserves_flags)
         );
     }
+}
+
+/// Сколько отдельных 4 MiB областей может занять загруженная программа.
+///
+/// Для каждого такого диапазона создаётся своя таблица страниц. Статические
+/// таблицы лежат в `.bss` ядра и адресуются по тождественному отображению.
+const PROGRAM_TABLE_LIMIT: usize = 16;
+
+static mut PROGRAM_TABLES: [PageTable; PROGRAM_TABLE_LIMIT] =
+    [PageTable {
+        entries: [0; PAGE_COUNT],
+    }; PROGRAM_TABLE_LIMIT];
+static mut PROGRAM_DIR_INDEX: [u32; PROGRAM_TABLE_LIMIT] =
+    [0; PROGRAM_TABLE_LIMIT];
+static mut PROGRAM_SAVED_PDE: [u32; PROGRAM_TABLE_LIMIT] =
+    [0; PROGRAM_TABLE_LIMIT];
+static mut PROGRAM_TABLE_COUNT: usize = 0;
+
+fn flush_tlb_page(address: u32) {
+    unsafe {
+        asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+    }
+}
+
+fn reload_cr3() {
+    let directory =
+        core::ptr::addr_of_mut!(PAGE_DIRECTORY) as u32;
+
+    unsafe {
+        asm!(
+            "mov cr3, {0:e}",
+            in(reg) directory,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Отображает одну 4 KiB страницу программы на физический кадр.
+///
+/// Тождественное отображение в этом диапазоне заменяется таблицей страниц;
+/// исходные записи каталога запоминаются и восстанавливаются в
+/// [`restore_program_pages`]. Возвращает `false`, если закончились таблицы.
+pub fn map_program_page(virt: u32, phys: u32) -> bool {
+    let dir_index = (virt >> 22) as usize;
+
+    // Нулевая запись каталога занята таблицей первых 4 MiB ядра.
+    if dir_index == 0 {
+        return false;
+    }
+
+    unsafe {
+        let directory =
+            core::ptr::addr_of_mut!(PAGE_DIRECTORY).cast::<u32>();
+        let mut slot = None;
+
+        for index in 0..PROGRAM_TABLE_COUNT {
+            let saved_dir = PROGRAM_DIR_INDEX[index] as usize;
+
+            if saved_dir == dir_index {
+                slot = Some(index);
+                break;
+            }
+        }
+
+        let slot = match slot {
+            Some(slot) => slot,
+            None => {
+                if PROGRAM_TABLE_COUNT >= PROGRAM_TABLE_LIMIT {
+                    return false;
+                }
+
+                let slot = PROGRAM_TABLE_COUNT;
+                PROGRAM_DIR_INDEX[slot] = dir_index as u32;
+                PROGRAM_SAVED_PDE[slot] =
+                    directory.add(dir_index).read_volatile();
+
+                let table = core::ptr::addr_of_mut!(
+                    PROGRAM_TABLES[slot]
+                )
+                .cast::<u8>();
+
+                for byte in 0..PAGE_SIZE as usize {
+                    table.add(byte).write_volatile(0);
+                }
+
+                directory.add(dir_index).write_volatile(
+                    (table as u32) | PAGE_PRESENT_WRITABLE,
+                );
+
+                PROGRAM_TABLE_COUNT += 1;
+                slot
+            }
+        };
+
+        let table = core::ptr::addr_of_mut!(PROGRAM_TABLES[slot])
+            .cast::<u32>();
+        let pte_index = ((virt >> 12) & 0x3FF) as usize;
+
+        table.add(pte_index).write_volatile(
+            (phys & !(PAGE_SIZE - 1)) | PAGE_PRESENT_WRITABLE,
+        );
+    }
+
+    flush_tlb_page(virt);
+    true
+}
+
+/// Восстанавливает исходное тождественное отображение после программы.
+pub fn restore_program_pages() {
+    unsafe {
+        let directory =
+            core::ptr::addr_of_mut!(PAGE_DIRECTORY).cast::<u32>();
+
+        for index in 0..PROGRAM_TABLE_COUNT {
+            let dir_index = PROGRAM_DIR_INDEX[index] as usize;
+
+            directory
+                .add(dir_index)
+                .write_volatile(PROGRAM_SAVED_PDE[index]);
+        }
+
+        PROGRAM_TABLE_COUNT = 0;
+    }
+
+    // Полностью сбрасываем TLB: старые записи могли кэшировать как
+    // тождественное отображение, так и отображение программы.
+    reload_cr3();
 }
 
 pub fn test_page_fault() -> ! {

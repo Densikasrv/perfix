@@ -19,6 +19,102 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
     (eax, ebx, ecx, edx)
 }
 
+/// Включает FPU, а также SSE и AVX, если процессор их поддерживает.
+///
+/// Ядро собрано с `-mmx,-sse`, но сторонние программы могут использовать
+/// эти инструкции. Без установленных битов CR0/CR4/OSXSAVE они вызывают
+/// #UD (#NM для FPU), поэтому разрешаем их до запуска чего-либо ещё.
+///
+/// Все обращения к CR0/CR4 выполняются только для поддерживаемых
+/// возможностей: биты OSFXSR/OSXMMEXCPT на процессоре без SSE
+/// зарезервированы, и запись единиц в них вызывает #GP. Так же и
+/// OSXSAVE/XCR0 включаются лишь при наличии XSAVE и AVX.
+pub fn init_features() {
+    unsafe {
+        let (_, _, ecx_features, edx_features) = cpuid(1);
+
+        let has_fpu = edx_features & (1 << 0) != 0;
+        let has_fxsr = edx_features & (1 << 24) != 0;
+        let has_sse = edx_features & (1 << 25) != 0;
+
+        // x87: сбрасываем EM/TS (эмуляция и ленивое переключение
+        // контекста) и выставляем MP/NE, чтобы FPU был доступен
+        // программе напрямую. На CPU без FPU регистры не трогаем.
+        if has_fpu {
+            let mut cr0: u32;
+
+            core::arch::asm!(
+                "mov {0:e}, cr0",
+                out(reg) cr0,
+                options(nostack, preserves_flags)
+            );
+
+            cr0 &= !((1 << 2) | (1 << 3));
+            cr0 |= (1 << 1) | (1 << 5);
+
+            core::arch::asm!(
+                "mov cr0, {0:e}",
+                in(reg) cr0,
+                options(nostack, preserves_flags)
+            );
+
+            core::arch::asm!("fninit", options(nostack));
+        }
+
+        let mut cr4: u32;
+
+        core::arch::asm!(
+            "mov {0:e}, cr4",
+            out(reg) cr4,
+            options(nostack, preserves_flags)
+        );
+
+        // OSFXSR — разрешает SSE-регистры, OSXMMEXCPT — исключения SSE.
+        if has_fxsr {
+            cr4 |= 1 << 9;
+        }
+
+        if has_sse {
+            cr4 |= 1 << 10;
+        }
+
+        // Бит 26 — аппаратная поддержка XSAVE, бит 28 — AVX;
+        // бит 27 (OSXSAVE) выставляет уже операционная система.
+        let has_xsave = ecx_features & (1 << 26) != 0;
+        let has_avx = ecx_features & (1 << 28) != 0;
+
+        // AVX имеет смысл только поверх SSE.
+        let use_avx = has_fxsr && has_sse && has_xsave && has_avx;
+
+        if use_avx {
+            // OSXSAVE разрешает XSAVE и XCR0.
+            cr4 |= 1 << 18;
+        }
+
+        core::arch::asm!(
+            "mov cr4, {0:e}",
+            in(reg) cr4,
+            options(nostack, preserves_flags)
+        );
+
+        if use_avx {
+            // Проверяем, что XCR0 умеет хранить состояния x87, SSE и AVX.
+            let (xcr0_supported, _, _, _) = cpuid(0xD);
+            let xcr0 = xcr0_supported & 0x7;
+
+            if xcr0 == 0x7 {
+                core::arch::asm!(
+                    "xsetbv",
+                    in("ecx") 0u32,
+                    in("eax") 0x7u32,
+                    in("edx") 0u32,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
+    }
+}
+
 /// Записывает vendor string CPU (например, GenuineIntel) и возвращает длину.
 pub fn vendor(out: &mut [u8]) -> usize {
     let (_, ebx, ecx, edx) = cpuid(0);

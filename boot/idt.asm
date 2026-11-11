@@ -4,7 +4,9 @@ BITS 32
 section .text
 
 extern idt_exception_handler
+extern syscall_handler
 global isr_stub_table
+global isr128
 
 %macro ISR_NOERR 1
 global isr%1
@@ -81,6 +83,25 @@ isr_common_stub:
     cli
     hlt
     jmp .hang
+
+; Системный вызов int 0x80.
+;
+; После pusha кадр регистров лежит в памяти так:
+;   [esp +  0] = EDI
+;   [esp +  4] = ESI
+;   [esp +  8] = EBP
+;   [esp + 12] = ESP (до pusha)
+;   [esp + 16] = EBX
+;   [esp + 20] = EDX
+;   [esp + 24] = ECX
+;   [esp + 28] = EAX
+isr128:
+    pusha
+    push esp
+    call syscall_handler
+    add esp, 4
+    popa
+    iret
 
 section .rodata
 align 4

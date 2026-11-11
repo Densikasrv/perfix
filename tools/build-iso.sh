@@ -48,13 +48,15 @@ echo "[1/5] Объектные файлы загрузчика"
 nasm -f elf32 "$ROOT/boot/boot.asm" -o "$TARGET_DIR/boot.o"
 nasm -f elf32 "$ROOT/boot/gdt.asm" -o "$TARGET_DIR/boot-gdt.o"
 nasm -f elf32 "$ROOT/boot/idt.asm" -o "$TARGET_DIR/boot-idt.o"
+nasm -f elf32 "$ROOT/boot/exec.asm" -o "$TARGET_DIR/boot-exec.o"
 
 echo "[2/5] Сборка ядра"
 export RUSTFLAGS="-C link-arg=-T$KERNEL_DIR/linker.ld \
 -C link-arg=-m -C link-arg=elf_i386 \
 -C link-arg=$TARGET_DIR/boot.o \
 -C link-arg=$TARGET_DIR/boot-gdt.o \
--C link-arg=$TARGET_DIR/boot-idt.o"
+-C link-arg=$TARGET_DIR/boot-idt.o \
+-C link-arg=$TARGET_DIR/boot-exec.o"
 
 # boot.o и другие ассемблерные объекты не отслеживаются cargo,
 # поэтому принудительно обновляем метку времени исходника ядра.
@@ -93,6 +95,12 @@ fi
 
 echo "[3/5] Подготовка каталога ISO и установщика"
 cp "$ELF" "$BUILD_DIR/iso/boot/perfix.elf"
+
+# Multiboot-модуль загружается в RAM целиком, поэтому отладочные секции
+# (несколько МиБ) только зря расходуют память. Сам ELF для GRUB остаётся
+# рабочим: для загрузки таблица символов не нужна.
+strip "$BUILD_DIR/iso/boot/perfix.elf"
+
 cp "$BOOT_IMG" "$BUILD_DIR/iso/boot/boot.img"
 
 # core.img ищет установленное ядро на любом разделе по файлу /perfix.elf,

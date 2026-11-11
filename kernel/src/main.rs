@@ -30,6 +30,9 @@ mod utf8;
 mod mouse;
 mod gui;
 mod pterm;
+mod auth;
+mod arena;
+mod exec;
 
 
 #[unsafe(no_mangle)]
@@ -253,7 +256,9 @@ let (framebuffer_address, framebuffer_size) = match &framebuffer {
 unsafe {
 gdt::init();
 idt::init();
+cpu::init_features();
 paging::init(framebuffer_address, framebuffer_size);
+arena::init();
 }
 
 installer::init(multiboot_info);
@@ -276,6 +281,21 @@ let (mouse_area_width, mouse_area_height) = if vga::is_graphics() {
 };
 
 mouse::init(mouse_area_width, mouse_area_height);
+
+// Учётные записи читаются с уже выбранного системного раздела. На
+// установочном носителе их нет — тогда вход не запрашивается и система
+// работает от имени root, как раньше.
+auth::init();
+
+if auth::login_required() {
+    auth::login();
+}
+
+let home = auth::home();
+
+if !home.is_empty() {
+    shell::set_initial_directory(home);
+}
 
 shell::show_screen(None);
 

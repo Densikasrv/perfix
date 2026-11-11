@@ -29,13 +29,11 @@ pub const INPUT_CAPACITY: usize = 256;
 /// Сколько последних команд хранит история.
 const HISTORY_DEPTH: usize = 16;
 
-/// Буфер для копирования файлов командами `cp` и `mv`.
+/// Максимальный размер файла для команд `cp` и `mv`.
 ///
-/// Ядро отображает первые 4 MiB физической памяти, а BSS начинается
-/// чуть ниже 2 MiB. Буфер обязан помещаться в это отображение, иначе
-/// обращение к нему вызовет page fault.
+/// Буфер выделяется из [`crate::arena`] только на время операции, поэтому
+/// эти 2 МиБ не занимают `.bss` постоянно.
 const COPY_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-static mut COPY_BUFFER: [u8; COPY_BUFFER_SIZE] = [0; COPY_BUFFER_SIZE];
 
 /// Сообщение о попытке обратиться к `/dsk` как к обычному каталогу.
 const RESERVED_DSK: &[u8] = b"dsk is a reserved system path";
@@ -194,6 +192,11 @@ fn set_cwd(path: &[u8]) {
         CWD[..path.len()].copy_from_slice(path);
         CWD_LEN = path.len();
     }
+}
+
+/// Задаёт начальный каталог оболочки после входа в систему.
+pub fn set_initial_directory(path: &[u8]) {
+    set_cwd(path);
 }
 
 fn build_prompt(out: &mut [u8; 80]) -> usize {
@@ -450,15 +453,39 @@ fn transfer_command(argument: &[u8], row: usize, moving: bool) -> usize {
         return 1;
     }
 
-    // Ядро однопоточное, поэтому статический буфер можно использовать
-    // напрямую без блокировки.
-    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(COPY_BUFFER) };
+    if !check_write_permission(destination.path(), row) {
+        return 1;
+    }
+
+    if moving {
+        if !check_write_permission(source.path(), row) {
+            return 1;
+        }
+
+        if !confirm_system_delete(source.path(), row) {
+            vga::print_at(row + 1, 0, b"mv: cancelled");
+            return 2;
+        }
+    }
+
+    // Буфер нужен только на время копирования. При нехватке памяти
+    // сообщаем об этом, не трогая файлы.
+    let mark = crate::arena::mark();
+    let buffer = match crate::arena::allocate(COPY_BUFFER_SIZE, 16) {
+        Some(buffer) => buffer,
+        None => {
+            vga::print_at(row, 0, b"cp: not enough memory");
+            return 1;
+        }
+    };
 
     let result = if moving {
         fs::move_file(&source, &destination, buffer)
     } else {
         fs::copy_file(&source, &destination, buffer)
     };
+
+    crate::arena::release(mark);
 
     let mut message = [b' '; 80];
     let mut len = 0usize;
@@ -607,9 +634,9 @@ fn parse_datetime(input: &[u8]) -> Option<(u32, u32, u32, u32, u32, u32)> {
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
         if crate::installer::available() {
-            34
+            36
         } else {
-            32
+            34
         }
     } else if input == b"version" {
         5
@@ -629,6 +656,10 @@ fn command_lines(input: &[u8]) -> usize {
         42
     } else if command_arg(input, b"cat").is_some() {
         CAT_LINES
+    } else if command_arg(input, b"install").is_some()
+        || command_arg(input, b"setup").is_some()
+    {
+        14
     } else {
         1
     }
@@ -711,6 +742,25 @@ fn split_first_space(input: &[u8]) -> (&[u8], &[u8]) {
 
 fn path_too_long(row: usize) {
     vga::print_at(row, 0, b"Path is too long");
+}
+
+/// Проверяет право записи и печатает отказ.
+fn check_write_permission(path: &[u8], row: usize) -> bool {
+    if crate::auth::can_write(path) {
+        return true;
+    }
+
+    vga::print_at(row, 0, b"Permission denied. Use elev <command>.");
+    false
+}
+
+/// Спрашивает подтверждение для удаления системного пути.
+fn confirm_system_delete(path: &[u8], row: usize) -> bool {
+    if !crate::auth::is_system_path(path) {
+        return true;
+    }
+
+    crate::auth::confirm_system_delete(row)
 }
 
 fn change_directory(argument: &[u8], row: usize) {
@@ -802,6 +852,46 @@ fn make_room(row: &mut usize, extra: usize) {
 }
 
 pub fn execute(input: &[u8], row: &mut usize) {
+    // elev <команда>: спрашивает пароль суперпользователя и выполняет
+    // ровно одну команду с повышенными правами.
+    if let Some(argument) = command_arg(input, b"elev") {
+        if argument.is_empty() {
+            vga::print_at(*row + 1, 0, b"Usage: elev <command>");
+            *row += 2;
+        } else if vga::is_capturing() {
+            vga::print_at(
+                *row + 1,
+                0,
+                b"elev: run this command in the console shell",
+            );
+            *row += 2;
+        } else {
+            // Пароль не нужен, если сеанс уже имеет права суперпользователя.
+            let prompted =
+                !crate::auth::is_elevated();
+
+            if !prompted || crate::auth::authorize_super(*row + 1) {
+                crate::auth::set_elevated(true);
+
+                // Пароль вводится на следующей строке; сдвигаем вывод,
+                // чтобы результат не затёр приглашение `password:`.
+                if prompted {
+                    *row += 1;
+                }
+
+                execute(argument, row);
+                crate::auth::set_elevated(false);
+                return;
+            }
+
+            vga::print_at(*row + 1, 0, b"elev: incorrect password");
+            *row += 2;
+        }
+
+        prompt(*row);
+        return;
+    }
+
     if input == b"clear" {
         show_screen(None);
         *row = 6;
@@ -947,6 +1037,39 @@ pub fn execute(input: &[u8], row: &mut usize) {
         return;
     }
 
+    let exec_argument = command_arg(input, b"exec")
+        .or_else(|| command_arg(input, b"run"));
+
+    if let Some(argument) = exec_argument {
+        // Программа печатает сама, поэтому заранее освобождаем только
+        // строку вывода и место под следующее приглашение.
+        make_room(row, 2);
+
+        let output_row = *row + 1;
+
+        if argument.is_empty() {
+            vga::print_at(output_row, 0, b"Usage: exec <file>");
+            *row = output_row + 1;
+            prompt(*row);
+            return;
+        }
+
+        let mut path = [0u8; PATH_MAX];
+
+        match parse_file_location(argument, &mut path) {
+            Ok(location) => {
+                *row = crate::exec::run(&location, output_row);
+            }
+            Err(message) => {
+                vga::print_at(output_row, 0, message);
+                *row = output_row + 1;
+            }
+        }
+
+        prompt(*row);
+        return;
+    }
+
     let lines = command_lines(input);
 
     // Освобождаем место ДО вывода всей команды — одним сдвигом экрана.
@@ -987,10 +1110,12 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 29, 0, b"timezone <GMT+N> - set time zone");
         vga::print_at(output_row + 30, 0, b"time <dd/mm/yyyy/hh/mm/ss> - set clock");
         vga::print_at(output_row + 31, 0, b"mkfs.ext4 <n> - format partition as ext4");
+        vga::print_at(output_row + 32, 0, b"elev <cmd> - run one command as superuser");
+        vga::print_at(output_row + 33, 0, b"exec <file> - run a static i386 ELF program");
 
         if crate::installer::available() {
-            vga::print_at(output_row + 32, 0, b"install [n] [format] - install Perfix");
-            vga::print_at(output_row + 33, 0, b"setup [n] [format]   - alias for install");
+            vga::print_at(output_row + 34, 0, b"install [n] [format] - install Perfix");
+            vga::print_at(output_row + 35, 0, b"setup [n] [format]   - alias for install");
         }
     } else if input == b"about" {
         vga::print_at(output_row, 0, b"Perfix");
@@ -1364,6 +1489,14 @@ entries += 1;
                 return;
             }
 
+            if !write_path.is_empty()
+                && !check_write_permission(write_path, output_row)
+            {
+                *row = output_row + 1;
+                prompt(*row);
+                return;
+            }
+
             match crate::disk::selected_kind() {
                 crate::disk::FsKind::Exfat => {
                     for_each_fs(output_row, |fs, row| {
@@ -1403,6 +1536,19 @@ entries += 1;
                 return;
             }
 
+            if !check_write_permission(&path[..len], output_row) {
+                *row = output_row + 1;
+                prompt(*row);
+                return;
+            }
+
+            if !confirm_system_delete(&path[..len], output_row) {
+                vga::print_at(output_row + 1, 0, b"rm: cancelled");
+                *row = output_row + 2;
+                prompt(*row);
+                return;
+            }
+
             for_selected_fs(output_row, |fs, row| {
                 fs.shell_remove(&path[..len], row)
             });
@@ -1417,6 +1563,12 @@ entries += 1;
         } else if let Some(len) = absolute_path(argument, &mut path) {
             if is_reserved_dsk(&path[..len]) {
                 vga::print_at(output_row, 0, RESERVED_DSK);
+                *row = output_row + 1;
+                prompt(*row);
+                return;
+            }
+
+            if !check_write_permission(&path[..len], output_row) {
                 *row = output_row + 1;
                 prompt(*row);
                 return;
@@ -1437,6 +1589,19 @@ entries += 1;
             if is_reserved_dsk(&path[..len]) {
                 vga::print_at(output_row, 0, RESERVED_DSK);
                 *row = output_row + 1;
+                prompt(*row);
+                return;
+            }
+
+            if !check_write_permission(&path[..len], output_row) {
+                *row = output_row + 1;
+                prompt(*row);
+                return;
+            }
+
+            if !confirm_system_delete(&path[..len], output_row) {
+                vga::print_at(output_row + 1, 0, b"rmdir: cancelled");
+                *row = output_row + 2;
                 prompt(*row);
                 return;
             }

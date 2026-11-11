@@ -651,6 +651,10 @@ fn save_ext4_file(path: &[u8], text: &[u8]) -> Result<(), &'static [u8]> {
 ///
 /// Возвращает размер записанного UTF-8 текста в байтах.
 pub fn save_text(path: &[u8], text: &[u8]) -> Result<usize, &'static [u8]> {
+    if !crate::auth::can_write(path) {
+        return Err(b"permission denied. use elev tedit");
+    }
+
     let utf8 = unsafe { &mut *core::ptr::addr_of_mut!(UTF8) };
     let utf8_len = exfat::cp866_to_utf8(text, utf8);
 

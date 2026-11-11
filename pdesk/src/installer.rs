@@ -10,15 +10,24 @@ use crate::{push_decimal, push_text, InstallTarget, Key, Platform, TEXT_COLOR, W
 /// Ширина клиентской области окна.
 pub const CONTENT_WIDTH: i32 = 620;
 /// Высота клиентской области окна.
-pub const CONTENT_HEIGHT: i32 = 380;
+pub const CONTENT_HEIGHT: i32 = 480;
 
 const MAX_TARGETS: usize = 8;
 const LIST_TOP: i32 = 68;
-const ROW_HEIGHT: i32 = 28;
-const MAX_ROWS: usize = 7;
+const ROW_HEIGHT: i32 = 24;
+const MAX_ROWS: usize = 5;
 const BUTTON_WIDTH: i32 = 200;
 const BUTTON_HEIGHT: i32 = 30;
 const BUTTON_BOTTOM: i32 = 60;
+
+/// Поля учётных записей.
+const FIELD_TOP: i32 = 200;
+const FIELD_HEIGHT: i32 = 22;
+const FIELD_GAP: i32 = 30;
+const USERNAME_MAX: usize = 16;
+const PASSWORD_MAX: usize = 64;
+/// Ни одно поле не выбрано: работают обычные горячие клавиши.
+const FOCUS_NONE: usize = 3;
 
 const HEADER_COLOR: u32 = 0x00ffffff;
 const HINT_COLOR: u32 = 0x0090a0b0;
@@ -40,6 +49,14 @@ pub struct Installer {
     status: [u8; 200],
     status_len: usize,
     status_error: bool,
+    username: [u8; USERNAME_MAX],
+    username_len: usize,
+    password: [u8; PASSWORD_MAX],
+    password_len: usize,
+    super_password: [u8; PASSWORD_MAX],
+    super_password_len: usize,
+    /// 0 — имя, 1 — пароль, 2 — пароль суперпользователя, 3 — ничего.
+    focus: usize,
 }
 
 impl Installer {
@@ -57,6 +74,97 @@ impl Installer {
             status: [0; 200],
             status_len: 0,
             status_error: false,
+            username: [0; USERNAME_MAX],
+            username_len: 0,
+            password: [0; PASSWORD_MAX],
+            password_len: 0,
+            super_password: [0; PASSWORD_MAX],
+            super_password_len: 0,
+            focus: FOCUS_NONE,
+        }
+    }
+
+    fn field_rect(&self, area: Rect, index: usize) -> Rect {
+        Rect {
+            x: area.x + 16,
+            y: area.y + FIELD_TOP + index as i32 * FIELD_GAP,
+            width: area.width - 32,
+            height: FIELD_HEIGHT,
+        }
+    }
+
+    /// Проверяет учётные данные перед установкой.
+    fn credentials_error(&self) -> Option<&'static [u8]> {
+        if self.username_len == 0 {
+            return Some(b"Enter a user name (1-16 characters).");
+        }
+
+        for &byte in &self.username[..self.username_len] {
+            if !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {
+                return Some(b"User name may contain only letters, digits, '_' and '-'.");
+            }
+        }
+
+        if self.password_len == 0 {
+            return Some(b"Enter a user password.");
+        }
+
+        if self.super_password_len == 0 {
+            return Some(b"Enter a superuser password.");
+        }
+
+        None
+    }
+
+    /// Добавляет символ в выбранное поле.
+    fn insert_field_char(&mut self, ch: u8) {
+        if ch < 0x20 {
+            return;
+        }
+
+        match self.focus {
+            0 => {
+                let allowed = ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-';
+
+                if allowed && self.username_len < USERNAME_MAX {
+                    self.username[self.username_len] = ch;
+                    self.username_len += 1;
+                }
+            }
+            1 => {
+                if self.password_len < PASSWORD_MAX {
+                    self.password[self.password_len] = ch;
+                    self.password_len += 1;
+                }
+            }
+            2 => {
+                if self.super_password_len < PASSWORD_MAX {
+                    self.super_password[self.super_password_len] = ch;
+                    self.super_password_len += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn backspace_field(&mut self) {
+        match self.focus {
+            0 => {
+                if self.username_len > 0 {
+                    self.username_len -= 1;
+                }
+            }
+            1 => {
+                if self.password_len > 0 {
+                    self.password_len -= 1;
+                }
+            }
+            2 => {
+                if self.super_password_len > 0 {
+                    self.super_password_len -= 1;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -113,6 +221,11 @@ impl Installer {
             return;
         }
 
+        if let Some(message) = self.credentials_error() {
+            self.set_status(message, true);
+            return;
+        }
+
         let target = self.targets[self.selected];
 
         if !target.ext4 && !self.format {
@@ -125,7 +238,13 @@ impl Installer {
 
         let number = target.number as u32;
 
-        match platform.install_perfix(number, self.format) {
+        match platform.install_perfix(
+            number,
+            self.format,
+            &self.username[..self.username_len],
+            &self.password[..self.password_len],
+            &self.super_password[..self.super_password_len],
+        ) {
             Ok(()) => {
                 if self.format {
                     self.set_status(
@@ -151,7 +270,38 @@ impl Installer {
     pub fn handle_key(&mut self, platform: &mut dyn Platform, key: Key) -> bool {
         self.ensure_targets(platform);
 
+        if self.focus != FOCUS_NONE {
+            match key {
+                Key::Char(ch) => {
+                    self.insert_field_char(ch);
+                    return true;
+                }
+                Key::Backspace => {
+                    self.backspace_field();
+                    return true;
+                }
+                Key::Tab => {
+                    self.focus = (self.focus + 1) % (FOCUS_NONE + 1);
+                    return true;
+                }
+                Key::Enter => {
+                    self.focus = FOCUS_NONE;
+                    self.install(platform);
+                    return true;
+                }
+                Key::Escape => {
+                    self.focus = FOCUS_NONE;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+
         match key {
+            Key::Tab => {
+                self.focus = 0;
+                true
+            }
             Key::ArrowUp if self.count > 0 => {
                 self.selected = if self.selected == 0 {
                     self.count - 1
@@ -228,6 +378,13 @@ impl Installer {
     ) -> bool {
         self.ensure_targets(platform);
 
+        for index in 0..3 {
+            if self.field_rect(area, index).contains(x, y) {
+                self.focus = index;
+                return true;
+            }
+        }
+
         if self.checkbox_rect(area).contains(x, y) {
             self.format = !self.format;
 
@@ -262,6 +419,7 @@ impl Installer {
 
             if index < self.count {
                 self.selected = index;
+                self.focus = FOCUS_NONE;
                 return true;
             }
         }
@@ -346,6 +504,80 @@ impl Installer {
                 },
             );
         }
+
+        let labels: [&[u8]; 3] = [
+            b"User name",
+            b"User password",
+            b"Superuser password",
+        ];
+
+        for index in 0..3 {
+            let field = self.field_rect(area, index);
+            let active = self.focus == index;
+            let background = if active { SELECTED_COLOR } else { WINDOW_COLOR };
+
+            platform.fill_rect(
+                field.x,
+                field.y,
+                field.width,
+                field.height,
+                background,
+            );
+            platform.draw_rect(
+                field.x,
+                field.y,
+                field.width,
+                field.height,
+                if active { BUTTON_BORDER } else { ROW_BORDER },
+            );
+            platform.draw_text(
+                field.x + 8,
+                field.y + (FIELD_HEIGHT - 16) / 2,
+                labels[index],
+                HINT_COLOR,
+                background,
+            );
+
+            let value_x = field.x + 160;
+
+            match index {
+                0 => platform.draw_text(
+                    value_x,
+                    field.y + (FIELD_HEIGHT - 16) / 2,
+                    &self.username[..self.username_len],
+                    TEXT_COLOR,
+                    background,
+                ),
+                1 => {
+                    let masked = [b'*'; PASSWORD_MAX];
+                    platform.draw_text(
+                        value_x,
+                        field.y + (FIELD_HEIGHT - 16) / 2,
+                        &masked[..self.password_len],
+                        TEXT_COLOR,
+                        background,
+                    );
+                }
+                _ => {
+                    let masked = [b'*'; PASSWORD_MAX];
+                    platform.draw_text(
+                        value_x,
+                        field.y + (FIELD_HEIGHT - 16) / 2,
+                        &masked[..self.super_password_len],
+                        TEXT_COLOR,
+                        background,
+                    );
+                }
+            }
+        }
+
+        platform.draw_text(
+            area.x + 16,
+            area.y + FIELD_TOP + 3 * FIELD_GAP - 4,
+            b"Tab switches fields. Enter installs. Passwords are case-sensitive.",
+            HINT_COLOR,
+            WINDOW_COLOR,
+        );
 
         let checkbox = self.checkbox_rect(area);
         let box_size = 16;

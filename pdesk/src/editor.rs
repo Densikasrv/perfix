@@ -163,10 +163,10 @@ impl Editor {
         }
     }
 
-    /// Начинает новую пустую сессию (`untitled`).
+    /// Начинает новую пустую сессию без имени.
     ///
-    /// У нового документа ещё нет имени: сохранить его можно только после
-    /// открытия файла командой `tedit <файл>`.
+    /// Используется, когда домашний каталог недоступен. В обычном сеансе
+    /// новый документ открывается с путём `/home/<имя>/untitled`.
     pub fn reset(&mut self) {
         self.len = 0;
         self.cursor = 0;
@@ -246,12 +246,29 @@ impl Editor {
         }
     }
 
-    /// Открывает диалог Save As с пустым полем пути.
-    fn request_save_as(&mut self) {
+    /// Открывает диалог Save As. Поле заранее заполняется домашним
+    /// каталогом пользователя, чтобы новые файлы сохранялись туда.
+    fn request_save_as(&mut self, platform: &mut dyn Platform) {
         self.mode = Mode::SaveAs;
         self.menu = None;
         self.save_as_len = 0;
-        self.set_status(b"Enter a path, for example /test/test.txt", false);
+
+        let mut home = [0u8; PATH_CAPACITY];
+        let length = platform.home_dir(&mut home).min(PATH_CAPACITY);
+
+        if length > 0 {
+            self.save_as_path[..length].copy_from_slice(&home[..length]);
+            self.save_as_len = length;
+
+            if self.save_as_path[self.save_as_len - 1] != b'/'
+                && self.save_as_len < PATH_CAPACITY
+            {
+                self.save_as_path[self.save_as_len] = b'/';
+                self.save_as_len += 1;
+            }
+        }
+
+        self.set_status(b"Save as: enter a file name", false);
     }
 
     /// Ввод пути в диалоге Save As.
@@ -498,7 +515,7 @@ impl Editor {
                 EditorOutcome::Redraw
             }
             Key::Control(b's') => {
-                self.request_save_as();
+                self.request_save_as(platform);
                 EditorOutcome::Redraw
             }
             Key::Control(b'x') => self.request_close(),
@@ -769,7 +786,7 @@ impl Editor {
                 ClickOutcome::Redraw
             }
             (Menu::File, 1) => {
-                self.request_save_as();
+                self.request_save_as(platform);
                 ClickOutcome::Redraw
             }
             (Menu::File, _) => match self.request_close() {
@@ -801,7 +818,7 @@ impl Editor {
                 ClickOutcome::Redraw
             }
             (Menu::Help, _) => {
-                self.set_status(b"tedit 0.2.5 - Perfix Notepad-style editor", false);
+                self.set_status(b"tedit 0.2.6 - Perfix Notepad-style editor", false);
                 ClickOutcome::Redraw
             }
         }

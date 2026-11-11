@@ -133,13 +133,29 @@ impl pdesk::Platform for KernelPlatform {
         &mut self,
         partition_number: u32,
         format: bool,
+        username: &[u8],
+        password: &[u8],
+        super_password: &[u8],
     ) -> Result<(), &'static [u8]> {
-        crate::installer::install_with_format(partition_number as usize, format)
-            .map_err(|error| error.message())
+        crate::installer::install_with_format(
+            partition_number as usize,
+            format,
+            username,
+            password,
+            super_password,
+        )
+        .map_err(|error| error.message())
     }
 
     fn installer_available(&mut self) -> bool {
         crate::installer::available()
+    }
+
+    fn home_dir(&mut self, out: &mut [u8]) -> usize {
+        let home = crate::auth::home();
+        let copy = home.len().min(out.len());
+        out[..copy].copy_from_slice(&home[..copy]);
+        copy
     }
 
     fn load_text_file(

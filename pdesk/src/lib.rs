@@ -273,7 +273,19 @@ pub trait Platform {
         &mut self,
         partition_number: u32,
         format: bool,
+        username: &[u8],
+        password: &[u8],
+        super_password: &[u8],
     ) -> Result<(), &'static [u8]>;
+
+    /// Записывает домашний каталог текущего пользователя.
+    ///
+    /// Возвращает длину пути или 0, если вход в систему не выполнялся
+    /// (например, на установочном носителе).
+    fn home_dir(&mut self, out: &mut [u8]) -> usize {
+        let _ = out;
+        0
+    }
 
     /// Доступен ли установщик Perfix.
     ///
@@ -1048,7 +1060,28 @@ impl Desktop {
         }
 
         if argument.is_empty() {
-            self.editor.reset();
+            // Новый документ сразу получает путь в домашнем каталоге
+            // пользователя, поэтому Ctrl+O сохраняет его туда.
+            let mut home = [0u8; editor::PATH_CAPACITY];
+            let home_len = platform.home_dir(&mut home).min(home.len());
+
+            if home_len > 0 {
+                let mut path = [0u8; editor::PATH_CAPACITY];
+                let mut length = home_len;
+
+                path[..length].copy_from_slice(&home[..length]);
+
+                if path[length - 1] != b'/' && length < path.len() {
+                    path[length] = b'/';
+                    length += 1;
+                }
+
+                length = push_text(&mut path, length, b"untitled");
+                self.editor.open(&path[..length], b"", false, false);
+            } else {
+                self.editor.reset();
+            }
+
             self.open_app(App::Editor);
             return KeyOutcome::Windows;
         }

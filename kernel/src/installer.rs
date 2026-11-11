@@ -51,6 +51,8 @@ pub enum InstallError {
     BootWriteFailed,
     CoreWriteFailed,
     MarkerWriteFailed,
+    AccountsWriteFailed,
+    InvalidCredentials,
     FormatFailed,
 }
 
@@ -67,6 +69,12 @@ impl InstallError {
             InstallError::BootWriteFailed => b"could not write boot.img to MBR",
             InstallError::CoreWriteFailed => b"could not write core.img after MBR",
             InstallError::MarkerWriteFailed => b"could not write /etc/InstallSuccess",
+            InstallError::AccountsWriteFailed => {
+                b"could not create /etc/users or /home/<user>"
+            }
+            InstallError::InvalidCredentials => {
+                b"invalid user name or empty password"
+            }
             InstallError::FormatFailed => b"could not format partition as ext4",
         }
     }
@@ -187,6 +195,14 @@ fn has_payload() -> bool {
     kernel_payload().is_some()
         && boot_image_payload().is_some()
         && core_image_payload().is_some()
+}
+
+/// Загружены ли мы с установочного носителя.
+///
+/// На живом носителе вход в систему не запрашивается: установщик должен
+/// работать от имени root, даже если на диске уже есть чужая установка.
+pub fn is_live_media() -> bool {
+    has_payload()
 }
 
 /// Установлен ли Perfix на диск.
@@ -425,9 +441,15 @@ fn write_core_image(core: &[u8]) -> Result<(), InstallError> {
 }
 
 /// Устанавливает Perfix, при необходимости сначала форматируя раздел.
+///
+/// Имя пользователя и пароли записываются в `/etc/users`, а домашний
+/// каталог создаётся как `/home/<username>`.
 pub fn install_with_format(
     partition_number: usize,
     format: bool,
+    username: &[u8],
+    password: &[u8],
+    super_password: &[u8],
 ) -> Result<(), InstallError> {
     let kernel = kernel_payload().ok_or(InstallError::NoPayload)?;
     let boot_image = boot_image_payload().ok_or(InstallError::NoPayload)?;
@@ -498,11 +520,52 @@ pub fn install_with_format(
 
     write_core_image(core_image)?;
 
-    // Маркер успешной установки: при загрузке с диска система увидит его
-    // и уберёт установщик из CLI и GUI.
+    // Учётные записи и домашний каталог. Без них установленная система
+    // загрузилась бы в режиме root без входа.
     filesystem
         .ensure_directory_path(b"/etc")
-        .map_err(|_| InstallError::MarkerWriteFailed)?;
+        .map_err(|_| InstallError::AccountsWriteFailed)?;
+
+    if !crate::auth::valid_username(username) {
+        return Err(InstallError::InvalidCredentials);
+    }
+
+    let mut accounts = [0u8; 512];
+    let accounts_len = crate::auth::build_accounts(
+        username,
+        password,
+        super_password,
+        &mut accounts,
+    )
+    .ok_or(InstallError::InvalidCredentials)?;
+
+    filesystem
+        .write_file_path(b"/etc/users", &accounts[..accounts_len])
+        .map_err(|_| InstallError::AccountsWriteFailed)?;
+
+    filesystem
+        .ensure_directory_path(b"/home")
+        .map_err(|_| InstallError::AccountsWriteFailed)?;
+
+    let mut home = [0u8; 64];
+    let mut home_len = 0usize;
+
+    for &byte in b"/home/" {
+        home[home_len] = byte;
+        home_len += 1;
+    }
+
+    for &byte in username {
+        home[home_len] = byte;
+        home_len += 1;
+    }
+
+    filesystem
+        .ensure_directory_path(&home[..home_len])
+        .map_err(|_| InstallError::AccountsWriteFailed)?;
+
+    // Маркер успешной установки: при загрузке с диска система увидит его
+    // и уберёт установщик из CLI и GUI.
     filesystem
         .write_file_path(SUCCESS_MARKER, SUCCESS_TEXT)
         .map_err(|_| InstallError::MarkerWriteFailed)?;
@@ -620,6 +683,11 @@ pub fn mkfs_shell_command(argument: &[u8], row: usize) -> usize {
         return 1;
     };
 
+    if !crate::auth::is_elevated() {
+        crate::vga::print_at(row, 0, b"Permission denied. Use elev mkfs.ext4.");
+        return 1;
+    }
+
     crate::vga::print_at(row, 0, b"Formatting partition as ext4...");
 
     match format_partition(number) {
@@ -672,16 +740,38 @@ pub fn shell_command(argument: &[u8], row: usize) -> usize {
         }
     }
 
-    if format {
-        crate::vga::print_at(row, 0, b"Formatting partition and installing Perfix...");
-    } else {
-        crate::vga::print_at(row, 0, b"Installing Perfix to ext4 partition...");
+    if !crate::auth::is_elevated() {
+        crate::vga::print_at(row, 0, b"Permission denied. Use elev install.");
+        return 1;
     }
 
-    match install_with_format(number, format) {
+    let Some(credentials) = crate::auth::prompt_new_credentials(row) else {
+        crate::vga::print_at(
+            row,
+            0,
+            b"install: enter credentials in the console or use the GUI installer",
+        );
+        return 1;
+    };
+
+    let base = row + credentials.rows;
+
+    if format {
+        crate::vga::print_at(base, 0, b"Formatting partition and installing Perfix...");
+    } else {
+        crate::vga::print_at(base, 0, b"Installing Perfix to ext4 partition...");
+    }
+
+    match install_with_format(
+        number,
+        format,
+        &credentials.username[..credentials.username_len],
+        &credentials.password[..credentials.password_len],
+        &credentials.super_password[..credentials.super_password_len],
+    ) {
         Ok(()) => {
             crate::vga::print_at(
-                row + 1,
+                base + 1,
                 0,
                 if format {
                     b"Installation complete: ext4 formatted, kernel and GRUB written"
@@ -689,13 +779,13 @@ pub fn shell_command(argument: &[u8], row: usize) -> usize {
                     b"Installation complete: /perfix.elf and GRUB are written"
                 },
             );
-            crate::vga::print_at(row + 2, 0, b"Reboot the computer to start Perfix");
-            3
+            crate::vga::print_at(base + 2, 0, b"Reboot the computer to start Perfix");
+            credentials.rows + 3
         }
         Err(error) => {
-            crate::vga::print_at(row + 1, 0, b"Install failed: ");
-            crate::vga::print_at(row + 1, 15, error.message());
-            2
+            crate::vga::print_at(base + 1, 0, b"Install failed: ");
+            crate::vga::print_at(base + 1, 15, error.message());
+            credentials.rows + 2
         }
     }
 }
