@@ -7,6 +7,7 @@
 
 use crate::rtc;
 use crate::drivers::net::rtl8139;
+use crate::timer;
 use crate::vga;
 
 /// Наш адрес и параметры сети по умолчанию (user-mode network QEMU).
@@ -473,6 +474,13 @@ fn push_dec(out: &mut [u8; 80], len: &mut usize, value: usize) {
     }
 }
 
+/// Печатает время в десятых долях миллисекунды: 3 -> `0.3`.
+fn push_tenths(out: &mut [u8; 80], len: &mut usize, tenths: usize) {
+    push_dec(out, len, tenths / 10);
+    push_bytes(out, len, b".");
+    push_dec(out, len, tenths % 10);
+}
+
 fn push_ip(out: &mut [u8; 80], len: &mut usize, ip: [u8; 4]) {
     for (index, byte) in ip.iter().enumerate() {
         if index > 0 {
@@ -638,6 +646,7 @@ pub fn ping(argument: &[u8], start_row: usize) -> usize {
             LAST_REPLY.valid = false;
         }
 
+        let start_ticks = timer::ticks();
         let sent_ok = send_ipv4(destination, IP_PROTO_ICMP, &request);
 
         let mut reply: Option<PingReply> = None;
@@ -687,6 +696,9 @@ pub fn ping(argument: &[u8], start_row: usize) -> usize {
             push_dec(&mut line, &mut len, reply.bytes as usize);
             push_bytes(&mut line, &mut len, b" seq=");
             push_dec(&mut line, &mut len, seq as usize);
+            push_bytes(&mut line, &mut len, b" time=");
+            push_tenths(&mut line, &mut len, timer::tenth_millis_since(start_ticks) as usize);
+            push_bytes(&mut line, &mut len, b" ms");
         } else {
             push_bytes(&mut line, &mut len, b"Request timed out.");
         }

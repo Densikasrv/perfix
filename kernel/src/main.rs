@@ -37,6 +37,7 @@ mod pci;
 mod port;
 mod drivers;
 mod net;
+mod timer;
 
 
 #[unsafe(no_mangle)]
@@ -278,6 +279,9 @@ vga::init(framebuffer);
 // поэтому догружаем глифы CP866. В framebuffer-режиме используется
 // полная таблица font_8x16.
 vga::load_glyphs(&font_cp866::GLYPHS);
+
+// Калибруем TSC заранее, чтобы первый ping не ждал измерения частоты.
+timer::init();
 
 // PS/2-мышь опрашивается из основного цикла, прерывания не используются.
 let (mouse_area_width, mouse_area_height) = if vga::is_graphics() {
