@@ -33,6 +33,7 @@ mod pterm;
 mod auth;
 mod arena;
 mod exec;
+mod pci;
 
 
 #[unsafe(no_mangle)]
@@ -265,6 +266,7 @@ installer::init(multiboot_info);
 installer::detect_installed();
 // Системный ext4-раздел подключается автоматически, как и том exFAT.
 disk::auto_select();
+pci::init();
 
 vga::init(framebuffer);
 

@@ -634,9 +634,9 @@ fn parse_datetime(input: &[u8]) -> Option<(u32, u32, u32, u32, u32, u32)> {
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
         if crate::installer::available() {
-            36
+            37
         } else {
-            34
+            35
         }
     } else if input == b"version" {
         5
@@ -1070,6 +1070,15 @@ pub fn execute(input: &[u8], row: &mut usize) {
         return;
     }
 
+    if input == b"lspci" || input == b"pci" {
+        let used = crate::pci::count() + 1;
+        make_room(row, 1 + used);
+        let output_row = *row + 1;
+        *row = output_row + crate::pci::print_list(output_row);
+        prompt(*row);
+        return;
+    }
+
     let lines = command_lines(input);
 
     // Освобождаем место ДО вывода всей команды — одним сдвигом экрана.
@@ -1112,10 +1121,11 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 31, 0, b"mkfs.ext4 <n> - format partition as ext4");
         vga::print_at(output_row + 32, 0, b"elev <cmd> - run one command as superuser");
         vga::print_at(output_row + 33, 0, b"exec <file> - run a static i386 ELF program");
+        vga::print_at(output_row + 34, 0, b"lspci     - list PCI devices");
 
         if crate::installer::available() {
-            vga::print_at(output_row + 34, 0, b"install [n] [format] - install Perfix");
-            vga::print_at(output_row + 35, 0, b"setup [n] [format]   - alias for install");
+            vga::print_at(output_row + 35, 0, b"install [n] [format] - install Perfix");
+            vga::print_at(output_row + 36, 0, b"setup [n] [format]   - alias for install");
         }
     } else if input == b"about" {
         vga::print_at(output_row, 0, b"Perfix");
