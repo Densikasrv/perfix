@@ -634,9 +634,9 @@ fn parse_datetime(input: &[u8]) -> Option<(u32, u32, u32, u32, u32, u32)> {
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
         if crate::installer::available() {
-            37
+            39
         } else {
-            35
+            37
         }
     } else if input == b"version" {
         5
@@ -1079,6 +1079,22 @@ pub fn execute(input: &[u8], row: &mut usize) {
         return;
     }
 
+    if input == b"net" {
+        make_room(row, 9);
+        let output_row = *row + 1;
+        *row = output_row + crate::net::print_info(output_row);
+        prompt(*row);
+        return;
+    }
+
+    if let Some(argument) = command_arg(input, b"ping") {
+        make_room(row, 8);
+        let output_row = *row + 1;
+        *row = output_row + crate::net::ping(argument, output_row);
+        prompt(*row);
+        return;
+    }
+
     let lines = command_lines(input);
 
     // Освобождаем место ДО вывода всей команды — одним сдвигом экрана.
@@ -1122,10 +1138,12 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 32, 0, b"elev <cmd> - run one command as superuser");
         vga::print_at(output_row + 33, 0, b"exec <file> - run a static i386 ELF program");
         vga::print_at(output_row + 34, 0, b"lspci     - list PCI devices");
+        vga::print_at(output_row + 35, 0, b"net       - network interface info");
+        vga::print_at(output_row + 36, 0, b"ping <ip> - send ICMP echo requests");
 
         if crate::installer::available() {
-            vga::print_at(output_row + 35, 0, b"install [n] [format] - install Perfix");
-            vga::print_at(output_row + 36, 0, b"setup [n] [format]   - alias for install");
+            vga::print_at(output_row + 37, 0, b"install [n] [format] - install Perfix");
+            vga::print_at(output_row + 38, 0, b"setup [n] [format]   - alias for install");
         }
     } else if input == b"about" {
         vga::print_at(output_row, 0, b"Perfix");

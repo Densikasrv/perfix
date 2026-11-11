@@ -110,6 +110,21 @@ pub fn write_u32(bus: u8, slot: u8, func: u8, offset: u8, value: u32) {
     }
 }
 
+/// Записывает 16 бит конфигурационного пространства, сохраняя соседние
+/// поля (например, статусные биты в старшей половине того же слова).
+pub fn write_u16(bus: u8, slot: u8, func: u8, offset: u8, value: u16) {
+    let shift = (offset & 2) * 8;
+    let mask = 0xFFFFu32 << shift;
+    let old = read_u32(bus, slot, func, offset);
+    write_u32(
+        bus,
+        slot,
+        func,
+        offset,
+        (old & !mask) | ((value as u32) << shift),
+    );
+}
+
 /// Читает 16 бит конфигурационного пространства.
 pub fn read_u16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
     let shift = (offset & 2) * 8;

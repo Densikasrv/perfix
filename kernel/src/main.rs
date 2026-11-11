@@ -34,6 +34,9 @@ mod auth;
 mod arena;
 mod exec;
 mod pci;
+mod port;
+mod rtl8139;
+mod net;
 
 
 #[unsafe(no_mangle)]
@@ -267,6 +270,7 @@ installer::detect_installed();
 // Системный ext4-раздел подключается автоматически, как и том exFAT.
 disk::auto_select();
 pci::init();
+net::init();
 
 vga::init(framebuffer);
 
