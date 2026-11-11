@@ -6,7 +6,7 @@
 //! появятся вместе с браузером Perfbrowse.
 
 use crate::rtc;
-use crate::rtl8139;
+use crate::drivers::net::rtl8139;
 use crate::vga;
 
 /// Наш адрес и параметры сети по умолчанию (user-mode network QEMU).

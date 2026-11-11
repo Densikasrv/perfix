@@ -35,7 +35,7 @@ mod arena;
 mod exec;
 mod pci;
 mod port;
-mod rtl8139;
+mod drivers;
 mod net;
 
 
