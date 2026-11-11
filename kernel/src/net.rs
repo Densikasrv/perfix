@@ -11,6 +11,7 @@ use crate::vga;
 
 /// Наш адрес и параметры сети по умолчанию (user-mode network QEMU).
 pub const IP: [u8; 4] = [10, 0, 2, 15];
+const NETMASK: [u8; 4] = [255, 255, 255, 0];
 const GATEWAY: [u8; 4] = [10, 0, 2, 2];
 const DNS: [u8; 4] = [10, 0, 2, 3];
 
@@ -332,13 +333,38 @@ fn arp_resolve(ip: [u8; 4]) -> Option<[u8; 6]> {
     None
 }
 
+/// Проверяет, лежит ли адрес в нашей подсети.
+fn in_subnet(address: [u8; 4]) -> bool {
+    let mut index = 0usize;
+
+    while index < 4 {
+        if address[index] & NETMASK[index] != IP[index] & NETMASK[index] {
+            return false;
+        }
+
+        index += 1;
+    }
+
+    true
+}
+
 /// Формирует и отправляет IPv4-пакет.
+///
+/// Адреса внутри подсети получают кадр напрямую, остальные — через
+/// шлюз: для них MAC назначения в кадре — это MAC шлюза, а IP-адрес
+/// получателя в заголовке остаётся исходным.
 fn send_ipv4(destination: [u8; 4], protocol: u8, payload: &[u8]) -> bool {
     if payload.len() > 1480 {
         return false;
     }
 
-    let Some(destination_mac) = arp_resolve(destination) else {
+    let next_hop = if in_subnet(destination) {
+        destination
+    } else {
+        GATEWAY
+    };
+
+    let Some(destination_mac) = arp_resolve(next_hop) else {
         return false;
     };
 
@@ -617,7 +643,8 @@ pub fn ping(argument: &[u8], start_row: usize) -> usize {
         let mut reply: Option<PingReply> = None;
 
         if sent_ok {
-            let start = rtc::second();
+            let mut last_second = rtc::second();
+            let mut elapsed = 0u32;
 
             loop {
                 poll();
@@ -629,7 +656,17 @@ pub fn ping(argument: &[u8], start_row: usize) -> usize {
                     break;
                 }
 
-                if rtc::second() != start {
+                // Внешние адреса в user-mode сети QEMU (slirp) могут
+                // отвечать с задержкой, поэтому ждём не один, а два
+                // тика RTC: иначе ответ приходит уже после таймаута.
+                let now = rtc::second();
+
+                if now != last_second {
+                    elapsed += 1;
+                    last_second = now;
+                }
+
+                if elapsed >= 2 {
                     break;
                 }
 
