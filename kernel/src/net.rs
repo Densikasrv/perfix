@@ -1,9 +1,12 @@
-//! Минимальный сетевой стек: Ethernet, ARP, IPv4 и ICMP.
+//! Сетевой стек: Ethernet, ARP, IPv4, ICMP, UDP и TCP.
 //!
 //! Конфигурация статическая и рассчитана на user-mode сеть QEMU:
-//! адрес `10.0.2.15/24`, шлюз `10.0.2.2`, DNS `10.0.2.3`. Пока
-//! реализованы только ARP и ICMP (команда `ping`); UDP/TCP и DNS
-//! появятся вместе с браузером Perfbrowse.
+//! адрес `10.0.2.15/24`, шлюз `10.0.2.2`, DNS `10.0.2.3`. Поверх
+//! транспорта работают `ping`, DNS и браузер Perfbrowse.
+
+pub(crate) mod dns;
+pub(crate) mod tcp;
+pub(crate) mod udp;
 
 use crate::rtc;
 use crate::drivers::net::rtl8139;
@@ -270,8 +273,13 @@ fn handle_ipv4(frame: &[u8]) {
     let mut source = [0u8; 4];
     source.copy_from_slice(&frame[26..30]);
 
-    if frame[23] == IP_PROTO_ICMP {
-        handle_icmp(&frame[14 + header_length..14 + total_length], source);
+    let payload = &frame[14 + header_length..14 + total_length];
+
+    match frame[23] {
+        IP_PROTO_ICMP => handle_icmp(payload, source),
+        17 => udp::handle(payload, source),
+        6 => tcp::handle(payload, source),
+        _ => {}
     }
 }
 
@@ -404,7 +412,7 @@ fn send_ipv4(destination: [u8; 4], protocol: u8, payload: &[u8]) -> bool {
     rtl8139::send(&frame[..34 + payload.len()])
 }
 
-fn parse_ipv4(text: &[u8]) -> Option<[u8; 4]> {
+pub(crate) fn parse_ipv4(text: &[u8]) -> Option<[u8; 4]> {
     let mut address = [0u8; 4];
     let mut part = 0usize;
     let mut value = 0u32;

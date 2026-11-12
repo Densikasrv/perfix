@@ -38,6 +38,7 @@ mod port;
 mod drivers;
 mod net;
 mod timer;
+mod browser;
 
 
 #[unsafe(no_mangle)]
