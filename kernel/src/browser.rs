@@ -547,56 +547,46 @@ fn decode_chunked(body: &mut [u8], start: usize, end: usize) -> Option<usize> {
     }
 }
 
-/// Загружает страницу и печатает её текст. Возвращает следующую строку.
-pub fn browse(argument: &[u8], start_row: usize) -> usize {
-    let mut row = start_row;
-
+/// Загружает страницу и возвращает её текст без вывода на экран.
+///
+/// Функция используется и консольным `browse`, и GUI-приложением
+/// Perfbrowse. Текст записывается в `out`, ошибки возвращаются статической
+/// строкой. Ответ с кодом не 2xx попадает в `out` как строка статуса.
+pub fn load(argument: &[u8], out: &mut [u8]) -> Result<usize, &'static [u8]> {
     if !net::ready() {
-        vga::print_at(row, 0, b"browse: no network device");
-        return row + 1;
+        return Err(b"no network device");
     }
 
     if argument.is_empty() {
-        vga::print_at(row, 0, b"Usage: browse <http://host[:port]/path>");
-        return row + 1;
+        return Err(b"usage: browse <http://host[:port]/path>");
     }
 
     if argument.starts_with(b"https://") {
-        vga::print_at(row, 0, b"browse: HTTPS is not supported yet");
-        return row + 1;
+        return Err(b"HTTPS is not supported yet");
     }
 
     let Some(url) = parse_url(argument) else {
-        vga::print_at(row, 0, b"browse: invalid URL");
-        return row + 1;
+        return Err(b"invalid URL");
     };
 
     let address = if let Some(address) = net::parse_ipv4(&url.host[..url.host_len]) {
         address
     } else {
-        vga::print_at(row, 0, b"Resolving host...");
-        row += 1;
-
         match dns::resolve(&url.host[..url.host_len]) {
             Some(address) => address,
-            None => {
-                vga::print_at(row, 0, b"browse: cannot resolve host");
-                return row + 1;
-            }
+            None => return Err(b"cannot resolve host"),
         }
     };
 
     if !tcp::connect(address, url.port) {
-        vga::print_at(row, 0, b"browse: cannot connect");
-        return row + 1;
+        return Err(b"cannot connect");
     }
 
     let (request, request_length) = build_request(&url);
 
     if !tcp::send(&request[..request_length]) {
-        vga::print_at(row, 0, b"browse: send failed");
         tcp::close();
-        return row + 1;
+        return Err(b"send failed");
     }
 
     let body = unsafe { &mut *core::ptr::addr_of_mut!(BODY) };
@@ -633,13 +623,11 @@ pub fn browse(argument: &[u8], start_row: usize) -> usize {
     tcp::close();
 
     if body_length == 0 {
-        vga::print_at(row, 0, b"browse: empty response");
-        return row + 1;
+        return Err(b"empty response");
     }
 
     let Some(header_end) = find_header_end(&body[..body_length]) else {
-        vga::print_at(row, 0, b"browse: malformed HTTP response");
-        return row + 1;
+        return Err(b"malformed HTTP response");
     };
 
     // Проверяем код ответа в первой строке.
@@ -674,8 +662,9 @@ pub fn browse(argument: &[u8], start_row: usize) -> usize {
     }
 
     if !(200..300).contains(&status_code) {
-        vga::print_at(row, 0, status_line);
-        return row + 1;
+        let length = status_line.len().min(out.len());
+        out[..length].copy_from_slice(&status_line[..length]);
+        return Ok(length);
     }
 
     let chunked = has_chunked(&body[..header_end]);
@@ -688,10 +677,36 @@ pub fn browse(argument: &[u8], start_row: usize) -> usize {
 
     let html = &body[html_start..html_end];
 
+    Ok(render_html(html, out))
+}
+
+/// Загружает страницу и печатает её текст. Возвращает следующую строку.
+pub fn browse(argument: &[u8], start_row: usize) -> usize {
+    let mut row = start_row;
     let text = unsafe { &mut *core::ptr::addr_of_mut!(TEXT) };
-    let text_length = render_html(html, text);
 
-    let (next_row, _) = print_text(&text[..text_length], row);
+    match load(argument, text) {
+        Ok(length) => {
+            let (next_row, _) = print_text(&text[..length], row);
+            next_row
+        }
+        Err(message) => {
+            let mut line = [0u8; 96];
+            let mut length = 0usize;
 
-    next_row
+            for &byte in b"browse: " {
+                line[length] = byte;
+                length += 1;
+            }
+
+            for &byte in message.iter().take(line.len() - length) {
+                line[length] = byte;
+                length += 1;
+            }
+
+            vga::print_at(row, 0, &line[..length]);
+            row += 1;
+            row
+        }
+    }
 }

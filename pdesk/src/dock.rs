@@ -42,6 +42,8 @@ pub enum Icon {
     Perforator,
     /// Приложение-терминал.
     Terminal,
+    /// Графический браузер Perfbrowse.
+    Browser,
     /// Тетрис.
     Tetris,
     /// Змейка.
@@ -114,9 +116,10 @@ impl Dock {
         match index {
             0 => Icon::Perforator,
             1 => Icon::Terminal,
-            2 => Icon::Tetris,
-            3 => Icon::Snake,
-            4 => Icon::Editor,
+            2 => Icon::Browser,
+            3 => Icon::Tetris,
+            4 => Icon::Snake,
+            5 => Icon::Editor,
             _ => Icon::Installer,
         }
     }
@@ -225,6 +228,7 @@ fn paint_icon(platform: &mut dyn Platform, icon: Icon, rect: Rect, highlighted: 
     match icon {
         Icon::Perforator => paint_perforator(platform, rect),
         Icon::Terminal => paint_terminal(platform, rect),
+        Icon::Browser => paint_browser(platform, rect),
         Icon::Tetris => paint_tetris(platform, rect),
         Icon::Snake => paint_snake(platform, rect),
         Icon::Editor => paint_editor(platform, rect),
@@ -248,6 +252,27 @@ fn paint_terminal(platform: &mut dyn Platform, rect: Rect) {
         b">_",
         PROMPT_COLOR,
         TERMINAL_SCREEN,
+    );
+}
+
+/// Иконка браузера: синяя веб-страница с надписью www.
+fn paint_browser(platform: &mut dyn Platform, rect: Rect) {
+    let inner = Rect {
+        x: rect.x + 8,
+        y: rect.y + 10,
+        width: rect.width - 16,
+        height: rect.height - 20,
+    };
+    let page = 0x00183860;
+
+    platform.fill_rect(inner.x, inner.y, inner.width, inner.height, page);
+    platform.draw_rect(inner.x, inner.y, inner.width, inner.height, 0x0030a0e0);
+    platform.draw_text(
+        inner.x + 2,
+        inner.y + (inner.height - 16) / 2,
+        b"www",
+        0x0060c0f0,
+        page,
     );
 }
 

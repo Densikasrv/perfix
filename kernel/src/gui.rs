@@ -100,6 +100,10 @@ impl pdesk::Platform for KernelPlatform {
         pterm::run_command(command, output, prompt)
     }
 
+    fn browse(&mut self, url: &[u8], out: &mut [u8]) -> Result<usize, &'static [u8]> {
+        crate::browser::load(url, out)
+    }
+
     fn shutdown(&mut self) -> bool {
         crate::power::shutdown()
     }

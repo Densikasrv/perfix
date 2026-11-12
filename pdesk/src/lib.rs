@@ -6,14 +6,15 @@
 //! можно собрать отдельно от ядра.
 //!
 //! В оболочке есть рабочий стол, док в стиле macOS с часами и несколько
-//! окон-приложений: терминал pterm, тетрис и змейка. Окна можно
-//! перетаскивать за заголовок, сворачивать, разворачивать на весь экран и
-//! закрывать (кнопки справа, как в Windows). Левая иконка дока (перфоратор)
-//! открывает меню со всеми программами, кнопкой выключения и выходом в
-//! консольную оболочку.
+//! окон-приложений: терминал pterm, графический браузер Perfbrowse, тетрис
+//! и змейка. Окна можно перетаскивать за заголовок, сворачивать,
+//! разворачивать на весь экран и закрывать (кнопки справа, как в Windows).
+//! Левая иконка дока (перфоратор) открывает меню со всеми программами,
+//! кнопкой выключения и выходом в консольную оболочку.
 
 #![no_std]
 
+pub mod browser;
 pub mod cursor;
 pub mod dock;
 pub mod editor;
@@ -27,6 +28,7 @@ pub mod window;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum App {
     Terminal,
+    Browser,
     Tetris,
     Snake,
     Editor,
@@ -38,8 +40,9 @@ impl App {
     ///
     /// Установщик всегда последний: на установленной системе он скрывается
     /// простым уменьшением количества видимых приложений на единицу.
-    pub const ALL: [App; 5] = [
+    pub const ALL: [App; 6] = [
         App::Terminal,
+        App::Browser,
         App::Tetris,
         App::Snake,
         App::Editor,
@@ -50,10 +53,11 @@ impl App {
     pub const fn index(self) -> usize {
         match self {
             App::Terminal => 0,
-            App::Tetris => 1,
-            App::Snake => 2,
-            App::Editor => 3,
-            App::Installer => 4,
+            App::Browser => 1,
+            App::Tetris => 2,
+            App::Snake => 3,
+            App::Editor => 4,
+            App::Installer => 5,
         }
     }
 
@@ -61,6 +65,7 @@ impl App {
     pub const fn title(self) -> &'static [u8] {
         match self {
             App::Terminal => b"pterm",
+            App::Browser => b"perfbrowse",
             App::Tetris => b"tetris",
             App::Snake => b"snake",
             App::Editor => b"tedit",
@@ -78,6 +83,10 @@ impl App {
             App::Terminal => (
                 terminal::COLS as i32 * terminal::CHAR_WIDTH + chrome_width,
                 terminal::ROWS as i32 * terminal::CHAR_HEIGHT + chrome_height,
+            ),
+            App::Browser => (
+                browser::CONTENT_WIDTH + chrome_width,
+                browser::CONTENT_HEIGHT + chrome_height,
             ),
             App::Tetris => (
                 tetris::CONTENT_WIDTH + chrome_width,
@@ -163,7 +172,6 @@ pub struct CommandResult {
     pub fullscreen: bool,
 }
 
-
 /// Раздел ext4, доступный установщику.
 #[derive(Clone, Copy, Default)]
 pub struct InstallTarget {
@@ -187,7 +195,6 @@ pub struct LoadedText {
     /// Длина абсолютного пути, записанного во второй буфер.
     pub path_length: usize,
 }
-
 
 /// Интерфейс, через который pdesk работает с железом.
 ///
@@ -311,6 +318,14 @@ pub trait Platform {
     /// Возвращает размер записанного UTF-8 текста в байтах.
     fn save_text_file(&mut self, path: &[u8], text: &[u8]) -> Result<usize, &'static [u8]>;
 
+    /// Загружает страницу Perfbrowse и возвращает её текст (CP866/ASCII).
+    ///
+    /// Ошибка — статическая строка для строки состояния браузера.
+    fn browse(&mut self, url: &[u8], out: &mut [u8]) -> Result<usize, &'static [u8]> {
+        let _ = (url, out);
+        Err(b"browser is not available")
+    }
+
     /// Вызывается, когда событий нет: позволяет ядру не грузить процессор.
     fn idle(&mut self) {}
 }
@@ -351,7 +366,6 @@ enum KeyOutcome {
     Fullscreen,
     Quit,
 }
-
 
 /// Период падения фигуры в тетрисе.
 const TETRIS_PERIOD_MS: u64 = 700;
@@ -411,12 +425,13 @@ struct Desktop {
     screen_width: i32,
     screen_height: i32,
     /// Окна приложений в порядке [`App::ALL`].
-    windows: [AppWindow; 5],
+    windows: [AppWindow; 6],
     /// Сколько приложений видно в доке и меню (установщик скрывается).
     app_count: usize,
     /// Активное приложение: получает клавиатуру и рисуется поверх остальных.
     focus: App,
     terminal: terminal::Terminal,
+    browser: browser::Browser,
     tetris: tetris::Tetris,
     snake: snake::Snake,
     editor: editor::Editor,
@@ -598,6 +613,7 @@ impl Desktop {
             screen_height,
             windows: [
                 AppWindow::new(App::Terminal, screen_width, screen_height, true),
+                AppWindow::new(App::Browser, screen_width, screen_height, false),
                 AppWindow::new(App::Tetris, screen_width, screen_height, false),
                 AppWindow::new(App::Snake, screen_width, screen_height, false),
                 AppWindow::new(App::Editor, screen_width, screen_height, false),
@@ -606,6 +622,7 @@ impl Desktop {
             app_count,
             focus: App::Terminal,
             terminal,
+            browser: browser::Browser::new(),
             tetris: tetris::Tetris::new(),
             snake: snake::Snake::new(),
             editor,
@@ -635,7 +652,7 @@ impl Desktop {
     }
 
     /// Порядок отрисовки: активное окно последним (оно сверху).
-    fn draw_order(&self) -> [App; 5] {
+    fn draw_order(&self) -> [App; 6] {
         let mut order = App::ALL;
 
         let mut index = 0;
@@ -659,7 +676,6 @@ impl Desktop {
         order
     }
 }
-
 
 impl Desktop {
     /// Полная перерисовка: рабочий стол, окна, док и меню.
@@ -802,6 +818,7 @@ impl Desktop {
 
         match app {
             App::Terminal => self.terminal.paint(platform, area.x, area.y),
+            App::Browser => self.browser.paint(platform, area),
             App::Tetris => self.tetris.paint(platform, area.x, area.y),
             App::Snake => self.snake.paint(platform, area.x, area.y),
             App::Editor => self.editor.paint(platform, area),
@@ -952,6 +969,13 @@ impl Desktop {
 
         match self.focus {
             App::Terminal => self.handle_terminal_key(platform, key),
+            App::Browser => {
+                if self.browser.handle_key(key) {
+                    KeyOutcome::Redraw
+                } else {
+                    KeyOutcome::Ignore
+                }
+            }
             App::Tetris => {
                 if self.tetris.handle_key(key) {
                     KeyOutcome::Redraw
@@ -1024,6 +1048,15 @@ impl Desktop {
         // tedit в pterm открывает графический редактор, а не консольный.
         if let Some(argument) = command_argument(command, b"tedit") {
             return self.open_editor(platform, argument);
+        }
+
+        // browse/perfbrowse открывают графический браузер.
+        if let Some(argument) = command_argument(command, b"browse")
+            .or_else(|| command_argument(command, b"perfbrowse"))
+        {
+            self.browser.open(argument);
+            self.open_app(App::Browser);
+            return KeyOutcome::Windows;
         }
 
         let mut output = [0u8; terminal::OUTPUT_CAPACITY];
@@ -1163,19 +1196,28 @@ impl Desktop {
         None
     }
 
-    /// Обновляет игровые таймеры активной игры.
+    /// Обновляет таймеры игр и отложенную загрузку Perfbrowse.
     fn tick(&mut self, platform: &mut dyn Platform) -> Repaint {
+        let mut repaint = Repaint::None;
+
+        if self.windows[App::Browser.index()].open
+            && self.browser.pending()
+            && self.browser.tick(platform)
+        {
+            self.dirty_app = Some(App::Browser);
+            repaint = Repaint::Window;
+        }
+
         let tetris_active =
             self.windows[App::Tetris.index()].open && self.focus == App::Tetris;
         let snake_active = self.windows[App::Snake.index()].open && self.focus == App::Snake;
 
         if !tetris_active && !snake_active {
-            return Repaint::None;
+            return repaint;
         }
 
         let ticks = platform.ticks();
         let per_second = platform.ticks_per_second().max(1);
-        let mut repaint = Repaint::None;
 
         if tetris_active && ticks >= self.next_tetris {
             self.next_tetris = ticks + per_second * TETRIS_PERIOD_MS / 1000;
@@ -1198,8 +1240,6 @@ impl Desktop {
         repaint
     }
 }
-
-
 
 impl Desktop {
     /// Обрабатывает положение и кнопки мыши.
@@ -1312,6 +1352,11 @@ impl Desktop {
                         // Закрытие терминала начинает новую сессию.
                         if app == App::Terminal {
                             self.terminal.reset();
+                        }
+
+                        // Закрытие браузера очищает страницу и адрес.
+                        if app == App::Browser {
+                            self.browser.reset();
                         }
 
                         // Закрытие редактора сбрасывает документ.
@@ -1531,8 +1576,6 @@ pub fn push_decimal(buffer: &mut [u8], length: usize, value: u32) -> usize {
 
     length
 }
-
-
 
 /// Запускает оболочку и работает до её закрытия.
 ///
