@@ -37,8 +37,12 @@ mod pci;
 mod port;
 mod drivers;
 mod net;
+mod crypto;
+mod tls;
 mod timer;
 mod browser;
+mod http;
+mod pfpak;
 
 
 #[unsafe(no_mangle)]

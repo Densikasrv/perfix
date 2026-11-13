@@ -52,6 +52,7 @@ pub enum InstallError {
     CoreWriteFailed,
     MarkerWriteFailed,
     AccountsWriteFailed,
+    SystemFilesWriteFailed,
     InvalidCredentials,
     FormatFailed,
 }
@@ -71,6 +72,9 @@ impl InstallError {
             InstallError::MarkerWriteFailed => b"could not write /etc/InstallSuccess",
             InstallError::AccountsWriteFailed => {
                 b"could not create /etc/users or /home/<user>"
+            }
+            InstallError::SystemFilesWriteFailed => {
+                b"could not write /etc/pfpak/repo.list or CA certificates"
             }
             InstallError::InvalidCredentials => {
                 b"invalid user name or empty password"
@@ -101,6 +105,16 @@ static mut INSTALLED: bool = false;
 const SUCCESS_MARKER: &[u8] = b"/etc/InstallSuccess";
 /// Содержимое маркера установки.
 const SUCCESS_TEXT: &[u8] = b"Perfix installation completed\n";
+/// Список репозиториев pfpak, создаваемый на установленной системе.
+const REPO_LIST_PATH: &[u8] = b"/etc/pfpak/repo.list";
+/// Репозиторий pfpak по умолчанию.
+///
+/// GitHub отдаёт содержимое репозитория по адресу `/tree/<ветка>/<путь>`;
+/// pfpak распознаёт такую форму и сам переводит её в raw-адрес.
+const REPO_LIST_CONTENT: &[u8] =
+    b"https://raw.githubusercontent.com/Densikasrv/pfpak-repo/tree/main/pfpak RELEASE:fatcat\n";
+/// Обычный PEM-набор корневых сертификатов для программ на диске.
+const CA_BUNDLE_PATH: &[u8] = b"/etc/ssl/certs/ca-certificates.crt";
 
 fn mbi_u32(multiboot_info: u32, offset: usize) -> u32 {
     unsafe {
@@ -563,6 +577,48 @@ pub fn install_with_format(
     filesystem
         .ensure_directory_path(&home[..home_len])
         .map_err(|_| InstallError::AccountsWriteFailed)?;
+
+    // Репозиторий pfpak по умолчанию. Без этого файла установленная
+    // система не знает, откуда ставить пакеты, хотя ISO его и не требует.
+    filesystem
+        .ensure_directory_path(b"/etc/pfpak")
+        .map_err(|_| InstallError::SystemFilesWriteFailed)?;
+
+    filesystem
+        .write_file_path(REPO_LIST_PATH, REPO_LIST_CONTENT)
+        .map_err(|_| InstallError::SystemFilesWriteFailed)?;
+
+    // Корневые сертификаты: ядро доверяет встроенному набору, а этот
+    // PEM-бандл нужен остальным программам на установленной системе.
+    filesystem
+        .ensure_directory_path(b"/etc/ssl/certs")
+        .map_err(|_| InstallError::SystemFilesWriteFailed)?;
+
+    let bundle_size = crate::tls::ca_bundle_size();
+    if bundle_size == 0 {
+        return Err(InstallError::SystemFilesWriteFailed);
+    }
+
+    let mark = crate::arena::mark();
+    let bundle = match crate::arena::allocate(bundle_size, 16) {
+        Some(bundle) => bundle,
+        None => {
+            crate::arena::release(mark);
+            return Err(InstallError::SystemFilesWriteFailed);
+        }
+    };
+
+    let bundle_len = match crate::tls::write_ca_bundle(bundle) {
+        Some(length) => length,
+        None => {
+            crate::arena::release(mark);
+            return Err(InstallError::SystemFilesWriteFailed);
+        }
+    };
+
+    let result = filesystem.write_file_path(CA_BUNDLE_PATH, &bundle[..bundle_len]);
+    crate::arena::release(mark);
+    result.map_err(|_| InstallError::SystemFilesWriteFailed)?;
 
     // Маркер успешной установки: при загрузке с диска система увидит его
     // и уберёт установщик из CLI и GUI.

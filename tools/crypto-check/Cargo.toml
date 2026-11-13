@@ -1,0 +1,8 @@
+[package]
+name = "crypto-check"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "crypto-check"
+path = "src/main.rs"

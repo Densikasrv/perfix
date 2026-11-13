@@ -5,144 +5,15 @@
 //! `http://`, DNS-имена и порты, отличные от 80. HTTPS и сложная
 //! вёрстка (таблицы, CSS, картинки) пока не поддерживаются.
 
-use crate::net;
-use crate::net::{dns, tcp};
-use crate::rtc;
+use crate::http;
 use crate::vga;
 
-const DEFAULT_PORT: u16 = 80;
 const BODY_CAPACITY: usize = 32 * 1024;
 const TEXT_CAPACITY: usize = 32 * 1024;
 const MAX_LINES: usize = 300;
 
 static mut BODY: [u8; BODY_CAPACITY] = [0; BODY_CAPACITY];
 static mut TEXT: [u8; TEXT_CAPACITY] = [0; TEXT_CAPACITY];
-
-struct Url {
-    host: [u8; 64],
-    host_len: usize,
-    port: u16,
-    path: [u8; 160],
-    path_len: usize,
-}
-
-fn push<const N: usize>(out: &mut [u8; N], length: &mut usize, bytes: &[u8]) {
-    for &byte in bytes {
-        if *length >= out.len() {
-            return;
-        }
-
-        out[*length] = byte;
-        *length += 1;
-    }
-}
-
-fn push_dec<const N: usize>(out: &mut [u8; N], length: &mut usize, mut value: u32) {
-    let mut digits = [0u8; 10];
-    let mut count = 0usize;
-
-    if value == 0 {
-        digits[0] = b'0';
-        count = 1;
-    } else {
-        while value > 0 {
-            digits[count] = b'0' + (value % 10) as u8;
-            value /= 10;
-            count += 1;
-        }
-    }
-
-    while count > 0 {
-        count -= 1;
-        push(out, length, &[digits[count]]);
-    }
-}
-
-fn parse_url(text: &[u8]) -> Option<Url> {
-    let rest = if let Some(rest) = text.strip_prefix(b"http://") {
-        rest
-    } else if text.starts_with(b"https://") {
-        return None;
-    } else {
-        text
-    };
-
-    if rest.is_empty() {
-        return None;
-    }
-
-    let host_end = rest
-        .iter()
-        .position(|&byte| byte == b'/' || byte == b':')
-        .unwrap_or(rest.len());
-    let host = &rest[..host_end];
-
-    if host.is_empty() || host.len() > 63 {
-        return None;
-    }
-
-    let mut url = Url {
-        host: [0; 64],
-        host_len: host.len(),
-        port: DEFAULT_PORT,
-        path: [0; 160],
-        path_len: 1,
-    };
-
-    url.host[..host.len()].copy_from_slice(host);
-    url.path[0] = b'/';
-
-    let mut index = host_end;
-
-    if rest.get(index) == Some(&b':') {
-        index += 1;
-        let mut port = 0u32;
-        let start = index;
-
-        while index < rest.len() && rest[index].is_ascii_digit() {
-            port = port * 10 + (rest[index] - b'0') as u32;
-            index += 1;
-        }
-
-        if index == start || port == 0 || port > 65535 {
-            return None;
-        }
-
-        url.port = port as u16;
-    }
-
-    if rest.get(index) == Some(&b'/') {
-        let path = &rest[index..];
-        let count = path.len().min(url.path.len());
-        url.path[..count].copy_from_slice(&path[..count]);
-        url.path_len = count;
-    }
-
-    Some(url)
-}
-
-fn build_request(url: &Url) -> ([u8; 512], usize) {
-    let mut request = [0u8; 512];
-    let mut length = 0usize;
-
-    push(&mut request, &mut length, b"GET ");
-    push(&mut request, &mut length, &url.path[..url.path_len]);
-    push(&mut request, &mut length, b" HTTP/1.0\r\nHost: ");
-    push(&mut request, &mut length, &url.host[..url.host_len]);
-
-    if url.port != DEFAULT_PORT {
-        push(&mut request, &mut length, b":");
-        push_dec(&mut request, &mut length, url.port as u32);
-    }
-
-    push(
-        &mut request,
-        &mut length,
-        b"\r\nUser-Agent: Perfbrowse/0.1\r\nConnection: close\r\n\r\n",
-    );
-
-    (request, length)
-}
 
 fn eq_ignore_case(left: &[u8], right: &[u8]) -> bool {
     left.len() == right.len()
@@ -459,225 +330,27 @@ fn print_text(text: &[u8], start_row: usize) -> (usize, usize) {
     (row, lines)
 }
 
-fn find_header_end(body: &[u8]) -> Option<usize> {
-    body.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn has_chunked(headers: &[u8]) -> bool {
-    let Some(position) = find_ignore_case(headers, 0, b"transfer-encoding:") else {
-        return false;
-    };
-
-    let start = position + b"transfer-encoding:".len();
-    let end = headers[start..]
-        .iter()
-        .position(|&byte| byte == b'\r' || byte == b'\n')
-        .map(|offset| start + offset)
-        .unwrap_or(headers.len());
-
-    find_ignore_case(&headers[start..end], 0, b"chunked").is_some()
-}
-
-fn hex_value(byte: u8) -> Option<usize> {
-    match byte {
-        b'0'..=b'9' => Some((byte - b'0') as usize),
-        b'a'..=b'f' => Some((byte - b'a' + 10) as usize),
-        b'A'..=b'F' => Some((byte - b'A' + 10) as usize),
-        _ => None,
-    }
-}
-
-/// Декодирует `Transfer-Encoding: chunked` прямо в буфере ответа:
-/// результат всегда короче исходных данных, поэтому копирование вперёд
-/// безопасно. Возвращает абсолютный конец декодированных данных.
-fn decode_chunked(body: &mut [u8], start: usize, end: usize) -> Option<usize> {
-    let mut source = start;
-    let mut destination = start;
-
-    loop {
-        let mut size = 0usize;
-        let mut digits = 0usize;
-
-        while source < end {
-            let Some(value) = hex_value(body[source]) else {
-                break;
-            };
-
-            size = size.saturating_mul(16).saturating_add(value);
-            digits += 1;
-            source += 1;
-        }
-
-        if digits == 0 {
-            return None;
-        }
-
-        // Пропускаем расширения чанка и CRLF.
-        while source < end && body[source] != b'\n' {
-            source += 1;
-        }
-
-        if source >= end {
-            return None;
-        }
-
-        source += 1;
-
-        if size == 0 {
-            return Some(destination);
-        }
-
-        if size > end - source {
-            return None;
-        }
-
-        for _ in 0..size {
-            body[destination] = body[source];
-            destination += 1;
-            source += 1;
-        }
-
-        if source < end && body[source] == b'\r' {
-            source += 1;
-        }
-
-        if source < end && body[source] == b'\n' {
-            source += 1;
-        }
-    }
-}
-
 /// Загружает страницу и возвращает её текст без вывода на экран.
 ///
 /// Функция используется и консольным `browse`, и GUI-приложением
 /// Perfbrowse. Текст записывается в `out`, ошибки возвращаются статической
 /// строкой. Ответ с кодом не 2xx попадает в `out` как строка статуса.
 pub fn load(argument: &[u8], out: &mut [u8]) -> Result<usize, &'static [u8]> {
-    if !net::ready() {
-        return Err(b"no network device");
-    }
-
     if argument.is_empty() {
         return Err(b"usage: browse <http://host[:port]/path>");
     }
 
-    if argument.starts_with(b"https://") {
-        return Err(b"HTTPS is not supported yet");
-    }
-
-    let Some(url) = parse_url(argument) else {
-        return Err(b"invalid URL");
-    };
-
-    let address = if let Some(address) = net::parse_ipv4(&url.host[..url.host_len]) {
-        address
-    } else {
-        match dns::resolve(&url.host[..url.host_len]) {
-            Some(address) => address,
-            None => return Err(b"cannot resolve host"),
-        }
-    };
-
-    if !tcp::connect(address, url.port) {
-        return Err(b"cannot connect");
-    }
-
-    let (request, request_length) = build_request(&url);
-
-    if !tcp::send(&request[..request_length]) {
-        tcp::close();
-        return Err(b"send failed");
-    }
-
     let body = unsafe { &mut *core::ptr::addr_of_mut!(BODY) };
-    let mut body_length = 0usize;
-    let mut last_second = rtc::second();
-    let mut elapsed = 0u32;
+    let response = http::fetch(argument, body, true, 10)?;
 
-    loop {
-        net::poll();
-
-        let count = tcp::read(&mut body[body_length..]);
-        body_length += count;
-
-        if tcp::peer_closed() || body_length >= body.len() {
-            break;
-        }
-
-        let now = rtc::second();
-
-        if now != last_second {
-            elapsed += 1;
-            last_second = now;
-        }
-
-        if elapsed >= 10 {
-            break;
-        }
-
-        for _ in 0..2000 {
-            core::hint::spin_loop();
-        }
-    }
-
-    tcp::close();
-
-    if body_length == 0 {
-        return Err(b"empty response");
-    }
-
-    let Some(header_end) = find_header_end(&body[..body_length]) else {
-        return Err(b"malformed HTTP response");
-    };
-
-    // Проверяем код ответа в первой строке.
-    let status_line_end = body[..header_end]
-        .iter()
-        .position(|&byte| byte == b'\r')
-        .unwrap_or(header_end);
-    let status_line = &body[..status_line_end];
-
-    let mut status_code = 0u32;
-    let mut spaces = 0usize;
-
-    for &byte in status_line {
-        if byte == b' ' {
-            spaces += 1;
-
-            if spaces == 2 {
-                let mut index = status_line
-                    .iter()
-                    .position(|&b| b == b' ')
-                    .map(|position| position + 1)
-                    .unwrap_or(0);
-
-                while index < status_line.len() && status_line[index].is_ascii_digit() {
-                    status_code = status_code * 10 + (status_line[index] - b'0') as u32;
-                    index += 1;
-                }
-
-                break;
-            }
-        }
-    }
-
-    if !(200..300).contains(&status_code) {
+    if !(200..300).contains(&response.status) {
+        let status_line = response.status_line(body);
         let length = status_line.len().min(out.len());
         out[..length].copy_from_slice(&status_line[..length]);
         return Ok(length);
     }
 
-    let chunked = has_chunked(&body[..header_end]);
-    let html_start = header_end + 4;
-    let html_end = if chunked {
-        decode_chunked(body, html_start, body_length).unwrap_or(body_length)
-    } else {
-        body_length
-    };
-
-    let html = &body[html_start..html_end];
-
-    Ok(render_html(html, out))
+    Ok(render_html(response.body(body), out))
 }
 
 /// Загружает страницу и печатает её текст. Возвращает следующую строку.

@@ -4,3 +4,8 @@
 /pdesk/target/
 /pdesk/Cargo.lock
 /tools/exfat-check/target/
+/tools/__pycache__/
+/tools/crypto-check/target/
+# Тестовый корневой сертификат для локальных испытаний TLS
+# (tools/gen-test-pki.sh, сборка с KERNEL_FEATURES=dev-root).
+/kernel/src/tls/dev-root.der

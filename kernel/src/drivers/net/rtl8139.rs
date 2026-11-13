@@ -44,10 +44,16 @@ const INT_CLEAR: u16 = 0xFFFF;
 const MSR_SPD_10: u8 = 1 << 3;
 const MSR_LINK_BAD: u8 = 1 << 2;
 
-/// Кольцо приёма: 8 КиБ полезных данных плюс 16 байт заголовка.
-const RX_RING_SIZE: usize = 8 * 1024 + 16;
-/// Запас на случай, если карта допишет пакет за границей кольца.
-const RX_BUFFER_SIZE: usize = RX_RING_SIZE + 1536;
+/// Кольцо приёма: 8 КиБ. Регистр CAPR хранит позицию чтения минус 16,
+/// поэтому 16 байт относятся к соглашению о регистре, а не к размеру
+/// самого кольца.
+const RX_RING_SIZE: usize = 8 * 1024;
+/// Запас на случай, если карта допишет пакет, пересекающий границу
+/// кольца, сразу за его концом. Такой пакет занимает не больше 1518
+/// байт; оставляем 2 КиБ, как это делает драйвер Linux.
+const RX_BUFFER_SIZE: usize = RX_RING_SIZE + 2048;
+/// Максимальная длина кадра Ethernet (с CRC) вместе с заголовком кольца.
+const MAX_RX_LENGTH: usize = 1600;
 
 const TX_BUFFER_SIZE: usize = 2048;
 
@@ -218,7 +224,13 @@ fn update_capr(offset: usize) {
 }
 
 fn ring_byte(offset: usize) -> u8 {
-    unsafe { RX_BUFFER.0[offset % RX_RING_SIZE] }
+    unsafe {
+        if offset < RX_BUFFER_SIZE {
+            RX_BUFFER.0[offset]
+        } else {
+            0
+        }
+    }
 }
 
 fn ring_u16(offset: usize) -> u16 {
@@ -242,7 +254,7 @@ pub fn recv(out: &mut [u8]) -> Option<usize> {
         let status = ring_u16(offset);
         let length = ring_u16(offset + 2) as usize;
 
-        if length == 0 || length > RX_RING_SIZE {
+        if length == 0 || length > MAX_RX_LENGTH {
             // Синхронизация потеряна — начинаем кольцо заново.
             unsafe {
                 RX_OFFSET = 0;
@@ -254,24 +266,24 @@ pub fn recv(out: &mut [u8]) -> Option<usize> {
         let advance = (length + 4 + 3) & !3;
         let mut next = offset + advance;
 
-        while next >= RX_RING_SIZE {
+        // Пакет, пересекающий границу, карта пишет линейно за концом
+        // кольца; указатель следующего пакета всё равно заворачивается.
+        if next >= RX_RING_SIZE {
             next -= RX_RING_SIZE;
         }
-
-        unsafe {
-            RX_OFFSET = next;
-        }
-        update_capr(next);
 
         // Бит ROK: пакет принят без ошибок.
         if status & 1 == 0 {
             unsafe {
+                RX_OFFSET = next;
                 RX_BAD += 1;
             }
+            update_capr(next);
             continue;
         }
 
-        // В length входит 4-байтовый CRC.
+        // В length входит 4-байтовый CRC. Копируем кадр до передачи
+        // буфера карте (CAPR): иначе она успеет перезаписать данные.
         let payload = length.saturating_sub(4);
         let copy = payload.min(out.len());
 
@@ -280,8 +292,10 @@ pub fn recv(out: &mut [u8]) -> Option<usize> {
         }
 
         unsafe {
+            RX_OFFSET = next;
             RX_OK += 1;
         }
+        update_capr(next);
 
         return Some(copy);
     }

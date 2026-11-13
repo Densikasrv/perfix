@@ -66,10 +66,18 @@ touch "$KERNEL_DIR/src/main.rs"
 # требует -Z json-target-spec, в других флаг уже удалён. Поэтому сборка
 # сначала идёт без флага и повторяется с ним только при явной ошибке.
 build_kernel() {
-    cargo +nightly build \
-        --manifest-path "$KERNEL_DIR/Cargo.toml" \
-        "$@" \
-        --target "$TARGET_SPEC"
+    if [ -n "${KERNEL_FEATURES:-}" ]; then
+        cargo +nightly build \
+            --manifest-path "$KERNEL_DIR/Cargo.toml" \
+            --features "$KERNEL_FEATURES" \
+            "$@" \
+            --target "$TARGET_SPEC"
+    else
+        cargo +nightly build \
+            --manifest-path "$KERNEL_DIR/Cargo.toml" \
+            "$@" \
+            --target "$TARGET_SPEC"
+    fi
 }
 
 set +e

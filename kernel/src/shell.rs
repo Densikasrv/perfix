@@ -634,9 +634,9 @@ fn parse_datetime(input: &[u8]) -> Option<(u32, u32, u32, u32, u32, u32)> {
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
         if crate::installer::available() {
-            40
+            41
         } else {
-            38
+            39
         }
     } else if input == b"version" {
         5
@@ -1104,6 +1104,22 @@ pub fn execute(input: &[u8], row: &mut usize) {
         return;
     }
 
+    if let Some(argument) = command_arg(input, b"pfpak") {
+        // pfpak печатает переменное число строк; запас в две строки
+        // оставляет место для сообщения об ошибке и приглашения.
+        make_room(row, 3);
+        let output_row = *row + 1;
+        let used = crate::pfpak::run(argument, output_row);
+        *row = output_row + used;
+
+        if *row >= vga::height() {
+            *row = vga::height() - 1;
+        }
+
+        prompt(*row);
+        return;
+    }
+
     let lines = command_lines(input);
 
     // Освобождаем место ДО вывода всей команды — одним сдвигом экрана.
@@ -1150,10 +1166,11 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 35, 0, b"net       - network interface info");
         vga::print_at(output_row + 36, 0, b"ping <ip> - send ICMP echo requests");
         vga::print_at(output_row + 37, 0, b"browse <url> - simple HTML browser");
+        vga::print_at(output_row + 38, 0, b"pfpak     - package manager (pfpak for help)");
 
         if crate::installer::available() {
-            vga::print_at(output_row + 38, 0, b"install [n] [format] - install Perfix");
-            vga::print_at(output_row + 39, 0, b"setup [n] [format]   - alias for install");
+            vga::print_at(output_row + 39, 0, b"install [n] [format] - install Perfix");
+            vga::print_at(output_row + 40, 0, b"setup [n] [format]   - alias for install");
         }
     } else if input == b"about" {
         vga::print_at(output_row, 0, b"Perfix");

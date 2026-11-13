@@ -252,6 +252,13 @@ fn read_rtc() -> Option<(u32, u32, u32, u32, u32, u32)> {
     Some((year, month, day, hours, minutes, seconds))
 }
 
+/// Текущие дата и время в UTC (без смещения часового пояса).
+///
+/// Нужно для проверки сроков действия сертификатов TLS: они заданы в UTC.
+pub fn utc_now() -> Option<(u32, u32, u32, u32, u32)> {
+    read_rtc().map(|(year, month, day, hour, minute, _second)| (year, month, day, hour, minute))
+}
+
 /// Текущие дата и время: (год, месяц, день, часы, минуты).
 ///
 /// Учитывает установленный часовой пояс (см. [`set_timezone_minutes`]).

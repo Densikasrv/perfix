@@ -132,3 +132,23 @@ pub fn tenth_millis_since(start: u64) -> u64 {
 
     rdtsc().wrapping_sub(start).saturating_mul(10_000) / frequency
 }
+
+/// Абсолютный срок в тактах TSC через `seconds` секунд.
+///
+/// В отличие от [`rtc::second`], счётчик тактов монотонен и не
+/// перескакивает через ноль в конце минуты, поэтому подходит для
+/// таймаутов сетевых операций.
+pub fn deadline(seconds: u32) -> u64 {
+    ensure_calibrated();
+
+    let frequency = unsafe { TICKS_PER_SECOND }.max(1);
+
+    rdtsc().wrapping_add(frequency.saturating_mul(seconds as u64))
+}
+
+/// Наступил ли срок, полученный из [`deadline`].
+pub fn expired(deadline: u64) -> bool {
+    // TSC монотонно растёт; разница меньше 2^63 тактов, поэтому знак
+    // корректно показывает, прошёл ли срок, даже при переполнении.
+    (rdtsc().wrapping_sub(deadline) as i64) >= 0
+}
