@@ -44,6 +44,8 @@ pub struct Terminal {
     /// Неоконченная строка, сохранённая при входе в историю.
     draft: [u8; COLS],
     draft_len: usize,
+    /// Вводится пароль: символы не показываются, строка подписана `password:`.
+    secret: bool,
 }
 
 impl Terminal {
@@ -62,7 +64,13 @@ impl Terminal {
             history_pos: None,
             draft: [0; COLS],
             draft_len: 0,
+            secret: false,
         }
+    }
+
+    /// Переключает ввод пароля (символы маскируются).
+    pub fn set_secret(&mut self, secret: bool) {
+        self.secret = secret;
     }
 
     /// Устанавливает приглашение оболочки (раскладка и текущий каталог).
@@ -244,6 +252,7 @@ impl Terminal {
         self.input_len = 0;
         self.history_pos = None;
         self.draft_len = 0;
+        self.secret = false;
 
         self.push_line(b"Perfix pterm");
         self.push_line(b"Commands are executed by the Perfix shell.");
@@ -283,46 +292,84 @@ impl Terminal {
         }
     }
 
-    /// Рисует содержимое терминала в прямоугольнике с левым верхним углом
-    /// `(x, y)`.
-    pub fn paint(&self, platform: &mut dyn Platform, x: i32, y: i32) {
-        platform.fill_rect(
-            x,
-            y,
-            COLS as i32 * CHAR_WIDTH,
-            ROWS as i32 * CHAR_HEIGHT,
-            WINDOW_COLOR,
-        );
+    /// Рисует содержимое терминала в клиентской области окна.
+    ///
+    /// Размер области может отличаться от 80x40: окно подстраивается под
+    /// разрешение экрана и тянется мышью, поэтому показываем столько
+    /// столбцов и строк, сколько помещается, прижимая вывод к нижней
+    /// строке ввода.
+    pub fn paint(&self, platform: &mut dyn Platform, area: crate::window::Rect) {
+        platform.fill_rect(area.x, area.y, area.width, area.height, WINDOW_COLOR);
 
-        for row in 0..self.count {
+        let columns = (area.width / CHAR_WIDTH).max(1) as usize;
+        let rows = (area.height / CHAR_HEIGHT).max(1) as usize;
+        let scroll_rows = rows.saturating_sub(1).max(1);
+        let start = self.count.saturating_sub(scroll_rows);
+
+        for (index, row) in (start..self.count).enumerate() {
+            let length = self.lengths[row].min(columns);
+
             platform.draw_text(
-                x,
-                y + row as i32 * CHAR_HEIGHT,
-                &self.lines[row][..self.lengths[row]],
+                area.x,
+                area.y + index as i32 * CHAR_HEIGHT,
+                &self.lines[row][..length],
                 TEXT_COLOR,
                 WINDOW_COLOR,
             );
         }
 
-        let input_y = y + SCROLL_ROWS as i32 * CHAR_HEIGHT;
+        let input_y = area.y + (rows - 1) as i32 * CHAR_HEIGHT;
+        let caret_x;
 
-        platform.draw_text(
-            x,
-            input_y,
-            &self.prompt[..self.prompt_len],
-            PROMPT_COLOR,
-            WINDOW_COLOR,
-        );
-        platform.draw_text(
-            x + self.prompt_len as i32 * CHAR_WIDTH,
-            input_y,
-            &self.input[..self.input_len],
-            TEXT_COLOR,
-            WINDOW_COLOR,
-        );
+        if self.secret {
+            // Пароль не показываем: только подпись и звёздочки.
+            let label = b"password: ";
+            let label_len = label.len().min(columns);
+            let stars_len = self
+                .input_len
+                .min(columns.saturating_sub(label_len));
+
+            platform.draw_text(
+                area.x,
+                input_y,
+                &label[..label_len],
+                PROMPT_COLOR,
+                WINDOW_COLOR,
+            );
+
+            let stars = [b'*'; COLS];
+            platform.draw_text(
+                area.x + label_len as i32 * CHAR_WIDTH,
+                input_y,
+                &stars[..stars_len],
+                TEXT_COLOR,
+                WINDOW_COLOR,
+            );
+
+            caret_x = area.x + (label_len + stars_len) as i32 * CHAR_WIDTH;
+        } else {
+            let prompt_len = self.prompt_len.min(columns);
+            let input_len = self.input_len.min(columns - prompt_len);
+
+            platform.draw_text(
+                area.x,
+                input_y,
+                &self.prompt[..prompt_len],
+                PROMPT_COLOR,
+                WINDOW_COLOR,
+            );
+            platform.draw_text(
+                area.x + prompt_len as i32 * CHAR_WIDTH,
+                input_y,
+                &self.input[..input_len],
+                TEXT_COLOR,
+                WINDOW_COLOR,
+            );
+
+            caret_x = area.x + (prompt_len + input_len) as i32 * CHAR_WIDTH;
+        }
 
         // Каретка ввода подчёркивает позицию следующего символа.
-        let caret_x = x + (self.prompt_len + self.input_len) as i32 * CHAR_WIDTH;
         platform.fill_rect(
             caret_x,
             input_y + CHAR_HEIGHT - 2,

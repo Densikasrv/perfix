@@ -244,7 +244,27 @@ pub(crate) fn russian_char(sc: u8, shift: bool) -> Option<u8> {
 }
 
 
+/// Читает одно событие клавиатуры.
+///
+/// Сначала обрабатываются скан-коды USB-клавиатуры (они уже переведены
+/// в формат PS/2), затем — данные контроллера PS/2. Это позволяет
+/// подключить USB-клавиатуру, не отключая встроенную.
 pub fn read_key() -> Key {
+    crate::drivers::usb::poll();
+
+    loop {
+        match crate::drivers::usb::pop_scancode() {
+            Some(sc) => {
+                let key = handle_scancode(sc);
+
+                if !matches!(key, Key::None) {
+                    return key;
+                }
+            }
+            None => break,
+        }
+    }
+
     let status = inb(0x64);
 
     if status & 1 == 0 {
@@ -261,6 +281,10 @@ pub fn read_key() -> Key {
         return Key::None;
     }
 
+    handle_scancode(sc)
+}
+
+fn handle_scancode(sc: u8) -> Key {
     unsafe {
         // Расширенные клавиши приходят с префиксом 0xE0.
         if sc == 0xE0 {

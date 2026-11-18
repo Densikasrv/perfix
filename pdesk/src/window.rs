@@ -11,6 +11,8 @@ pub const BORDER: i32 = 2;
 pub const TITLE_HEIGHT: i32 = 28;
 /// Отступ между рамкой/заголовком и содержимым.
 pub const PADDING: i32 = 6;
+/// Ширина полосы у края окна, за которую тянется изменение размера.
+pub const RESIZE_GRIP: i32 = 5;
 
 /// Ширина кнопки управления.
 const BUTTON_WIDTH: i32 = 40;
@@ -27,6 +29,19 @@ pub enum Control {
     Close,
     Minimize,
     Maximize,
+}
+
+/// Край или угол окна, за который меняется размер.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 /// Прямоугольная область экрана.
@@ -151,6 +166,41 @@ impl Window {
         None
     }
 
+    /// Край или угол под указателем, за который можно изменить размер.
+    ///
+    /// Кнопки управления в заголовке имеют приоритет: за них окно
+    /// разворачивается, сворачивается или закрывается, а не тянется.
+    pub fn resize_edge_at(&self, x: i32, y: i32) -> Option<Edge> {
+        if !self.contains(x, y) || self.control_at(x, y).is_some() {
+            return None;
+        }
+
+        let left = x < self.x + RESIZE_GRIP;
+        let right = x >= self.x + self.width - RESIZE_GRIP;
+        let top = y < self.y + RESIZE_GRIP;
+        let bottom = y >= self.y + self.height - RESIZE_GRIP;
+
+        match (left, right, top, bottom) {
+            (true, _, true, _) => Some(Edge::TopLeft),
+            (_, true, true, _) => Some(Edge::TopRight),
+            (true, _, _, true) => Some(Edge::BottomLeft),
+            (_, true, _, true) => Some(Edge::BottomRight),
+            (true, _, _, _) => Some(Edge::Left),
+            (_, true, _, _) => Some(Edge::Right),
+            (_, _, true, _) => Some(Edge::Top),
+            (_, _, _, true) => Some(Edge::Bottom),
+            _ => None,
+        }
+    }
+
+    /// Задаёт положение и размер окна.
+    pub fn set_geometry(&mut self, rect: Rect) {
+        self.x = rect.x;
+        self.y = rect.y;
+        self.width = rect.width;
+        self.height = rect.height;
+    }
+
     /// Клиентская область — прямоугольник под заголовком.
     pub fn content(&self) -> Rect {
         Rect {
@@ -236,8 +286,7 @@ impl Window {
 }
 
 /// Рисует значок кнопки управления.
-fn draw_glyph(
-    platform: &mut dyn Platform,
+fn draw_glyph(    platform: &mut dyn Platform,
     control: Control,
     rect: Rect,
     maximized: bool,
@@ -271,5 +320,49 @@ fn draw_glyph(
                 platform.fill_rect(center_x + offset, center_y - offset, 1, 1, color);
             }
         }
+    }
+}
+
+/// Новый прямоугольник окна после потягивания края или угла.
+///
+/// `origin` — геометрия на момент нажатия, `dx`/`dy` — смещение указателя.
+/// Размер не опускается ниже `min_width`/`min_height` и не выходит за экран.
+pub fn resize_rect(
+    origin: Rect,
+    edge: Edge,
+    dx: i32,
+    dy: i32,
+    min_width: i32,
+    min_height: i32,
+    screen_width: i32,
+    screen_height: i32,
+) -> Rect {
+    let mut left = origin.x;
+    let mut top = origin.y;
+    let mut right = origin.x + origin.width;
+    let mut bottom = origin.y + origin.height;
+
+    let pulls_left = matches!(edge, Edge::Left | Edge::TopLeft | Edge::BottomLeft);
+    let pulls_right = matches!(edge, Edge::Right | Edge::TopRight | Edge::BottomRight);
+    let pulls_top = matches!(edge, Edge::Top | Edge::TopLeft | Edge::TopRight);
+    let pulls_bottom = matches!(edge, Edge::Bottom | Edge::BottomLeft | Edge::BottomRight);
+
+    if pulls_left {
+        left = (origin.x + dx).clamp(0, right - min_width.min(origin.width));
+    } else if pulls_right {
+        right = (right + dx).clamp(left + min_width.min(origin.width), screen_width);
+    }
+
+    if pulls_top {
+        top = (origin.y + dy).clamp(0, bottom - min_height.min(origin.height));
+    } else if pulls_bottom {
+        bottom = (bottom + dy).clamp(top + min_height.min(origin.height), screen_height);
+    }
+
+    Rect {
+        x: left,
+        y: top,
+        width: (right - left).max(1),
+        height: (bottom - top).max(1),
     }
 }

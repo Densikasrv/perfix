@@ -100,8 +100,101 @@ impl pdesk::Platform for KernelPlatform {
         pterm::run_command(command, output, prompt)
     }
 
+    fn super_password_required(&mut self) -> bool {
+        crate::auth::login_required()
+    }
+
+    fn run_elevated_command(
+        &mut self,
+        command: &[u8],
+        password: &[u8],
+        output: &mut [u8],
+        prompt: &mut [u8],
+    ) -> pdesk::CommandResult {
+        pterm::run_elevated_command(command, password, output, prompt)
+    }
+
     fn browse(&mut self, url: &[u8], out: &mut [u8]) -> Result<usize, &'static [u8]> {
         crate::browser::load(url, out)
+    }
+
+    fn list_directory(
+        &mut self,
+        path: &[u8],
+        out: &mut [pdesk::DirEntry],
+    ) -> Result<usize, &'static [u8]> {
+        let mut resolved = [0u8; 512];
+        let location = shell::parse_file_location(path, &mut resolved)?;
+        let mut entries = [crate::fileops::Entry::EMPTY; 160];
+        let count = crate::fileops::list(&location, &mut entries)?;
+        let copy = count.min(out.len());
+
+        for index in 0..copy {
+            out[index] = pdesk::DirEntry::EMPTY;
+            out[index].name_len = entries[index].name_len.min(pdesk::FILE_NAME_CAPACITY);
+            out[index].name[..out[index].name_len]
+                .copy_from_slice(&entries[index].name[..out[index].name_len]);
+            out[index].is_dir = entries[index].is_dir;
+            out[index].size = entries[index].size;
+        }
+
+        Ok(copy)
+    }
+
+    fn disk_list(&mut self, out: &mut [pdesk::DiskEntry]) -> usize {
+        let mut disks = [crate::fileops::Disk::EMPTY; 32];
+        let count = crate::fileops::disks(&mut disks);
+        let copy = count.min(out.len());
+
+        for index in 0..copy {
+            out[index] = pdesk::DiskEntry::EMPTY;
+            out[index].name_len = disks[index].name_len.min(8);
+            out[index].name[..out[index].name_len]
+                .copy_from_slice(&disks[index].name[..out[index].name_len]);
+            out[index].kind = disks[index].kind;
+            out[index].sectors = disks[index].sectors;
+        }
+
+        copy
+    }
+
+    fn create_directory(&mut self, path: &[u8]) -> Result<(), &'static [u8]> {
+        let mut resolved = [0u8; 512];
+        let location = shell::parse_file_location(path, &mut resolved)?;
+        crate::fileops::create_directory(&location)
+    }
+
+    fn remove_path(&mut self, path: &[u8]) -> Result<(), &'static [u8]> {
+        let mut resolved = [0u8; 512];
+        let location = shell::parse_file_location(path, &mut resolved)?;
+        crate::fileops::delete(&location)
+    }
+
+    fn rename_path(
+        &mut self,
+        source: &[u8],
+        destination: &[u8],
+    ) -> Result<(), &'static [u8]> {
+        let mut source_path = [0u8; 512];
+        let mut destination_path = [0u8; 512];
+        let source = shell::parse_file_location(source, &mut source_path)?;
+        let destination =
+            shell::parse_file_location(destination, &mut destination_path)?;
+        crate::fileops::rename(&source, &destination)
+    }
+
+    fn copy_path(
+        &mut self,
+        source: &[u8],
+        destination: &[u8],
+        moving: bool,
+    ) -> Result<(), &'static [u8]> {
+        let mut source_path = [0u8; 512];
+        let mut destination_path = [0u8; 512];
+        let source = shell::parse_file_location(source, &mut source_path)?;
+        let destination =
+            shell::parse_file_location(destination, &mut destination_path)?;
+        crate::fileops::copy(&source, &destination, moving).map(|_| ())
     }
 
     fn shutdown(&mut self) -> bool {

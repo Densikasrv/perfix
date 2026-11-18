@@ -18,6 +18,7 @@ pub mod browser;
 pub mod cursor;
 pub mod dock;
 pub mod editor;
+pub mod fmgr;
 pub mod installer;
 pub mod snake;
 pub mod terminal;
@@ -29,6 +30,7 @@ pub mod window;
 pub enum App {
     Terminal,
     Browser,
+    Files,
     Tetris,
     Snake,
     Editor,
@@ -40,9 +42,10 @@ impl App {
     ///
     /// Установщик всегда последний: на установленной системе он скрывается
     /// простым уменьшением количества видимых приложений на единицу.
-    pub const ALL: [App; 6] = [
+    pub const ALL: [App; 7] = [
         App::Terminal,
         App::Browser,
+        App::Files,
         App::Tetris,
         App::Snake,
         App::Editor,
@@ -54,10 +57,11 @@ impl App {
         match self {
             App::Terminal => 0,
             App::Browser => 1,
-            App::Tetris => 2,
-            App::Snake => 3,
-            App::Editor => 4,
-            App::Installer => 5,
+            App::Files => 2,
+            App::Tetris => 3,
+            App::Snake => 4,
+            App::Editor => 5,
+            App::Installer => 6,
         }
     }
 
@@ -66,6 +70,7 @@ impl App {
         match self {
             App::Terminal => b"pterm",
             App::Browser => b"perfbrowse",
+            App::Files => b"fmgr",
             App::Tetris => b"tetris",
             App::Snake => b"snake",
             App::Editor => b"tedit",
@@ -88,6 +93,10 @@ impl App {
                 browser::CONTENT_WIDTH + chrome_width,
                 browser::CONTENT_HEIGHT + chrome_height,
             ),
+            App::Files => (
+                fmgr::CONTENT_WIDTH + chrome_width,
+                fmgr::CONTENT_HEIGHT + chrome_height,
+            ),
             App::Tetris => (
                 tetris::CONTENT_WIDTH + chrome_width,
                 tetris::CONTENT_HEIGHT + chrome_height,
@@ -105,6 +114,30 @@ impl App {
                 installer::CONTENT_HEIGHT + chrome_height,
             ),
         }
+    }
+
+    /// Минимальный размер окна при изменении размера мышью.
+    ///
+    /// Игры и редактор рассчитаны на фиксированное игровое поле или
+    /// знакоместа, поэтому меньше своего содержимого они не становятся.
+    /// Остальные приложения сами подстраивают разметку под клиентскую
+    /// область и могут сжиматься сильнее.
+    pub const fn min_size(self) -> (i32, i32) {
+        let chrome_width = 2 * (window::BORDER + window::PADDING);
+        let chrome_height =
+            2 * window::BORDER + window::TITLE_HEIGHT + 2 * window::PADDING;
+
+        let (width, height) = match self {
+            App::Terminal => (24 * terminal::CHAR_WIDTH, 8 * terminal::CHAR_HEIGHT),
+            App::Browser => (320, 160),
+            App::Files => (400, 220),
+            App::Tetris => (tetris::CONTENT_WIDTH, tetris::CONTENT_HEIGHT),
+            App::Snake => (snake::CONTENT_WIDTH, snake::CONTENT_HEIGHT),
+            App::Editor => (480, 300),
+            App::Installer => (420, 300),
+        };
+
+        (width + chrome_width, height + chrome_height)
     }
 }
 
@@ -183,6 +216,54 @@ pub struct InstallTarget {
     pub ext4: bool,
 }
 
+/// Максимальная длина имени в списке файлового менеджера.
+pub const FILE_NAME_CAPACITY: usize = 128;
+
+/// Запись каталога для файлового менеджера.
+#[derive(Clone, Copy)]
+pub struct DirEntry {
+    pub name: [u8; FILE_NAME_CAPACITY],
+    pub name_len: usize,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+impl DirEntry {
+    pub const EMPTY: Self = Self {
+        name: [0; FILE_NAME_CAPACITY],
+        name_len: 0,
+        is_dir: false,
+        size: 0,
+    };
+
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len]
+    }
+}
+
+/// Раздел на боковой панели файлового менеджера.
+#[derive(Clone, Copy)]
+pub struct DiskEntry {
+    pub name: [u8; 8],
+    pub name_len: usize,
+    /// 0 — другой, 1 — exFAT, 2 — ext4.
+    pub kind: u8,
+    pub sectors: u32,
+}
+
+impl DiskEntry {
+    pub const EMPTY: Self = Self {
+        name: [0; 8],
+        name_len: 0,
+        kind: 0,
+        sectors: 0,
+    };
+
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len]
+    }
+}
+
 /// Результат загрузки текстового файла для GUI-редактора.
 #[derive(Clone, Copy, Default)]
 pub struct LoadedText {
@@ -247,6 +328,56 @@ pub trait Platform {
         output: &mut [u8],
         prompt: &mut [u8],
     ) -> CommandResult;
+
+    /// Нужно ли спрашивать пароль суперпользователя для `elev`.
+    ///
+    /// На установочном носителе без учётных записей сеанс уже имеет права
+    /// суперпользователя, и пароль не запрашивается.
+    fn super_password_required(&mut self) -> bool;
+
+    /// Выполняет команду с правами суперпользователя.
+    ///
+    /// `command` — текст после `elev`, `password` — введённый пароль.
+    /// Неверный пароль возвращает сообщение в `output`, команда при этом
+    /// не выполняется.
+    fn run_elevated_command(
+        &mut self,
+        command: &[u8],
+        password: &[u8],
+        output: &mut [u8],
+        prompt: &mut [u8],
+    ) -> CommandResult;
+
+    /// Перечисляет каталог по абсолютному пути (`/dsk/a1/...`).
+    fn list_directory(
+        &mut self,
+        path: &[u8],
+        out: &mut [DirEntry],
+    ) -> Result<usize, &'static [u8]>;
+
+    /// Заполняет `out` разделами, доступными файловому менеджеру.
+    fn disk_list(&mut self, out: &mut [DiskEntry]) -> usize;
+
+    /// Создаёт каталог по абсолютному пути.
+    fn create_directory(&mut self, path: &[u8]) -> Result<(), &'static [u8]>;
+
+    /// Удаляет файл или пустой каталог.
+    fn remove_path(&mut self, path: &[u8]) -> Result<(), &'static [u8]>;
+
+    /// Переименовывает файл или пустой каталог.
+    fn rename_path(
+        &mut self,
+        source: &[u8],
+        destination: &[u8],
+    ) -> Result<(), &'static [u8]>;
+
+    /// Копирует файл (`moving == false`) или перемещает его.
+    fn copy_path(
+        &mut self,
+        source: &[u8],
+        destination: &[u8],
+        moving: bool,
+    ) -> Result<(), &'static [u8]>;
 
     /// Выключает компьютер (кнопка Shutdown в меню дока).
     ///
@@ -371,6 +502,38 @@ enum KeyOutcome {
 const TETRIS_PERIOD_MS: u64 = 700;
 /// Период шага змейки.
 const SNAKE_PERIOD_MS: u64 = 200;
+/// Зазор между окном и краем экрана.
+const SCREEN_MARGIN: i32 = 8;
+
+/// Высота рабочей области над доком.
+fn work_height(screen_height: i32) -> i32 {
+    (screen_height - dock::DOCK_HEIGHT - dock::DOCK_MARGIN - SCREEN_MARGIN).max(120)
+}
+
+/// Подгоняет размер окна приложения под разрешение framebufferа.
+///
+/// Окно не должно выходить за экран или прятаться под доком: на маленьких
+/// разрешениях (например, 800x600) высокие окна вроде терминала сжимаются
+/// по высоте, а на больших остаются привычного размера.
+fn fit_size(app: App, screen_width: i32, screen_height: i32) -> (i32, i32) {
+    let (preferred_width, preferred_height) = app.size();
+    let (min_width, min_height) = app.min_size();
+    let work_height = work_height(screen_height);
+
+    let mut width = preferred_width.min((screen_width - SCREEN_MARGIN).max(1));
+    let mut height = preferred_height.min(work_height);
+
+    // Минимум важен для игр, но не может быть больше рабочей области.
+    if width < min_width {
+        width = min_width.min(screen_width);
+    }
+
+    if height < min_height {
+        height = min_height.min(work_height);
+    }
+
+    (width, height)
+}
 
 /// Окно приложения и его состояние на рабочем столе.
 struct AppWindow {
@@ -383,9 +546,14 @@ struct AppWindow {
 
 impl AppWindow {
     fn new(app: App, screen_width: i32, screen_height: i32, open: bool) -> Self {
-        let (width, height) = app.size();
-        let window =
-            window::Window::centered(screen_width, screen_height, width, height, app.title());
+        let (width, height) = fit_size(app, screen_width, screen_height);
+        let window = window::Window::centered(
+            screen_width,
+            work_height(screen_height),
+            width,
+            height,
+            app.title(),
+        );
 
         Self {
             saved: (window.x, window.y, width, height),
@@ -425,7 +593,7 @@ struct Desktop {
     screen_width: i32,
     screen_height: i32,
     /// Окна приложений в порядке [`App::ALL`].
-    windows: [AppWindow; 6],
+    windows: [AppWindow; 7],
     /// Сколько приложений видно в доке и меню (установщик скрывается).
     app_count: usize,
     /// Активное приложение: получает клавиатуру и рисуется поверх остальных.
@@ -434,6 +602,7 @@ struct Desktop {
     browser: browser::Browser,
     tetris: tetris::Tetris,
     snake: snake::Snake,
+    files: fmgr::Fmgr,
     editor: editor::Editor,
     installer: installer::Installer,
     cursor: cursor::Cursor,
@@ -455,6 +624,10 @@ struct Desktop {
     last_mouse: Mouse,
     /// Перетаскивание окна: приложение и смещение указателя в заголовке.
     drag: Option<(App, i32, i32)>,
+    /// Изменение размера: приложение, край, геометрия при нажатии и точка нажатия.
+    resize: Option<(App, window::Edge, window::Rect, i32, i32)>,
+    /// Новый размер окна, который нужно отрисовать в этом кадре.
+    pending_resize: Option<(App, window::Rect)>,
     /// Момент следующего шага игр (в тактах TSC).
     next_tetris: u64,
     next_snake: u64,
@@ -467,6 +640,8 @@ struct Desktop {
     drag_background_rect: Option<window::Rect>,
     /// Новое положение окна, которое нужно отрисовать в этом кадре.
     pending_drag: Option<(App, i32, i32)>,
+    /// Команда после `elev`, ожидающая пароль суперпользователя.
+    pending_super: Option<([u8; terminal::COLS], usize)>,
 }
 
 /// Максимальный размер окна, которое можно перетаскивать.
@@ -614,6 +789,7 @@ impl Desktop {
             windows: [
                 AppWindow::new(App::Terminal, screen_width, screen_height, true),
                 AppWindow::new(App::Browser, screen_width, screen_height, false),
+                AppWindow::new(App::Files, screen_width, screen_height, false),
                 AppWindow::new(App::Tetris, screen_width, screen_height, false),
                 AppWindow::new(App::Snake, screen_width, screen_height, false),
                 AppWindow::new(App::Editor, screen_width, screen_height, false),
@@ -625,6 +801,7 @@ impl Desktop {
             browser: browser::Browser::new(),
             tetris: tetris::Tetris::new(),
             snake: snake::Snake::new(),
+            files: fmgr::Fmgr::new(),
             editor,
             installer: installer::Installer::new(),
             cursor: cursor::Cursor::new(screen_width / 2, screen_height / 2),
@@ -642,17 +819,20 @@ impl Desktop {
                 buttons: 0,
             },
             drag: None,
+            resize: None,
+            pending_resize: None,
             next_tetris: 0,
             next_snake: 0,
             dirty_app: None,
             damage: None,
             drag_background_rect: None,
             pending_drag: None,
+            pending_super: None,
         }
     }
 
     /// Порядок отрисовки: активное окно последним (оно сверху).
-    fn draw_order(&self) -> [App; 6] {
+    fn draw_order(&self) -> [App; 7] {
         let mut order = App::ALL;
 
         let mut index = 0;
@@ -710,6 +890,7 @@ impl Desktop {
 
         if !self.windows[index].open || self.windows[index].maximized {
             self.drag = None;
+            self.resize = None;
             self.drag_background_rect = None;
             return;
         }
@@ -789,6 +970,30 @@ impl Desktop {
         self.paint_chrome(platform);
     }
 
+    /// Отрисовывает окно с новым размером во время потягивания за край.
+    fn render_resize(&mut self, platform: &mut dyn Platform, app: App, rect: window::Rect) {
+        let index = app.index();
+
+        if !self.windows[index].open || self.windows[index].maximized {
+            self.resize = None;
+            return;
+        }
+
+        let old = window_rect(&self.windows[index].window);
+
+        // Старое место окна очищаем и заново рисуем всё, что под ним:
+        // рабочий стол здесь однотонный, поэтому достаточно заливки.
+        platform.fill_rect(old.x, old.y, old.width, old.height, DESKTOP_COLOR);
+        self.paint_windows_except(platform, app);
+        self.paint_chrome(platform);
+
+        self.windows[index].window.set_geometry(rect);
+        // Изменение размера — действие пользователя: окно выходит наверх.
+        self.focus = app;
+        self.paint_app(platform, app);
+        self.paint_chrome(platform);
+    }
+
     /// Перерисовка одного окна вместе с содержимым приложения.
     fn paint_app(&mut self, platform: &mut dyn Platform, app: App) {
         let index = app.index();
@@ -817,8 +1022,9 @@ impl Desktop {
         let area = self.windows[index].window.content();
 
         match app {
-            App::Terminal => self.terminal.paint(platform, area.x, area.y),
+            App::Terminal => self.terminal.paint(platform, area),
             App::Browser => self.browser.paint(platform, area),
+            App::Files => self.files.paint(platform, area),
             App::Tetris => self.tetris.paint(platform, area.x, area.y),
             App::Snake => self.snake.paint(platform, area.x, area.y),
             App::Editor => self.editor.paint(platform, area),
@@ -861,7 +1067,12 @@ impl Desktop {
             );
         }
 
-        if let Some((app, x, y)) = self.pending_drag.take() {
+        if let Some((app, rect)) = self.pending_resize.take() {
+            // Изменение размера стирает старую рамку и перерисовывает всё,
+            // что было под окном, затем рисует окно уже нового размера.
+            self.dirty_app = None;
+            self.render_resize(platform, app, rect);
+        } else if let Some((app, x, y)) = self.pending_drag.take() {
             // Перетаскивание рисует себя само: возвращает фон из копии и
             // перерисовывает только перемещаемое окно.
             self.dirty_app = None;
@@ -908,6 +1119,7 @@ impl Desktop {
         self.focus = app;
         self.menu_open = false;
         self.drag = None;
+        self.resize = None;
     }
 
     /// После закрытия активного окна выбирает другое открытое.
@@ -976,6 +1188,15 @@ impl Desktop {
                     KeyOutcome::Ignore
                 }
             }
+            App::Files => match self.files.handle_key(platform, key) {
+                fmgr::Outcome::Ignored => KeyOutcome::Ignore,
+                fmgr::Outcome::Redraw => KeyOutcome::Redraw,
+                fmgr::Outcome::OpenEditor => {
+                    let mut path = [0u8; fmgr::PATH_CAPACITY];
+                    let length = self.files.open_path(&mut path);
+                    self.open_editor(platform, &path[..length])
+                }
+            },
             App::Tetris => {
                 if self.tetris.handle_key(key) {
                     KeyOutcome::Redraw
@@ -1026,6 +1247,27 @@ impl Desktop {
         let mut command = [0u8; terminal::COLS];
         let command_len = self.terminal.take_input(&mut command);
 
+        // Строка ввода может быть паролем для ожидающей команды elev.
+        if let Some((pending, pending_len)) = self.pending_super.take() {
+            self.terminal.set_secret(false);
+
+            if command_len == 0 {
+                self.terminal.push_line(b"elev: cancelled");
+                return KeyOutcome::Redraw;
+            }
+
+            let mut output = [0u8; terminal::OUTPUT_CAPACITY];
+            let mut prompt = [0u8; terminal::PROMPT_CAPACITY];
+            let result = platform.run_elevated_command(
+                &pending[..pending_len],
+                &command[..command_len],
+                &mut output,
+                &mut prompt,
+            );
+
+            return self.command_outcome(result, &output, &prompt);
+        }
+
         self.terminal.echo(&command[..command_len]);
 
         if command_len == 0 {
@@ -1059,10 +1301,44 @@ impl Desktop {
             return KeyOutcome::Windows;
         }
 
+        // elev: на установленной системе спрашиваем пароль прямо в pterm.
+        if let Some(argument) = command_argument(command, b"elev") {
+            if argument.is_empty() {
+                self.terminal.push_line(b"Usage: elev <command>");
+                return KeyOutcome::Redraw;
+            }
+
+            if platform.super_password_required() {
+                let mut stored = [0u8; terminal::COLS];
+                let length = argument.len().min(terminal::COLS);
+                stored[..length].copy_from_slice(&argument[..length]);
+                self.pending_super = Some((stored, length));
+                self.terminal.set_secret(true);
+                return KeyOutcome::Redraw;
+            }
+
+            let mut output = [0u8; terminal::OUTPUT_CAPACITY];
+            let mut prompt = [0u8; terminal::PROMPT_CAPACITY];
+            let result =
+                platform.run_elevated_command(argument, b"", &mut output, &mut prompt);
+
+            return self.command_outcome(result, &output, &prompt);
+        }
+
         let mut output = [0u8; terminal::OUTPUT_CAPACITY];
         let mut prompt = [0u8; terminal::PROMPT_CAPACITY];
         let result = platform.run_command(command, &mut output, &mut prompt);
 
+        self.command_outcome(result, &output, &prompt)
+    }
+
+    /// Дописывает вывод команды в терминал и обновляет приглашение.
+    fn command_outcome(
+        &mut self,
+        result: CommandResult,
+        output: &[u8],
+        prompt: &[u8],
+    ) -> KeyOutcome {
         self.terminal.append_text(&output[..result.length]);
 
         if result.prompt_length > 0 {
@@ -1281,6 +1557,7 @@ impl Desktop {
                 if let Some(index) = dock::menu_hit(&menu, mouse.x, mouse.y, self.dock.apps) {
                     self.menu_open = false;
                     self.drag = None;
+                    self.resize = None;
                     self.damage = Some(dock_rect(menu));
 
                     if index < self.dock.apps {
@@ -1299,6 +1576,7 @@ impl Desktop {
 
                 if menu.contains(mouse.x, mouse.y) {
                     self.drag = None;
+                    self.resize = None;
                     return repaint;
                 }
 
@@ -1312,6 +1590,7 @@ impl Desktop {
             // 2. Иконки дока.
             if let Some(index) = self.dock.hit(mouse.x, mouse.y) {
                 self.drag = None;
+                self.resize = None;
 
                 if index == 0 {
                     // Перфоратор: открыть или закрыть меню.
@@ -1334,6 +1613,7 @@ impl Desktop {
             // 3. Кнопки управления окна в заголовке.
             if let Some((app, control)) = self.control_at(mouse.x, mouse.y) {
                 self.drag = None;
+                self.resize = None;
                 self.focus = app;
                 let index = app.index();
                 let old = window_rect(&self.windows[index].window);
@@ -1349,9 +1629,11 @@ impl Desktop {
 
                         self.windows[index].open = false;
 
-                        // Закрытие терминала начинает новую сессию.
+                        // Закрытие терминала начинает новую сессию и
+                        // отменяет неоконченный запрос пароля elev.
                         if app == App::Terminal {
                             self.terminal.reset();
+                            self.pending_super = None;
                         }
 
                         // Закрытие браузера очищает страницу и адрес.
@@ -1387,6 +1669,26 @@ impl Desktop {
                 self.focus = app;
                 self.menu_open = false;
                 let index = app.index();
+
+                // Край окна: начинаем изменение размера. Проверяем раньше
+                // содержимого, иначе нижняя кромка досталась бы приложению.
+                if !self.windows[index].maximized {
+                    if let Some(edge) =
+                        self.windows[index].window.resize_edge_at(mouse.x, mouse.y)
+                    {
+                        self.drag = None;
+                        self.resize = None;
+                        self.drag_background_rect = None;
+                        self.resize = Some((
+                            app,
+                            edge,
+                            window_rect(&self.windows[index].window),
+                            mouse.x,
+                            mouse.y,
+                        ));
+                        return repaint.max(Repaint::Windows);
+                    }
+                }
 
                 if app == App::Installer {
                     let content = self.windows[index].window.content();
@@ -1438,6 +1740,55 @@ impl Desktop {
                     }
                 }
 
+                if app == App::Files {
+                    let content = self.windows[index].window.content();
+
+                    if content.contains(mouse.x, mouse.y) {
+                        let old = window_rect(&self.windows[index].window);
+                        let ticks = platform.ticks();
+
+                        return match self.files.handle_click(
+                            platform,
+                            content,
+                            mouse.x,
+                            mouse.y,
+                            ticks,
+                        ) {
+                            fmgr::Outcome::Ignored => {
+                                if focus_changed {
+                                    repaint.max(Repaint::Windows)
+                                } else {
+                                    repaint
+                                }
+                            }
+                            fmgr::Outcome::Redraw => {
+                                if focus_changed {
+                                    repaint.max(Repaint::Windows)
+                                } else {
+                                    self.dirty_app = Some(App::Files);
+                                    repaint.max(Repaint::Window)
+                                }
+                            }
+                            fmgr::Outcome::OpenEditor => {
+                                let mut path = [0u8; fmgr::PATH_CAPACITY];
+                                let length = self.files.open_path(&mut path);
+                                let _ = old;
+
+                                match self.open_editor(platform, &path[..length]) {
+                                    KeyOutcome::Ignore => repaint,
+                                    KeyOutcome::Redraw => {
+                                        self.dirty_app = Some(self.focus);
+                                        repaint.max(Repaint::Window)
+                                    }
+                                    KeyOutcome::Windows => repaint.max(Repaint::Windows),
+                                    KeyOutcome::Fullscreen => repaint.max(Repaint::Full),
+                                    KeyOutcome::Quit => repaint,
+                                }
+                            }
+                        };
+                    }
+                }
+
                 if !self.windows[index].maximized
                     && self.windows[index].window.contains_title(mouse.x, mouse.y)
                 {
@@ -1450,11 +1801,54 @@ impl Desktop {
             }
         } else if !left_is && left_was {
             self.drag = None;
+            self.resize = None;
+        }
+
+        if let Some((app, edge, origin, press_x, press_y)) = self.resize {
+            if !left_is {
+                self.resize = None;
+                return repaint;
+            }
+
+            let index = app.index();
+
+            if !self.windows[index].open || self.windows[index].maximized {
+                self.resize = None;
+                return repaint;
+            }
+
+            let (min_width, min_height) = app.min_size();
+            let rect = window::resize_rect(
+                origin,
+                edge,
+                mouse.x - press_x,
+                mouse.y - press_y,
+                min_width,
+                min_height,
+                self.screen_width,
+                self.screen_height,
+            );
+
+            let window = &self.windows[index].window;
+
+            if rect.x != window.x
+                || rect.y != window.y
+                || rect.width != window.width
+                || rect.height != window.height
+            {
+                // Отрисовку откладываем до apply, чтобы указатель не попал
+                // в перерисовываемую область.
+                self.pending_resize = Some((app, rect));
+                repaint = repaint.max(Repaint::Cursor);
+            }
+
+            return repaint;
         }
 
         if let Some((app, offset_x, offset_y)) = self.drag {
             if !left_is {
                 self.drag = None;
+                self.resize = None;
                 self.drag_background_rect = None;
                 return repaint;
             }
@@ -1463,6 +1857,7 @@ impl Desktop {
 
             if !self.windows[index].open || self.windows[index].maximized {
                 self.drag = None;
+                self.resize = None;
                 self.drag_background_rect = None;
                 return repaint;
             }

@@ -143,6 +143,36 @@ static mut PROGRAM_SAVED_PDE: [u32; PROGRAM_TABLE_LIMIT] =
     [0; PROGRAM_TABLE_LIMIT];
 static mut PROGRAM_TABLE_COUNT: usize = 0;
 
+/// Добавляет тождественное отображение 4 MiB-страницы, содержащей адрес.
+///
+/// Нужно драйверам MMIO (например, AHCI): BAR может находиться выше
+/// обычного диапазона RAM, который ядро отображает при старте.
+pub fn map_identity_large(address: u32) -> bool {
+    let aligned = address & !(LARGE_PAGE_SIZE - 1);
+    let index = (aligned >> 22) as usize;
+
+    if index == 0 || index >= PAGE_COUNT {
+        return false;
+    }
+
+    unsafe {
+        let directory =
+            core::ptr::addr_of_mut!(PAGE_DIRECTORY).cast::<u32>();
+
+        // Если страница уже отображена (например, это RAM), ничего не меняем.
+        let entry = directory.add(index).read_volatile();
+
+        if entry & 1 == 0 {
+            directory
+                .add(index)
+                .write_volatile(aligned | PAGE_LARGE);
+        }
+    }
+
+    reload_cr3();
+    true
+}
+
 fn flush_tlb_page(address: u32) {
     unsafe {
         asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));

@@ -4,3 +4,5 @@
 //! появятся рядом по мере добавления.
 
 pub mod net;
+pub mod sata;
+pub mod usb;

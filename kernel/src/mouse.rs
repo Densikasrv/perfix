@@ -336,28 +336,43 @@ fn apply_packet(packet: [u8; 3]) {
     let dx = packet[1] as i8 as i32;
     let dy = packet[2] as i8 as i32;
 
+    // Экранная ось Y направлена вниз, а мышь сообщает смещение вверх.
+    apply_motion(dx, dy, flags & 0x07);
+}
+
+/// Применяет относительное перемещение и состояние кнопок.
+///
+/// `dy` положителен при движении вверх — так же, как в пакете PS/2.
+/// Общая функция используется и USB-драйвером.
+pub(crate) fn apply_motion(dx: i32, dy: i32, buttons: u8) {
     unsafe {
-        let new_buttons = flags & 0x07;
+        let new_buttons = buttons & 0x07;
 
         // Нажатия запоминаем: они могли прийти и уйти между опросами.
         BUTTON_LATCH |= new_buttons & !BUTTONS & 0x07;
         BUTTONS = new_buttons;
 
         POSITION_X = (POSITION_X + dx).clamp(0, BOUNDS_WIDTH - 1);
-        // Экранная ось Y направлена вниз, а мышь сообщает смещение вверх.
         POSITION_Y = (POSITION_Y - dy).clamp(0, BOUNDS_HEIGHT - 1);
     }
 }
 
-/// Читает из контроллера все готовые пакеты мыши.
+/// Читает готовые пакеты PS/2- и USB-мыши.
 ///
 /// Возвращает новое состояние, если хотя бы один пакет был обработан.
 pub fn poll() -> Option<MouseState> {
-    if !is_initialized() {
-        return None;
-    }
+    crate::drivers::usb::poll();
 
     let mut updated = None;
+
+    while let Some((dx, dy, buttons)) = crate::drivers::usb::pop_mouse() {
+        apply_motion(dx, dy, buttons);
+        updated = Some(state());
+    }
+
+    if !is_initialized() {
+        return updated;
+    }
 
     for _ in 0..PACKETS_PER_POLL {
         let status = inb(STATUS_PORT);

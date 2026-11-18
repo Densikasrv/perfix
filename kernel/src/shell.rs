@@ -303,53 +303,32 @@ pub(crate) fn reserved_path(path: &[u8]) -> bool {
     is_reserved_dsk(path)
 }
 
-fn parse_partition_number(input: &[u8]) -> Option<usize> {
-    if input.is_empty() {
-        return None;
-    }
-
-    let mut value = 0usize;
-
-    for &byte in input {
-        if !byte.is_ascii_digit() {
-            return None;
-        }
-
-        value = value.checked_mul(10)?;
-        value = value.checked_add((byte - b'0') as usize)?;
-    }
-
-    Some(value)
-}
 
 /// Разбирает аргумент в расположение файла.
 ///
 /// Путь `/dsk/N/...` адресует раздел `N`; остальные пути относятся
 /// к текущему выбранному разделу.
-fn parse_file_location(
+pub(crate) fn parse_file_location(
     argument: &[u8],
     out: &mut [u8; PATH_MAX],
 ) -> Result<FileLocation, &'static [u8]> {
     let kind;
+    let device;
     let start_lba;
     let sectors;
     let path_len;
 
     if argument.starts_with(b"/dsk/") {
         let rest = &argument[5..];
-        let mut digits_end = 0usize;
+        let name_len = crate::disk::partition_reference_len(rest);
 
-        while digits_end < rest.len() && rest[digits_end].is_ascii_digit() {
-            digits_end += 1;
-        }
-
-        if digits_end == 0 {
+        if name_len == 0 {
             return Err(RESERVED_DSK);
         }
 
-        let number = parse_partition_number(&rest[..digits_end])
+        let partition = crate::disk::parse_partition_reference(&rest[..name_len])
             .ok_or(b"Partition not found" as &'static [u8])?;
-        let tail = &rest[digits_end..];
+        let tail = &rest[name_len..];
 
         if !tail.is_empty() && tail[0] != b'/' {
             return Err(RESERVED_DSK);
@@ -373,23 +352,12 @@ fn parse_file_location(
             return Err(RESERVED_DSK);
         }
 
-        let mut partitions = [crate::disk::DiskPartition {
-            number: 0,
-            kind: crate::disk::FsKind::Other,
-            start_lba: 0,
-            sectors: 0,
-        }; 4];
-        let count = crate::disk::read_partitions(&mut partitions);
-        let partition = partitions[..count]
-            .iter()
-            .find(|p| p.number == number)
-            .ok_or(b"Partition not found" as &'static [u8])?;
-
         if partition.kind == crate::disk::FsKind::Other {
             return Err(b"Unsupported filesystem" as &'static [u8]);
         }
 
         kind = partition.kind;
+        device = partition.device;
         start_lba = partition.start_lba;
         sectors = partition.sectors;
     } else {
@@ -406,11 +374,12 @@ fn parse_file_location(
             return Err(b"Unsupported filesystem" as &'static [u8]);
         }
 
+        device = crate::disk::selected_device();
         start_lba = crate::disk::selected_lba();
         sectors = crate::disk::selected_sectors();
     }
 
-    FileLocation::new(kind, start_lba, sectors, &out[..path_len])
+    FileLocation::new(kind, device, start_lba, sectors, &out[..path_len])
         .ok_or(b"Path is too long" as &'static [u8])
 }
 
@@ -634,12 +603,12 @@ fn parse_datetime(input: &[u8]) -> Option<(u32, u32, u32, u32, u32, u32)> {
 fn command_lines(input: &[u8]) -> usize {
     if input == b"help" {
         if crate::installer::available() {
-            41
+            44
         } else {
-            39
+            42
         }
     } else if input == b"version" {
-        5
+        6
     } else if input == b"diskinfo" {
         9
     } else if input == b"mount" {
@@ -807,6 +776,23 @@ fn change_directory(argument: &[u8], row: usize) {
     }
     if !cd_handled {
         vga::print_at(row, 0, b"Path not found on any filesystem");
+    }
+}
+
+fn push_hex_message<const N: usize>(
+    out: &mut [u8; N],
+    len: &mut usize,
+    value: u32,
+    digits: usize,
+) {
+    const HEX: &[u8] = b"0123456789ABCDEF";
+
+    let mut index = digits;
+
+    while index > 0 {
+        index -= 1;
+        let nibble = ((value >> (index * 4)) & 0xF) as usize;
+        push_message(out, len, &[HEX[nibble]]);
     }
 }
 
@@ -1070,6 +1056,22 @@ pub fn execute(input: &[u8], row: &mut usize) {
         return;
     }
 
+    if input == b"usb" {
+        make_room(row, 28);
+        let output_row = *row + 1;
+        *row = output_row + crate::drivers::usb::print_info(output_row);
+        prompt(*row);
+        return;
+    }
+
+    if input == b"mtrr" {
+        make_room(row, 12);
+        let output_row = *row + 1;
+        *row = output_row + crate::mtrr::print_info(output_row);
+        prompt(*row);
+        return;
+    }
+
     if input == b"lspci" || input == b"pci" {
         let used = crate::pci::count() + 1;
         make_room(row, 1 + used);
@@ -1149,7 +1151,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 18, 0, b"pwd       - print working directory");
         vga::print_at(output_row + 19, 0, b"Up/Down   - command history");
         vga::print_at(output_row + 20, 0, b"listpart  - list partitions");
-        vga::print_at(output_row + 21, 0, b"cdpart <n>- select partition");
+        vga::print_at(output_row + 21, 0, b"cdpart <a1|n> - select partition");
         vga::print_at(output_row + 22, 0, b"fetch     - system information");
         vga::print_at(output_row + 23, 0, b"halt      - turn off the computer");
         vga::print_at(output_row + 24, 0, b"calc      - simple calculator");
@@ -1167,10 +1169,12 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 36, 0, b"ping <ip> - send ICMP echo requests");
         vga::print_at(output_row + 37, 0, b"browse <url> - simple HTML browser");
         vga::print_at(output_row + 38, 0, b"pfpak     - package manager (pfpak for help)");
+        vga::print_at(output_row + 39, 0, b"usb       - USB controller and devices");
+        vga::print_at(output_row + 40, 0, b"mtrr      - memory type ranges");
 
         if crate::installer::available() {
-            vga::print_at(output_row + 39, 0, b"install [n] [format] - install Perfix");
-            vga::print_at(output_row + 40, 0, b"setup [n] [format]   - alias for install");
+            vga::print_at(output_row + 41, 0, b"install [n] [format] - install Perfix");
+            vga::print_at(output_row + 42, 0, b"setup [n] [format]   - alias for install");
         }
     } else if input == b"about" {
         vga::print_at(output_row, 0, b"Perfix");
@@ -1192,6 +1196,34 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row + 3, 10, version::LANGUAGE);
         vga::print_at(output_row + 4, 0, b"Status: ");
         vga::print_at(output_row + 4, 8, version::STATUS);
+
+        let mut line = [b' '; 80];
+        let mut len = 0usize;
+        push_message(&mut line, &mut len, b"Framebuffer: ");
+
+        if vga::is_graphics() {
+            push_dec_message(&mut line, &mut len, vga::pixel_width());
+            push_message(&mut line, &mut len, b"x");
+            push_dec_message(&mut line, &mut len, vga::pixel_height());
+            push_message(&mut line, &mut len, b"x");
+            push_dec_message(&mut line, &mut len, vga::bits_per_pixel());
+            push_message(&mut line, &mut len, b", ");
+        } else {
+            push_message(&mut line, &mut len, b"text, ");
+        }
+
+        push_message(&mut line, &mut len, crate::mtrr::status());
+
+        if crate::mtrr::active() {
+            let (base, size) = crate::mtrr::range();
+            push_message(&mut line, &mut len, b" 0x");
+            push_hex_message(&mut line, &mut len, base as u32, 8);
+            push_message(&mut line, &mut len, b"/");
+            push_dec_message(&mut line, &mut len, (size / (1024 * 1024)) as usize);
+            push_message(&mut line, &mut len, b"MB");
+        }
+
+        vga::print_at(output_row + 5, 0, &line[..len]);
     } else if input == b"fetch" {
         let used = crate::fetch::show(output_row);
         *row = output_row + used;
@@ -1202,18 +1234,80 @@ pub fn execute(input: &[u8], row: &mut usize) {
         *row = output_row + used;
         prompt(*row);
         return;
+    } else if input == b"sata" {
+        use crate::drivers::sata::ahci;
+        let mut line = [b' '; 80];
+        let mut len = 0usize;
+        let mut used = 0usize;
+
+        if ahci::controller_found() {
+            push_message(&mut line, &mut len, b"SATA: AHCI controller, ABAR 0x");
+            push_hex_message(&mut line, &mut len, ahci::abar(), 8);
+            push_message(&mut line, &mut len, b"  ports 0x");
+            push_hex_message(&mut line, &mut len, ahci::implemented_ports(), 8);
+        } else {
+            push_message(&mut line, &mut len, b"SATA: AHCI controller not found");
+        }
+
+        vga::print_at(output_row, 0, &line[..len]);
+        used += 1;
+
+        if ahci::controller_found() {
+            len = 0;
+            push_message(&mut line, &mut len, b"drives: ");
+            push_dec_message(&mut line, &mut len, ahci::count());
+            push_message(&mut line, &mut len, b"  block devices: ");
+            push_dec_message(&mut line, &mut len, crate::block::count());
+            vga::print_at(output_row + used, 0, &line[..len]);
+            used += 1;
+
+            let implemented = ahci::implemented_ports();
+
+            for port in 0..8u8 {
+                if implemented & (1 << port) == 0 {
+                    continue;
+                }
+
+                let Some((ssts, sig)) = ahci::port_state(port) else {
+                    break;
+                };
+
+                len = 0;
+                push_message(&mut line, &mut len, b"Port ");
+                push_dec_message(&mut line, &mut len, port as usize);
+                push_message(&mut line, &mut len, b": ");
+
+                if ssts & 0x0F == 3 {
+                    push_message(&mut line, &mut len, b"connected");
+
+                    if sig == 0x0000_0101 {
+                        push_message(&mut line, &mut len, b" (ATA)");
+                    } else if sig == 0xEB14_0101 {
+                        push_message(&mut line, &mut len, b" (ATAPI)");
+                    } else {
+                        push_message(&mut line, &mut len, b" (SIG 0x");
+                        push_hex_message(&mut line, &mut len, sig, 8);
+                        push_message(&mut line, &mut len, b")");
+                    }
+                } else {
+                    push_message(&mut line, &mut len, b"empty");
+                }
+
+                vga::print_at(output_row + used, 0, &line[..len]);
+                used += 1;
+            }
+        }
+
+        *row = output_row + used;
+        prompt(*row);
+        return;
     } else if input == b"mount" {
         for_each_fs(output_row, |fs, r| fs.print_volume_info(r));
     } else if input == b"charset" {
         vga::print_charset(output_row);
     
 } else if input == b"listpart" {
-    let mut partitions = [crate::disk::DiskPartition {
-        number: 0,
-        kind: crate::disk::FsKind::Other,
-        start_lba: 0,
-        sectors: 0,
-    }; crate::fs::exfat::MAX_PARTITIONS];
+    let mut partitions = [crate::disk::DiskPartition::EMPTY; 32];
 
     let count = crate::disk::read_partitions(&mut partitions);
 
@@ -1223,7 +1317,7 @@ pub fn execute(input: &[u8], row: &mut usize) {
         vga::print_at(output_row, 0, b"Disk partitions:");
 
         for (i, p) in partitions[..count].iter().enumerate() {
-            let name = match p.kind {
+            let kind_name = match p.kind {
                 crate::disk::FsKind::Exfat => b"exFAT".as_slice(),
                 crate::disk::FsKind::Ext4 => b"ext4".as_slice(),
                 crate::disk::FsKind::Other => b"Other".as_slice(),
@@ -1232,10 +1326,15 @@ pub fn execute(input: &[u8], row: &mut usize) {
             let mut line = [b' '; 80];
             let mut len = 0usize;
 
-            push_message(&mut line, &mut len, b"Partition ");
+            push_message(&mut line, &mut len, b"/dsk/");
+            push_message(&mut line, &mut len, &[crate::disk::disk_letter(p.device)]);
+            push_dec_message(&mut line, &mut len, p.partition_index);
+            push_message(&mut line, &mut len, b"  (");
             push_dec_message(&mut line, &mut len, p.number);
+            push_message(&mut line, &mut len, b")  disk ");
+            push_dec_message(&mut line, &mut len, p.device + 1);
             push_message(&mut line, &mut len, b"  ");
-            push_message(&mut line, &mut len, name);
+            push_message(&mut line, &mut len, kind_name);
             push_message(&mut line, &mut len, b"  LBA ");
             push_dec_message(&mut line, &mut len, p.start_lba as usize);
             push_message(&mut line, &mut len, b"  sectors ");
@@ -1272,23 +1371,13 @@ pub fn execute(input: &[u8], row: &mut usize) {
         prompt(*row);
         return;
     } else if let Some(argument) = command_arg(input, b"cdpart") {
-    let mut number = 0usize;
-    let mut valid = !argument.is_empty();
-
-    for &byte in argument {
-        if !byte.is_ascii_digit() {
-            valid = false;
-            break;
-        }
-
-        number = number
-            .saturating_mul(10)
-            .saturating_add((byte - b'0') as usize);
-    }
+    let partition = crate::disk::parse_partition_reference(argument);
     let mut used_rows = 1usize;
-    if !valid || number == 0 {
-        vga::print_at(output_row, 0, b"Usage: cdpart <number>");
+    if partition.is_none() {
+        vga::print_at(output_row, 0, b"Usage: cdpart <a1|number>");
     } else {
+        let number = partition.unwrap().number;
+
         match crate::disk::select_partition(number) {
             Ok(crate::disk::FsKind::Exfat) => {
                 set_cwd(b"/");

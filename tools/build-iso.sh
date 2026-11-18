@@ -114,14 +114,16 @@ cp "$BOOT_IMG" "$BUILD_DIR/iso/boot/boot.img"
 # core.img ищет установленное ядро на любом разделе по файлу /perfix.elf,
 # поэтому номер раздела не зашивается в загрузчик.
 echo "[4/5] Генерация core.img"
+# Установленное ядро грузится этим core.img. По умолчанию выбирается
+# режим 1024x768: его понимают старые VBE-адаптеры (например, ATI Rage
+# Pro на Dell Optiplex GX1) и ЭЛТ-мониторы. Если монитор не поддерживает
+# и его, в меню можно выбрать 800x600 или текстовый режим.
 cat > "$BUILD_DIR/early.cfg" <<'EOF'
-set timeout=0
-set default=0
-menuentry "Perfix" {
-    search --no-floppy --file --set=root /perfix.elf
-    multiboot /perfix.elf
-    boot
-}
+search --no-floppy --file --set=root /perfix.elf
+configfile /boot/grub/grub.cfg
+multiboot /perfix.elf
+set gfxpayload=1024x768x32,1024x768x24,1024x768x16,800x600x32,800x600x24,800x600x16
+boot
 EOF
 
 grub-mkimage \
@@ -130,16 +132,76 @@ grub-mkimage \
     -p '(hd0)/' \
     -c "$BUILD_DIR/early.cfg" \
     biosdisk part_msdos part_gpt ext2 search search_fs_file \
-    search_fs_uuid multiboot normal configfile echo test boot
+    search_fs_uuid multiboot normal configfile echo test boot all_video
 
 cat > "$BUILD_DIR/iso/boot/grub/grub.cfg" <<'EOF'
-set timeout=0
+set timeout=3
 set default=0
 
 menuentry "Perfix" {
     insmod all_video
-    set gfxpayload=1920x1080x32
     multiboot /boot/perfix.elf
+    set gfxpayload=1024x768x32,1024x768x24,1024x768x16,800x600x32,800x600x24,800x600x16
+    module /boot/perfix.elf
+    module /boot/boot.img
+    module /boot/core.img
+    boot
+}
+
+menuentry "Perfix (1920x1080)" {
+    insmod all_video
+    multiboot /boot/perfix.elf
+    set gfxpayload=1920x1080x32
+    module /boot/perfix.elf
+    module /boot/boot.img
+    module /boot/core.img
+    boot
+}
+
+menuentry "Perfix (800x600)" {
+    insmod all_video
+    multiboot /boot/perfix.elf
+    set gfxpayload=800x600x32,800x600x24,800x600x16
+    module /boot/perfix.elf
+    module /boot/boot.img
+    module /boot/core.img
+    boot
+}
+
+menuentry "Perfix (1024x768, 16-bit)" {
+    insmod all_video
+    multiboot /boot/perfix.elf
+    set gfxpayload=1024x768x16
+    module /boot/perfix.elf
+    module /boot/boot.img
+    module /boot/core.img
+    boot
+}
+
+menuentry "Perfix (1024x768, 24-bit)" {
+    insmod all_video
+    multiboot /boot/perfix.elf
+    set gfxpayload=1024x768x24
+    module /boot/perfix.elf
+    module /boot/boot.img
+    module /boot/core.img
+    boot
+}
+
+menuentry "Perfix (800x600, 16-bit)" {
+    insmod all_video
+    multiboot /boot/perfix.elf
+    set gfxpayload=800x600x16
+    module /boot/perfix.elf
+    module /boot/boot.img
+    module /boot/core.img
+    boot
+}
+
+menuentry "Perfix (VGA text mode)" {
+    insmod all_video
+    multiboot /boot/perfix.elf
+    set gfxpayload=text
     module /boot/perfix.elf
     module /boot/boot.img
     module /boot/core.img

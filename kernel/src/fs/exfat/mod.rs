@@ -8,18 +8,34 @@ pub use fs::{BlockReader, BlockDevice, BlockError};
 
 pub use fs::{cp866_to_utf8, FsError, PartitionInfo, Volume, MAX_PARTITIONS};
 
-use crate::ata::{self, AtaError};
+use crate::block;
 use crate::vga;
 
-/// Устройство чтения/записи секторов через ATA PIO (primary master).
-pub struct AtaDevice;
+/// Устройство чтения/записи секторов через выбранный IDE/SATA-диск.
+#[derive(Clone, Copy)]
+pub struct AtaDevice {
+    pub device: usize,
+}
 
-fn map_ata_error(error: AtaError) -> fs::BlockError {
+impl AtaDevice {
+    pub const fn new(device: usize) -> Self {
+        Self { device }
+    }
+}
+
+/// Устройство, к которому привязан выбранный том exFAT.
+fn volume_device() -> AtaDevice {
+    AtaDevice {
+        device: unsafe { SELECTED_DEVICE },
+    }
+}
+
+fn map_ata_error(error: block::Error) -> fs::BlockError {
     match error {
-        AtaError::Timeout => fs::BlockError::Timeout,
-        AtaError::NoDevice => fs::BlockError::NoDevice,
-        AtaError::DeviceError(_) => fs::BlockError::Device,
-        AtaError::InvalidLba => fs::BlockError::InvalidLba,
+        block::Error::Timeout => fs::BlockError::Timeout,
+        block::Error::NoDevice => fs::BlockError::NoDevice,
+        block::Error::DeviceError => fs::BlockError::Device,
+        block::Error::InvalidLba => fs::BlockError::InvalidLba,
     }
 }
 
@@ -29,7 +45,7 @@ impl fs::BlockReader for AtaDevice {
         lba: u32,
         buffer: &mut [u8; fs::SECTOR_SIZE],
     ) -> Result<(), fs::BlockError> {
-        ata::read_sector(lba, buffer).map_err(map_ata_error)
+        crate::block::read_sector(self.device, lba, buffer).map_err(map_ata_error)
     }
 }
 
@@ -39,16 +55,17 @@ impl fs::BlockDevice for AtaDevice {
         lba: u32,
         buffer: &[u8; fs::SECTOR_SIZE],
     ) -> Result<(), fs::BlockError> {
-        ata::write_sector(lba, buffer).map_err(map_ata_error)
+        crate::block::write_sector(self.device, lba, buffer).map_err(map_ata_error)
     }
 
     fn flush(&self) -> Result<(), fs::BlockError> {
-        ata::flush().map_err(map_ata_error)
+        crate::block::flush(self.device).map_err(map_ata_error)
     }
 }
 
 static mut SELECTED_BASE: Option<u32> = None;
 static mut SELECTED_INDEX: Option<usize> = None;
+static mut SELECTED_DEVICE: usize = 0;
 
 fn selected_base() -> Option<u32> {
     unsafe { SELECTED_BASE }
@@ -61,26 +78,42 @@ pub fn selected_partition() -> Option<usize> {
 
 fn mount_volume() -> Result<Volume, FsError> {
     match selected_base() {
-        Some(base) => fs::mount_at(&AtaDevice, base),
-        None => fs::mount(&AtaDevice),
+        Some(base) => fs::mount_at(&volume_device(), base),
+        None => fs::mount(&volume_device()),
     }
 }
 
 /// Возвращает (общий размер, свободные байты) выбранного тома exFAT.
 pub fn space_info() -> Result<(u64, u64), FsError> {
     let volume = mount_volume()?;
-    fs::volume_space(&AtaDevice, &volume)
+    fs::volume_space(&volume_device(), &volume)
 }
 
 /// Перечисляет найденные разделы exFAT.
 pub fn partition_list(out: &mut [PartitionInfo]) -> Result<usize, FsError> {
-    fs::scan_exfat_partitions(&AtaDevice, out)
+    fs::scan_exfat_partitions(&volume_device(), out)
+}
+
+/// Перечисляет разделы exFAT на конкретном устройстве.
+pub fn partition_list_on(
+    device: usize,
+    out: &mut [PartitionInfo],
+) -> Result<usize, FsError> {
+    fs::scan_exfat_partitions(&AtaDevice::new(device), out)
 }
 
 /// Выбирает раздел по индексу (0-based) для всех файловых операций.
 pub fn select_partition(index: usize) -> Result<PartitionInfo, FsError> {
+    select_partition_on(unsafe { SELECTED_DEVICE }, index)
+}
+
+/// Выбирает раздел exFAT на конкретном устройстве.
+pub fn select_partition_on(
+    device: usize,
+    index: usize,
+) -> Result<PartitionInfo, FsError> {
     let mut partitions = [PartitionInfo::empty(); MAX_PARTITIONS];
-    let count = partition_list(&mut partitions)?;
+    let count = partition_list_on(device, &mut partitions)?;
 
     if index >= count {
         return Err(FsError::PartitionNotFound);
@@ -91,6 +124,7 @@ pub fn select_partition(index: usize) -> Result<PartitionInfo, FsError> {
     unsafe {
         SELECTED_BASE = Some(partition.base_lba);
         SELECTED_INDEX = Some(index);
+        SELECTED_DEVICE = device;
     }
 
     Ok(partition)
@@ -266,7 +300,7 @@ pub fn print_boot_sector(row: usize) -> usize {
 
     let mut boot = [0u8; fs::SECTOR_SIZE];
 
-    if let Err(error) = fs::BlockReader::read_sector(&AtaDevice, base_lba, &mut boot) {
+    if let Err(error) = fs::BlockReader::read_sector(&volume_device(), base_lba, &mut boot) {
         return print_error(row, error.into());
     }
 
@@ -346,7 +380,8 @@ pub fn shell_list(path: &[u8], row: usize) -> usize {
         Err(error) => return print_error(row, error),
     };
 
-    let directory = match fs::resolve(&AtaDevice, &volume, path) {
+    let device = volume_device();
+    let directory = match fs::resolve(&device, &volume, path) {
         Ok(entry) => entry,
         Err(error) => return print_error(row, error),
     };
@@ -366,7 +401,7 @@ pub fn shell_list(path: &[u8], row: usize) -> usize {
     let mut entries = 0usize;
     let mut cursor = fs::DirCursor::new(
         &volume,
-        &AtaDevice,
+        &device,
         directory.first_cluster,
         directory.contiguous,
         directory.data_length,
@@ -423,7 +458,7 @@ pub fn shell_cat(path: &[u8], row: usize) -> usize {
         Err(error) => return print_error(row, error),
     };
 
-    let file = match fs::resolve(&AtaDevice, &volume, path) {
+    let file = match fs::resolve(&volume_device(), &volume, path) {
         Ok(entry) => entry,
         Err(error) => return print_error(row, error),
     };
@@ -453,7 +488,7 @@ pub fn shell_cat(path: &[u8], row: usize) -> usize {
     let mut truncated = false;
     let mut decoder = crate::utf8::Decoder::new();
 
-    let result = fs::read_file(&AtaDevice, &volume, &file, |chunk| {
+    let result = fs::read_file(&volume_device(), &volume, &file, |chunk| {
         for &byte in chunk {
             let mut decoded = [0u8; 4];
             let decoded_len = decoder.feed(byte, &mut decoded, fs::utf16_to_cp866);
@@ -534,7 +569,7 @@ pub fn shell_cat(path: &[u8], row: usize) -> usize {
 /// управляющие коды пропускаются.
 pub fn load_text_file(path: &[u8], out: &mut [u8]) -> Result<(usize, bool), FsError> {
     let volume = mount_volume()?;
-    let file = fs::resolve(&AtaDevice, &volume, path)?;
+    let file = fs::resolve(&volume_device(), &volume, path)?;
 
     if file.is_directory() {
         return Err(FsError::NotAFile);
@@ -544,7 +579,7 @@ pub fn load_text_file(path: &[u8], out: &mut [u8]) -> Result<(usize, bool), FsEr
     let mut len = 0usize;
     let mut truncated = false;
 
-    fs::read_file(&AtaDevice, &volume, &file, |chunk| {
+    fs::read_file(&volume_device(), &volume, &file, |chunk| {
         for &byte in chunk {
             let mut decoded = [0u8; 4];
             let decoded_len = decoder.feed(byte, &mut decoded, fs::utf16_to_cp866);
@@ -585,7 +620,7 @@ pub fn save_file(path: &[u8], data: &[u8]) -> Result<(), FsError> {
     let volume = mount_volume()?;
 
     fs::write_file(
-        &AtaDevice,
+        &volume_device(),
         &volume,
         path,
         data,
@@ -596,7 +631,7 @@ pub fn save_file(path: &[u8], data: &[u8]) -> Result<(), FsError> {
 /// Проверяет, что путь существует и указывает на каталог.
 pub fn path_is_directory(path: &[u8]) -> Result<bool, FsError> {
     let volume = mount_volume()?;
-    let entry = fs::resolve(&AtaDevice, &volume, path)?;
+    let entry = fs::resolve(&volume_device(), &volume, path)?;
 
     Ok(entry.is_directory())
 }
@@ -618,7 +653,7 @@ pub fn shell_write(path: &[u8], text: &[u8], row: usize) -> usize {
     let text_len = fs::cp866_to_utf8(text, &mut utf8);
 
     match fs::write_file(
-        &AtaDevice,
+        &volume_device(),
         &volume,
         path,
         &utf8[..text_len],
@@ -656,7 +691,7 @@ pub fn shell_remove(path: &[u8], row: usize) -> usize {
         Err(error) => return print_error(row, error),
     };
 
-    match fs::remove_file(&AtaDevice, &volume, path) {
+    match fs::remove_file(&volume_device(), &volume, path) {
         Ok(()) => {
             let mut line = [b' '; 80];
             let mut len = 0usize;
@@ -684,7 +719,7 @@ pub fn shell_mkdir(path: &[u8], row: usize) -> usize {
         Err(error) => return print_error(row, error),
     };
 
-    match fs::make_directory(&AtaDevice, &volume, path, crate::rtc::timestamp()) {
+    match fs::make_directory(&volume_device(), &volume, path, crate::rtc::timestamp()) {
         Ok(()) => {
             let mut line = [b' '; 80];
             let mut len = 0usize;
@@ -842,7 +877,7 @@ pub fn shell_rmdir(path: &[u8], row: usize) -> usize {
         Err(error) => return print_error(row, error),
     };
 
-    match fs::remove_directory(&AtaDevice, &volume, path) {
+    match fs::remove_directory(&volume_device(), &volume, path) {
         Ok(()) => {
             let mut line = [b' '; 80];
             let mut len = 0usize;

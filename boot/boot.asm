@@ -17,10 +17,13 @@ align 4
     ; a.out kludge fields (not used)
     dd 0, 0, 0, 0, 0
 
-        ; Request a linear graphics mode (1 = Text mode preferred, but allows override)
-    dd 0   ; Было 0 (чистая графика). Ставим 1 (текст по дефолту, но графика разрешена)
-    dd 1920
-    dd 1080
+    ; Запасной режим на случай, если загрузчик не задал gfxpayload:
+    ; 1024x768 понимают почти все мониторы и старые VBE-адаптеры
+    ; (ATI Rage Pro и подобные). GRUB всё равно может выбрать другой
+    ; режим через gfxpayload.
+    dd 0
+    dd 1024
+    dd 768
     dd 32
 
 ; Reserve 256 KiB for the initial kernel stack.

@@ -181,7 +181,7 @@ fn build_request(url: &Url) -> ([u8; 640], usize) {
     push(
         &mut request,
         &mut length,
-        b"\r\nUser-Agent: Perfix/0.2.8\r\nConnection: close\r\n\r\n",
+        b"\r\nUser-Agent: Perfix/0.2.9\r\nConnection: close\r\n\r\n",
     );
 
     (request, length)

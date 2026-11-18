@@ -44,6 +44,8 @@ pub enum Icon {
     Terminal,
     /// Графический браузер Perfbrowse.
     Browser,
+    /// Файловый менеджер.
+    Files,
     /// Тетрис.
     Tetris,
     /// Змейка.
@@ -117,9 +119,10 @@ impl Dock {
             0 => Icon::Perforator,
             1 => Icon::Terminal,
             2 => Icon::Browser,
-            3 => Icon::Tetris,
-            4 => Icon::Snake,
-            5 => Icon::Editor,
+            3 => Icon::Files,
+            4 => Icon::Tetris,
+            5 => Icon::Snake,
+            6 => Icon::Editor,
             _ => Icon::Installer,
         }
     }
@@ -229,6 +232,7 @@ fn paint_icon(platform: &mut dyn Platform, icon: Icon, rect: Rect, highlighted: 
         Icon::Perforator => paint_perforator(platform, rect),
         Icon::Terminal => paint_terminal(platform, rect),
         Icon::Browser => paint_browser(platform, rect),
+        Icon::Files => paint_files_icon(platform, rect),
         Icon::Tetris => paint_tetris(platform, rect),
         Icon::Snake => paint_snake(platform, rect),
         Icon::Editor => paint_editor(platform, rect),
@@ -274,6 +278,17 @@ fn paint_browser(platform: &mut dyn Platform, rect: Rect) {
         0x0060c0f0,
         page,
     );
+}
+
+/// Иконка файлового менеджера: жёлтая папка.
+fn paint_files_icon(platform: &mut dyn Platform, rect: Rect) {
+    let x = rect.x;
+    let y = rect.y;
+
+    platform.fill_rect(x + 10, y + 16, 28, 20, 0x00e0b040);
+    platform.fill_rect(x + 12, y + 12, 12, 6, 0x00e0b040);
+    platform.draw_rect(x + 10, y + 16, 28, 20, 0x00a07820);
+    platform.fill_rect(x + 14, y + 22, 20, 2, 0x00a07820);
 }
 
 /// Иконка тетриса: несколько цветных блоков.

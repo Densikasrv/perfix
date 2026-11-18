@@ -236,6 +236,10 @@ impl Browser {
 
         let page = &page_buffer()[..self.page_len];
         let top = area.y + TEXT_TOP;
+        // При изменении размера окна перенос строк подстраивается под
+        // фактическую ширину, а показываем столько строк, сколько влезает.
+        let columns = (((area.width - 12) / CHAR_WIDTH).max(8) as usize).min(MAX_LINE);
+        let rows = (((area.height - TEXT_TOP) / CHAR_HEIGHT).max(1)) as usize;
 
         if page.is_empty() {
             if !self.pending {
@@ -256,8 +260,8 @@ impl Browser {
         let mut line_number = 0usize;
         let mut row = 0usize;
 
-        while position < page.len() && row < ROWS {
-            let length = take_line(page, &mut position, COLS, &mut line);
+        while position < page.len() && row < rows {
+            let length = take_line(page, &mut position, columns, &mut line);
 
             if line_number >= self.scroll {
                 platform.draw_text(

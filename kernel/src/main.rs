@@ -14,14 +14,17 @@ mod gdt;
 mod idt;
 mod paging;
 mod ata;
+mod block;
 mod fs;
 mod disk;
+mod fileops;
 mod installer;
 pub use fs::exfat;
 pub use fs::ext4;
 mod tedit;
 mod fetch;
 mod cpu;
+mod mtrr;
 mod sysinfo;
 mod font_cp866;
 mod font_8x16;
@@ -211,6 +214,12 @@ fn framebuffer_info(multiboot_info: u32) -> Option<vga::FramebufferInfo> {
         height: mbi_u32(multiboot_info, 104),
         bpp: mbi_u8(multiboot_info, 108),
         kind: mbi_u8(multiboot_info, 109),
+        red_position: mbi_u8(multiboot_info, 110),
+        red_size: mbi_u8(multiboot_info, 111),
+        green_position: mbi_u8(multiboot_info, 112),
+        green_size: mbi_u8(multiboot_info, 113),
+        blue_position: mbi_u8(multiboot_info, 114),
+        blue_size: mbi_u8(multiboot_info, 115),
     })
 }
 
@@ -272,11 +281,18 @@ arena::init();
 }
 
 installer::init(multiboot_info);
+pci::init();
+// Блочные устройства перечисляются до первого обращения к разделам:
+// установщик и автоподключение уже работают через таблицу дисков.
+block::init();
 installer::detect_installed();
 // Системный ext4-раздел подключается автоматически, как и том exFAT.
 disk::auto_select();
-pci::init();
 net::init();
+
+// Видеопамять на реальном железе обычно некэшируемая. Write-combining
+// заметно ускоряет перерисовку pdesk (особенно перетаскивание окон).
+mtrr::init(framebuffer_address, framebuffer_size);
 
 vga::init(framebuffer);
 
@@ -287,6 +303,11 @@ vga::load_glyphs(&font_cp866::GLYPHS);
 
 // Калибруем TSC заранее, чтобы первый ping не ждал измерения частоты.
 timer::init();
+
+// USB-контроллер опрашивается из основного цикла, как и PS/2.
+// Отсутствие USB не мешает работе: встроенные клавиатура и мышь
+// продолжают обслуживаться драйверами i8042.
+drivers::usb::init();
 
 // PS/2-мышь опрашивается из основного цикла, прерывания не используются.
 let (mouse_area_width, mouse_area_height) = if vga::is_graphics() {
@@ -487,7 +508,7 @@ loop {
 fn test_ext4() {
     use crate::fs::ext4::{AtaDevice, Ext4};
 
-    let device = AtaDevice;
+    let device = AtaDevice::selected();
      let partition_start = crate::disk::selected_lba();
      let partition_sectors = crate::disk::selected_sectors();
 

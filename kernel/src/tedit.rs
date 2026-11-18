@@ -156,7 +156,7 @@ fn load_ext4_file(
 ) -> Result<(usize, bool), FsError> {
     use crate::fs::ext4::{AtaDevice, Ext4};
 
-    let device = AtaDevice;
+    let device = AtaDevice::selected();
     let ext4 = Ext4::mount(
         &device,
         crate::disk::selected_lba(),
@@ -255,18 +255,72 @@ pub fn gui_load(
         return Err(b"path is too long");
     };
 
+    let copy = path_len.min(resolved.len());
+    resolved[..copy].copy_from_slice(&path[..copy]);
+
+    if path[..path_len].starts_with(b"/dsk/") {
+        let mut location_path = [0u8; 512];
+        let location = crate::shell::parse_file_location(
+            &path[..path_len],
+            &mut location_path,
+        )?;
+
+        return match load_location_text(&location, output) {
+            Ok((length, truncated)) => Ok((length, true, truncated, copy)),
+            Err(message) if message == b"path not found" => {
+                Ok((0, false, false, copy))
+            }
+            Err(message) => Err(message),
+        };
+    }
+
     if crate::shell::reserved_path(&path[..path_len]) {
         return Err(b"reserved path");
     }
-
-    let copy = path_len.min(resolved.len());
-    resolved[..copy].copy_from_slice(&path[..copy]);
 
     match load_text(&path[..path_len], output) {
         Ok((length, truncated)) => Ok((length, true, truncated, copy)),
         Err(FsError::PathNotFound) => Ok((0, false, false, copy)),
         Err(error) => Err(error.message()),
     }
+}
+
+/// Загружает текст с любого раздела через общий слой файловых операций.
+fn load_location_text(
+    location: &crate::fs::FileLocation,
+    output: &mut [u8],
+) -> Result<(usize, bool), &'static [u8]> {
+    let utf8 = unsafe { &mut *core::ptr::addr_of_mut!(UTF8) };
+    let size = crate::fs::file_size(location)
+        .map_err(|error| error.message())?;
+
+    if size > utf8.len() as u64 {
+        return Err(b"file is too large");
+    }
+
+    let count = crate::fs::read_file(location, utf8)
+        .map_err(|error| error.message())?;
+    let mut decoder = crate::utf8::Decoder::new();
+    let mut decoded = [0u8; 4];
+    let mut output_len = 0usize;
+
+    for &byte in &utf8[..count] {
+        let decoded_len = decoder.feed(
+            byte,
+            &mut decoded,
+            crate::fs::exfat::fs::utf16_to_cp866,
+        );
+
+        if output_len + decoded_len > output.len() {
+            return Ok((output_len, true));
+        }
+
+        output[output_len..output_len + decoded_len]
+            .copy_from_slice(&decoded[..decoded_len]);
+        output_len += decoded_len;
+    }
+
+    Ok((output_len, false))
 }
 /// Запускает редактор для файла `path`.
 ///
@@ -622,7 +676,7 @@ fn paste(buffer: &mut Buffer, editor: &mut Editor) {
 fn save_ext4_file(path: &[u8], text: &[u8]) -> Result<(), &'static [u8]> {
     use crate::fs::ext4::{AtaDevice, Ext4, Ext4Error};
 
-    let device = AtaDevice;
+    let device = AtaDevice::selected();
     let ext4 = Ext4::mount_read_write(
         &device,
         crate::disk::selected_lba(),
@@ -683,6 +737,23 @@ pub fn gui_save(path: &[u8], text: &[u8]) -> Result<usize, &'static [u8]> {
     let Some(length) = crate::shell::resolve_path(path, &mut resolved) else {
         return Err(b"path is too long");
     };
+
+    if resolved[..length].starts_with(b"/dsk/") {
+        if !crate::auth::can_write(&resolved[..length]) {
+            return Err(b"permission denied. use elev tedit");
+        }
+
+        let mut location_path = [0u8; 512];
+        let location = crate::shell::parse_file_location(
+            &resolved[..length],
+            &mut location_path,
+        )?;
+        let utf8 = unsafe { &mut *core::ptr::addr_of_mut!(UTF8) };
+        let utf8_len = exfat::cp866_to_utf8(text, utf8);
+        crate::fs::write_file(&location, &utf8[..utf8_len])
+            .map_err(|error| error.message())?;
+        return Ok(utf8_len);
+    }
 
     if crate::shell::reserved_path(&resolved[..length]) {
         return Err(b"reserved path");

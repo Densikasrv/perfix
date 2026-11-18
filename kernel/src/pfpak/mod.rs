@@ -431,12 +431,19 @@ fn extract_package(
 
     rollback_begin();
 
+    // Заменять /perfix.elf может только официальный пакет Perfix от
+    // Densikasrv: имя пакета берём из аргумента, мейнтейнера — из манифеста.
+    let replace_kernel = paths::can_replace_kernel(
+        package,
+        manifest::field(remote_manifest, b"maintainer"),
+    );
+
     let mut target = InstallTarget {
         filesystem: &filesystem,
         manifest: remote_manifest,
     };
 
-    let mut extractor = tar::Extractor::new(&mut target);
+    let mut extractor = tar::Extractor::with_kernel_access(&mut target, replace_kernel);
     let result = inflate::gunzip(archive, &mut extractor);
 
     match result {
@@ -452,7 +459,7 @@ fn extract_package(
     let mut missing: Option<store::Error> = None;
     manifest::for_each_file(remote_manifest, |entry| {
         let path = match paths::normalize(entry) {
-            Ok(path) if paths::allowed(&path) => path,
+            Ok(path) if paths::allowed_for(&path, replace_kernel) => path,
             _ => {
                 missing = Some(b"manifest contains an unsafe file path");
                 return false;
@@ -550,11 +557,13 @@ fn remove_inner(
     }
 
     // Сначала проверяем весь список, чтобы не удалить половину пакета,
-    // если манифест был испорчен.
+    // если манифест был испорчен. Официальный Perfix может снять и ядро.
+    let replace_kernel =
+        paths::can_replace_kernel(package, manifest::field(data, b"maintainer"));
     let mut invalid = false;
     manifest::for_each_file(data, |entry| {
         match paths::normalize(entry) {
-            Ok(path) if paths::allowed(&path) => true,
+            Ok(path) if paths::allowed_for(&path, replace_kernel) => true,
             _ => {
                 invalid = true;
                 false

@@ -9,7 +9,7 @@
 //!   получают настоящий экран целиком, после чего pdesk перерисовывается;
 //! * `guinit` из pterm запрещён, чтобы не запустить оболочку рекурсивно.
 
-use crate::{shell, vga};
+use crate::{auth, shell, vga};
 
 /// Виртуальная консоль, в которую пишет вывод команд pterm.
 static mut CONSOLE: vga::CaptureConsole = vga::CaptureConsole::new();
@@ -67,6 +67,43 @@ pub fn run_command(command: &[u8], output: &mut [u8], prompt: &mut [u8]) -> pdes
 
     result.length = copy_screen(console.cells(), output);
     result
+}
+
+/// Выполняет команду после `elev` с проверкой пароля суперпользователя.
+///
+/// Пароль вводится в окне pterm, поэтому здесь нет консольного запроса:
+/// при неверном пароле возвращается сообщение, а команда не выполняется.
+pub fn run_elevated_command(
+    command: &[u8],
+    password: &[u8],
+    output: &mut [u8],
+    prompt: &mut [u8],
+) -> pdesk::CommandResult {
+    let mut result = pdesk::CommandResult::default();
+
+    let mut buffer = [0u8; 80];
+    let prompt_size = shell::prompt_text(&mut buffer);
+    let copy = prompt_size.min(prompt.len());
+    prompt[..copy].copy_from_slice(&buffer[..copy]);
+    result.prompt_length = copy;
+
+    let command = trim(command);
+
+    if command.is_empty() {
+        result.length = copy_message(output, b"usage: elev <command>");
+        return result;
+    }
+
+    if !auth::authorize_password(password) {
+        result.length = copy_message(output, b"elev: incorrect password");
+        return result;
+    }
+
+    auth::set_elevated(true);
+    let elevated = run_command(command, output, prompt);
+    auth::set_elevated(false);
+
+    elevated
 }
 
 /// Отбрасывает пробелы и табуляции по краям команды.

@@ -101,7 +101,7 @@ pub fn init() {
         return;
     }
 
-    let device = AtaDevice;
+    let device = AtaDevice::selected();
     let Ok(filesystem) = Ext4::mount(
         &device,
         crate::disk::selected_lba(),
@@ -502,6 +502,13 @@ fn find_user(name: &[u8]) -> Option<Account> {
 }
 
 /// Проверяет пароль суперпользователя.
+///
+/// Используется pterm: пароль вводится в окне терминала, а не в консоли,
+/// поэтому проверка выполняется без чтения клавиатуры.
+pub fn authorize_password(password: &[u8]) -> bool {
+    !login_required() || super_password_valid(password)
+}
+
 fn super_password_valid(password: &[u8]) -> bool {
     let count = unsafe { ACCOUNT_COUNT };
 

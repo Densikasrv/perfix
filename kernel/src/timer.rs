@@ -146,6 +146,17 @@ pub fn deadline(seconds: u32) -> u64 {
     rdtsc().wrapping_add(frequency.saturating_mul(seconds as u64))
 }
 
+/// Абсолютный срок в тактах TSC через `millis` миллисекунд.
+pub fn deadline_millis(millis: u32) -> u64 {
+    ensure_calibrated();
+
+    let frequency = unsafe { TICKS_PER_SECOND }.max(1);
+
+    rdtsc().wrapping_add(
+        frequency.saturating_mul(millis as u64) / 1000,
+    )
+}
+
 /// Наступил ли срок, полученный из [`deadline`].
 pub fn expired(deadline: u64) -> bool {
     // TSC монотонно растёт; разница меньше 2^63 тактов, поэтому знак

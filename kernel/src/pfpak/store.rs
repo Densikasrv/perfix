@@ -10,14 +10,20 @@ use crate::fs::ext4::{AtaDevice, Ext4, Ext4Error};
 
 pub type Error = &'static [u8];
 
-static DEVICE: AtaDevice = AtaDevice;
+static DEVICES: [AtaDevice; crate::block::MAX_DEVICES] =
+    [AtaDevice::new(0); crate::block::MAX_DEVICES];
+
+fn device() -> &'static AtaDevice {
+    let index = disk::selected_device().min(crate::block::MAX_DEVICES - 1);
+    &DEVICES[index]
+}
 
 pub fn mount_readonly() -> Result<Ext4<'static, AtaDevice>, Error> {
     if !matches!(disk::selected_kind(), disk::FsKind::Ext4) {
         return Err(b"pfpak needs an ext4 system partition");
     }
 
-    Ext4::mount(&DEVICE, disk::selected_lba(), disk::selected_sectors())
+    Ext4::mount(device(), disk::selected_lba(), disk::selected_sectors())
         .map_err(map_error)
 }
 
@@ -26,7 +32,7 @@ pub fn mount_readwrite() -> Result<Ext4<'static, AtaDevice>, Error> {
         return Err(b"pfpak needs an ext4 system partition");
     }
 
-    Ext4::mount_read_write(&DEVICE, disk::selected_lba(), disk::selected_sectors())
+    Ext4::mount_read_write(device(), disk::selected_lba(), disk::selected_sectors())
         .map_err(map_error)
 }
 

@@ -79,6 +79,7 @@ impl TransferError {
 #[derive(Clone, Copy)]
 pub struct FileLocation {
     pub kind: FsKind,
+    pub device: usize,
     pub start_lba: u32,
     pub sectors: u32,
     path: [u8; FS_PATH_MAX],
@@ -88,6 +89,7 @@ pub struct FileLocation {
 impl FileLocation {
     pub fn new(
         kind: FsKind,
+        device: usize,
         start_lba: u32,
         sectors: u32,
         path: &[u8],
@@ -98,6 +100,7 @@ impl FileLocation {
 
         let mut location = FileLocation {
             kind,
+            device,
             start_lba,
             sectors,
             path: [0u8; FS_PATH_MAX],
@@ -112,7 +115,10 @@ impl FileLocation {
     }
 
     pub fn same_file(&self, other: &FileLocation) -> bool {
-        if self.kind != other.kind || self.start_lba != other.start_lba {
+        if self.kind != other.kind
+            || self.device != other.device
+            || self.start_lba != other.start_lba
+        {
             return false;
         }
 
@@ -181,26 +187,31 @@ fn print_ext4_error(row: usize, error: crate::fs::ext4::Ext4Error) -> usize {
 }
 
 fn exfat_mount(location: &FileLocation) -> Result<exfat::fs::Volume, TransferError> {
-    exfat::fs::mount_at(&exfat::AtaDevice, location.start_lba)
-        .map_err(map_exfat_error)
+    exfat::fs::mount_at(
+        &exfat::AtaDevice::new(location.device),
+        location.start_lba,
+    )
+    .map_err(map_exfat_error)
 }
 
-fn ext4_mount_read(
+fn ext4_mount_read<'a>(
+    device: &'a crate::fs::ext4::AtaDevice,
     location: &FileLocation,
-) -> Result<crate::fs::ext4::Ext4<'_, crate::fs::ext4::AtaDevice>, TransferError> {
+) -> Result<crate::fs::ext4::Ext4<'a, crate::fs::ext4::AtaDevice>, TransferError> {
     crate::fs::ext4::Ext4::mount(
-        &crate::fs::ext4::AtaDevice,
+        device,
         location.start_lba,
         location.sectors,
     )
     .map_err(map_ext4_error)
 }
 
-fn ext4_mount_write(
+fn ext4_mount_write<'a>(
+    device: &'a crate::fs::ext4::AtaDevice,
     location: &FileLocation,
-) -> Result<crate::fs::ext4::Ext4<'_, crate::fs::ext4::AtaDevice>, TransferError> {
+) -> Result<crate::fs::ext4::Ext4<'a, crate::fs::ext4::AtaDevice>, TransferError> {
     crate::fs::ext4::Ext4::mount_read_write(
-        &crate::fs::ext4::AtaDevice,
+        device,
         location.start_lba,
         location.sectors,
     )
@@ -221,7 +232,7 @@ fn ext4_inode_for_path(
 pub fn file_size(location: &FileLocation) -> Result<u64, TransferError> {
     match location.kind {
         FsKind::Exfat => {
-            let device = exfat::AtaDevice;
+            let device = exfat::AtaDevice::new(location.device);
             let volume = exfat_mount(location)?;
             let entry = exfat::fs::resolve(
                 &device,
@@ -237,7 +248,8 @@ pub fn file_size(location: &FileLocation) -> Result<u64, TransferError> {
             Ok(entry.content_length())
         }
         FsKind::Ext4 => {
-            let filesystem = ext4_mount_read(location)?;
+            let device = crate::fs::ext4::AtaDevice::new(location.device);
+            let filesystem = ext4_mount_read(&device, location)?;
             let inode_number =
                 ext4_inode_for_path(&filesystem, location.path())?;
             let inode = filesystem
@@ -267,7 +279,7 @@ where
 {
     match location.kind {
         FsKind::Exfat => {
-            let device = exfat::AtaDevice;
+            let device = exfat::AtaDevice::new(location.device);
             let volume = exfat_mount(location)?;
             let entry = exfat::fs::resolve(
                 &device,
@@ -296,7 +308,8 @@ where
             Ok(total)
         }
         FsKind::Ext4 => {
-            let filesystem = ext4_mount_read(location)?;
+            let device = crate::fs::ext4::AtaDevice::new(location.device);
+            let filesystem = ext4_mount_read(&device, location)?;
             let inode_number =
                 ext4_inode_for_path(&filesystem, location.path())?;
             let inode = filesystem
@@ -373,7 +386,7 @@ pub fn write_file(
 ) -> Result<(), TransferError> {
     match location.kind {
         FsKind::Exfat => {
-            let device = exfat::AtaDevice;
+            let device = exfat::AtaDevice::new(location.device);
             let volume = exfat_mount(location)?;
 
             exfat::fs::write_file(
@@ -386,7 +399,8 @@ pub fn write_file(
             .map_err(map_exfat_error)
         }
         FsKind::Ext4 => {
-            let filesystem = ext4_mount_write(location)?;
+            let device = crate::fs::ext4::AtaDevice::new(location.device);
+            let filesystem = ext4_mount_write(&device, location)?;
 
             match filesystem.write_file_path(location.path(), data) {
                 Ok(_) => Ok(()),
@@ -404,7 +418,7 @@ pub fn write_file(
 pub fn remove_file(location: &FileLocation) -> Result<(), TransferError> {
     match location.kind {
         FsKind::Exfat => {
-            let device = exfat::AtaDevice;
+            let device = exfat::AtaDevice::new(location.device);
             let volume = exfat_mount(location)?;
 
             exfat::fs::remove_file(
@@ -415,7 +429,8 @@ pub fn remove_file(location: &FileLocation) -> Result<(), TransferError> {
             .map_err(map_exfat_error)
         }
         FsKind::Ext4 => {
-            let filesystem = ext4_mount_write(location)?;
+            let device = crate::fs::ext4::AtaDevice::new(location.device);
+            let filesystem = ext4_mount_write(&device, location)?;
 
             filesystem
                 .remove_file_path(location.path())
@@ -588,7 +603,7 @@ impl DirectoryFileSystem for Ext4DirectoryFileSystem {
             return 1;
         }
 
-        let device = crate::fs::ext4::AtaDevice;
+        let device = crate::fs::ext4::AtaDevice::selected();
         let ext4 = match crate::fs::ext4::Ext4::mount(
             &device,
             crate::disk::selected_lba(),
@@ -710,7 +725,7 @@ impl DirectoryFileSystem for Ext4DirectoryFileSystem {
             return 1;
         }
 
-        let device = AtaDevice;
+        let device = AtaDevice::selected();
         let ext4 = match Ext4::mount(
             &device,
             crate::disk::selected_lba(),
@@ -908,7 +923,7 @@ impl DirectoryFileSystem for Ext4DirectoryFileSystem {
             return Err(b"selected partition is not ext4");
         }
 
-        let device = crate::fs::ext4::AtaDevice;
+        let device = crate::fs::ext4::AtaDevice::selected();
         let ext4 = crate::fs::ext4::Ext4::mount(
             &device,
             crate::disk::selected_lba(),
@@ -957,7 +972,7 @@ impl DirectoryFileSystem for Ext4DirectoryFileSystem {
             }
         }
 
-        let device = AtaDevice;
+        let device = AtaDevice::selected();
         let ext4 = match Ext4::mount_read_write(
             &device,
             crate::disk::selected_lba(),
@@ -1018,7 +1033,7 @@ impl DirectoryFileSystem for Ext4DirectoryFileSystem {
             return 1;
         }
 
-        let device = AtaDevice;
+        let device = AtaDevice::selected();
         let ext4 = match Ext4::mount_read_write(
             &device,
             crate::disk::selected_lba(),
@@ -1068,7 +1083,7 @@ impl DirectoryFileSystem for Ext4DirectoryFileSystem {
             return 1;
         }
 
-        let device = AtaDevice;
+        let device = AtaDevice::selected();
         let ext4 = match Ext4::mount_read_write(
             &device,
             crate::disk::selected_lba(),
@@ -1118,7 +1133,7 @@ impl DirectoryFileSystem for Ext4DirectoryFileSystem {
             return 1;
         }
 
-        let device = AtaDevice;
+        let device = AtaDevice::selected();
         let ext4 = match Ext4::mount_read_write(
             &device,
             crate::disk::selected_lba(),

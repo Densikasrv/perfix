@@ -51,10 +51,14 @@ pub struct Extractor<'a> {
     long_name_len: usize,
     pax: [u8; MAX_PAX_SIZE],
     pax_len: usize,
+    /// Пакету разрешено заменять системное ядро `/perfix.elf`.
+    replace_kernel: bool,
 }
 
 impl<'a> Extractor<'a> {
-    pub fn new(target: &'a mut dyn Target) -> Self {
+    /// Создаёт извлекатель; `replace_kernel` открывает только официальному
+    /// пакету Perfix путь `/perfix.elf`.
+    pub fn with_kernel_access(target: &'a mut dyn Target, replace_kernel: bool) -> Self {
         Self {
             target,
             state: State::Header,
@@ -70,6 +74,7 @@ impl<'a> Extractor<'a> {
             long_name_len: 0,
             pax: [0; MAX_PAX_SIZE],
             pax_len: 0,
+            replace_kernel,
         }
     }
 
@@ -157,7 +162,7 @@ impl<'a> Extractor<'a> {
                     return Err(b"tar file is too large");
                 }
 
-                if !paths::allowed(&normalized) {
+                if !paths::allowed_for(&normalized, self.replace_kernel) {
                     return Err(b"package writes outside allowed paths");
                 }
 
@@ -181,7 +186,7 @@ impl<'a> Extractor<'a> {
                 self.state = State::Data;
             }
             b'5' => {
-                if !paths::allowed(&normalized) {
+                if !paths::allowed_for(&normalized, self.replace_kernel) {
                     return Err(b"package creates directory outside allowed paths");
                 }
 
@@ -318,7 +323,7 @@ impl<'a> Extractor<'a> {
             let path = self.entry_path()?;
             let normalized = paths::normalize(&path)?;
 
-            if !paths::allowed(&normalized) {
+            if !paths::allowed_for(&normalized, self.replace_kernel) {
                 arena::release(self.file_mark);
                 return Err(b"package writes outside allowed paths");
             }

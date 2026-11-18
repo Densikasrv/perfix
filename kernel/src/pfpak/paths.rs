@@ -123,6 +123,13 @@ const PROTECTED: [&[u8]; 5] = [
     b"/boot",
 ];
 
+/// Пакет, которому разрешено заменять системное ядро.
+pub const KERNEL_PACKAGE: &[u8] = b"perfix";
+/// Мейнтейнер, которому разрешено заменять системное ядро.
+pub const KERNEL_MAINTAINER: &[u8] = b"Densikasrv";
+/// Путь системного ядра, защищённый от обычных пакетов.
+pub const KERNEL_PATH: &[u8] = b"/perfix.elf";
+
 fn under(path: &[u8], prefix: &[u8]) -> bool {
     path == prefix
         || (path.len() > prefix.len()
@@ -130,9 +137,21 @@ fn under(path: &[u8], prefix: &[u8]) -> bool {
             && path[prefix.len()] == b'/')
 }
 
-/// Разрешена ли запись по нормализованному пути.
-pub fn allowed(path: &Path) -> bool {
+/// Может ли пакет с таким именем и мейнтейнером заменять `/perfix.elf`.
+///
+/// Перезапись ядра — исключение только для официального пакета Perfix:
+/// все остальные пакеты видят `/perfix.elf` защищённым.
+pub fn can_replace_kernel(package: &[u8], maintainer: Option<&[u8]>) -> bool {
+    package == KERNEL_PACKAGE && maintainer == Some(KERNEL_MAINTAINER)
+}
+
+/// Разрешена ли запись по пути с учётом доверенного пакета Perfix.
+pub fn allowed_for(path: &Path, replace_kernel: bool) -> bool {
     let bytes = path.as_bytes();
+
+    if replace_kernel && bytes == KERNEL_PATH {
+        return true;
+    }
 
     if PROTECTED.iter().any(|prefix| under(bytes, prefix)) {
         return false;

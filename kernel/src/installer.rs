@@ -15,6 +15,64 @@ use crate::fs::ext4::{AtaDevice, Ext4};
 const MAX_MODULES: usize = 8;
 /// Сколько ext4-разделов показываем как цели установки.
 const MAX_TARGETS: usize = 8;
+/// Меню GRUB установленной системы.
+///
+/// `gfxpayload` задаётся после `multiboot`: при разборе заголовка GRUB
+/// перезаписывает его значением из Multiboot-заголовка.
+const INSTALLED_GRUB_CONFIG: &[u8] = b"\
+set timeout=3
+set default=0
+
+menuentry \"Perfix\" {
+    search --no-floppy --file --set=root /perfix.elf
+    multiboot /perfix.elf
+    set gfxpayload=1024x768x32,1024x768x24,1024x768x16,800x600x32,800x600x24,800x600x16
+    boot
+}
+
+menuentry \"Perfix (1920x1080)\" {
+    search --no-floppy --file --set=root /perfix.elf
+    multiboot /perfix.elf
+    set gfxpayload=1920x1080x32
+    boot
+}
+
+menuentry \"Perfix (800x600)\" {
+    search --no-floppy --file --set=root /perfix.elf
+    multiboot /perfix.elf
+    set gfxpayload=800x600x32,800x600x24,800x600x16
+    boot
+}
+
+menuentry \"Perfix (1024x768, 16-bit)\" {
+    search --no-floppy --file --set=root /perfix.elf
+    multiboot /perfix.elf
+    set gfxpayload=1024x768x16
+    boot
+}
+
+menuentry \"Perfix (1024x768, 24-bit)\" {
+    search --no-floppy --file --set=root /perfix.elf
+    multiboot /perfix.elf
+    set gfxpayload=1024x768x24
+    boot
+}
+
+menuentry \"Perfix (800x600, 16-bit)\" {
+    search --no-floppy --file --set=root /perfix.elf
+    multiboot /perfix.elf
+    set gfxpayload=800x600x16
+    boot
+}
+
+menuentry \"Perfix (VGA text mode)\" {
+    search --no-floppy --file --set=root /perfix.elf
+    multiboot /perfix.elf
+    set gfxpayload=text
+    boot
+}
+";
+
 /// Начальный LBA для `core.img` (сразу после MBR).
 const CORE_IMAGE_LBA: u32 = 1;
 /// Смещение поля core image LBA в `boot.img`.
@@ -50,6 +108,7 @@ pub enum InstallError {
     KernelWriteFailed,
     BootWriteFailed,
     CoreWriteFailed,
+    GrubConfigWriteFailed,
     MarkerWriteFailed,
     AccountsWriteFailed,
     SystemFilesWriteFailed,
@@ -69,6 +128,9 @@ impl InstallError {
             InstallError::KernelWriteFailed => b"could not write /perfix.elf",
             InstallError::BootWriteFailed => b"could not write boot.img to MBR",
             InstallError::CoreWriteFailed => b"could not write core.img after MBR",
+            InstallError::GrubConfigWriteFailed => {
+                b"could not write /boot/grub/grub.cfg"
+            }
             InstallError::MarkerWriteFailed => b"could not write /etc/InstallSuccess",
             InstallError::AccountsWriteFailed => {
                 b"could not create /etc/users or /home/<user>"
@@ -115,6 +177,23 @@ const REPO_LIST_CONTENT: &[u8] =
     b"https://raw.githubusercontent.com/Densikasrv/pfpak-repo/tree/main/pfpak RELEASE:fatcat\n";
 /// Обычный PEM-набор корневых сертификатов для программ на диске.
 const CA_BUNDLE_PATH: &[u8] = b"/etc/ssl/certs/ca-certificates.crt";
+/// Каталог установленного пакета perfix.
+const PERFIX_PACKAGE_DIR: &[u8] = b"/etc/pfpak/InstalledPaks/perfix";
+/// Манифест установленного пакета perfix.
+const PERFIX_MANIFEST_PATH: &[u8] = b"/etc/pfpak/InstalledPaks/perfix/MANIFEST";
+/// Манифест базового пакета perfix: единственный файл — системное ядро.
+///
+/// Благодаря этой записи `pfpak list` на свежеустановленной системе сразу
+/// показывает perfix, а `pfpak info perfix` — версию, мейнтейнера и файл
+/// `/perfix.elf`. Версия должна совпадать с версией собираемого образа.
+const PERFIX_MANIFEST: &[u8] = b"name: perfix\n\
+version: 0.2.9\n\
+maintainer: Densikasrv\n\
+description: Perfix operating system kernel and boot files\n\
+size: 0\n\
+depends:\n\
+files:\n\
+/perfix.elf\n";
 
 fn mbi_u32(multiboot_info: u32, offset: usize) -> u32 {
     unsafe {
@@ -239,12 +318,7 @@ pub fn detect_installed() {
         return;
     }
 
-    let mut partitions = [DiskPartition {
-        number: 0,
-        kind: FsKind::Other,
-        start_lba: 0,
-        sectors: 0,
-    }; MAX_TARGETS];
+    let mut partitions = [DiskPartition::EMPTY; MAX_TARGETS];
     let count = disk::read_partitions(&mut partitions);
 
     for partition in partitions[..count].iter() {
@@ -252,8 +326,9 @@ pub fn detect_installed() {
             continue;
         }
 
+        let device = AtaDevice::new(partition.device);
         let Ok(filesystem) =
-            Ext4::mount(&AtaDevice, partition.start_lba, partition.sectors)
+            Ext4::mount(&device, partition.start_lba, partition.sectors)
         else {
             continue;
         };
@@ -276,12 +351,7 @@ fn read_ext4_partitions(out: &mut [DiskPartition]) -> usize {
 /// ext4 можно ставить сразу; остальные разделы доступны только с
 /// явным форматированием.
 pub fn targets(out: &mut [InstallTarget]) -> usize {
-    let mut partitions = [DiskPartition {
-        number: 0,
-        kind: FsKind::Other,
-        start_lba: 0,
-        sectors: 0,
-    }; MAX_TARGETS];
+    let mut partitions = [DiskPartition::EMPTY; MAX_TARGETS];
     let count = read_ext4_partitions(&mut partitions);
     let mut found = 0usize;
 
@@ -290,7 +360,7 @@ pub fn targets(out: &mut [InstallTarget]) -> usize {
             break;
         }
 
-        if is_extended_container(partition.number) {
+        if is_extended_type(partition.partition_type) {
             continue;
         }
 
@@ -306,19 +376,7 @@ pub fn targets(out: &mut [InstallTarget]) -> usize {
 }
 
 /// Типы MBR, которые обозначают контейнер расширенных разделов.
-fn is_extended_container(number: usize) -> bool {
-    if number == 0 || number > 4 {
-        return false;
-    }
-
-    let mut mbr = [0u8; 512];
-    if crate::ata::read_sector(0, &mut mbr).is_err() {
-        return false;
-    }
-
-    let offset = 446 + (number - 1) * 16;
-    let partition_type = mbr[offset + 4];
-
+fn is_extended_type(partition_type: u8) -> bool {
     partition_type == 0x05 || partition_type == 0x0F || partition_type == 0x85
 }
 
@@ -327,12 +385,7 @@ fn find_partition(
     number: usize,
     require_ext4: bool,
 ) -> Result<DiskPartition, InstallError> {
-    let mut partitions = [DiskPartition {
-        number: 0,
-        kind: FsKind::Other,
-        start_lba: 0,
-        sectors: 0,
-    }; MAX_TARGETS];
+    let mut partitions = [DiskPartition::EMPTY; MAX_TARGETS];
     let count = read_ext4_partitions(&mut partitions);
 
     let partition = partitions[..count]
@@ -353,43 +406,60 @@ fn find_partition(
 /// Форматировать можно только обычный раздел MBR; контейнер расширенных
 /// разделов и GPT отклоняются.
 pub fn format_partition(number: usize) -> Result<(), InstallError> {
+    let partition = find_partition(number, false)?;
+
+    if partition.partition_type == 0xEE || is_extended_type(partition.partition_type) {
+        return Err(InstallError::NotMbr);
+    }
+
     let mut mbr = [0u8; 512];
-    crate::ata::read_sector(0, &mut mbr).map_err(|_| InstallError::NotMbr)?;
+    crate::block::read_sector(partition.device, 0, &mut mbr)
+        .map_err(|_| InstallError::NotMbr)?;
 
     if mbr[510] != 0x55 || mbr[511] != 0xAA {
         return Err(InstallError::NotMbr);
     }
 
-    if number == 0 || number > 4 {
-        return Err(InstallError::PartitionNotFound);
-    }
-
-    let entry = 446 + (number - 1) * 16;
-    let partition_type = mbr[entry + 4];
-    let start_lba = read_u32(&mbr, entry + 8);
-    let sectors = read_u32(&mbr, entry + 12);
-
-    if partition_type == 0xEE {
+    if mbr[446 + 4] == 0xEE {
         return Err(InstallError::NotMbr);
     }
 
-    if partition_type == 0
-        || sectors == 0
-        || partition_type == 0x05
-        || partition_type == 0x0F
-        || partition_type == 0x85
-    {
+    // Раздел должен быть записан в MBR как обычный (не расширенный).
+    let mut found = false;
+
+    for index in 0..4 {
+        let entry = 446 + index * 16;
+        let partition_type = mbr[entry + 4];
+        let start_lba = read_u32(&mbr, entry + 8);
+        let sectors = read_u32(&mbr, entry + 12);
+
+        if partition_type == 0
+            || sectors == 0
+            || is_extended_type(partition_type)
+            || partition_type == 0xEE
+        {
+            continue;
+        }
+
+        if start_lba == partition.start_lba && sectors == partition.sectors {
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
         return Err(InstallError::PartitionNotFound);
     }
 
-    let partition = find_partition(number, false)?;
-    if partition.start_lba != start_lba || partition.sectors != sectors {
-        return Err(InstallError::PartitionNotFound);
-    }
+    let device = AtaDevice::new(partition.device);
 
-    crate::fs::ext4::format_ext4(&AtaDevice, start_lba, sectors)
-        .map_err(|_| InstallError::FormatFailed)?;
-    let _ = crate::ata::flush();
+    crate::fs::ext4::format_ext4(
+        &device,
+        partition.start_lba,
+        partition.sectors,
+    )
+    .map_err(|_| InstallError::FormatFailed)?;
+    let _ = crate::block::flush(partition.device);
 
     Ok(())
 }
@@ -432,7 +502,7 @@ fn validate_mbr_gap(mbr: &[u8; 512], core_end: u32) -> Result<(), InstallError> 
     Ok(())
 }
 
-fn write_core_image(core: &[u8]) -> Result<(), InstallError> {
+fn write_core_image(device: usize, core: &[u8]) -> Result<(), InstallError> {
     let sectors = (core.len() + 511) / 512;
     let mut offset = 0usize;
 
@@ -442,7 +512,8 @@ fn write_core_image(core: &[u8]) -> Result<(), InstallError> {
         let take = remaining.min(buffer.len());
         buffer[..take].copy_from_slice(&core[offset..offset + take]);
 
-        crate::ata::write_sector(
+        crate::block::write_sector(
+            device,
             CORE_IMAGE_LBA + index as u32,
             &buffer,
         )
@@ -475,7 +546,9 @@ pub fn install_with_format(
 
     let partition = find_partition(partition_number, !format)?;
 
-    if is_extended_container(partition_number) {
+    if partition.partition_type == 0xEE
+        || is_extended_type(partition.partition_type)
+    {
         return Err(InstallError::PartitionNotFound);
     }
     let core_sectors = ((core_image.len() + 511) / 512) as u32;
@@ -486,7 +559,8 @@ pub fn install_with_format(
     // Читаем текущий MBR заранее: установка на GPT-диск или диск без
     // достаточного промежутка после MBR должна быть отклонена до записи.
     let mut mbr = [0u8; 512];
-    crate::ata::read_sector(0, &mut mbr).map_err(|_| InstallError::NotMbr)?;
+    crate::block::read_sector(partition.device, 0, &mut mbr)
+        .map_err(|_| InstallError::NotMbr)?;
     validate_mbr_gap(&mbr, core_end)?;
 
     if core_end > partition.start_lba {
@@ -495,9 +569,11 @@ pub fn install_with_format(
 
     // Разрушительное форматирование выполняется только после всех
     // проверок, чтобы ошибка установки не уничтожила файловую систему.
+    let disk_device = AtaDevice::new(partition.device);
+
     if format {
         crate::fs::ext4::format_ext4(
-            &AtaDevice,
+            &disk_device,
             partition.start_lba,
             partition.sectors,
         )
@@ -506,7 +582,7 @@ pub fn install_with_format(
 
     // Сначала ядро: если запись не удалась, загрузчик не тронут.
     let filesystem = Ext4::mount_read_write(
-        &AtaDevice,
+        &disk_device,
         partition.start_lba,
         partition.sectors,
     )
@@ -515,6 +591,16 @@ pub fn install_with_format(
     filesystem
         .write_file_path(b"/perfix.elf", kernel)
         .map_err(|_| InstallError::KernelWriteFailed)?;
+
+    // Меню установленной системы. Раньше режим задавался только
+    // заголовком Multiboot, и на старых видеокартах нельзя было выбрать
+    // безопасное разрешение. Теперь core.img загружает этот конфиг.
+    filesystem
+        .ensure_directory_path(b"/boot/grub")
+        .map_err(|_| InstallError::GrubConfigWriteFailed)?;
+    filesystem
+        .write_file_path(b"/boot/grub/grub.cfg", INSTALLED_GRUB_CONFIG)
+        .map_err(|_| InstallError::GrubConfigWriteFailed)?;
 
     let mut boot_sector = [0u8; 512];
     boot_sector.copy_from_slice(&boot_image[..512]);
@@ -529,10 +615,10 @@ pub fn install_with_format(
         .copy_from_slice(&(CORE_IMAGE_LBA as u64).to_le_bytes());
     boot_sector[BOOT_IMAGE_DRIVE_OFFSET] = 0xff;
 
-    crate::ata::write_sector(0, &boot_sector)
+    crate::block::write_sector(partition.device, 0, &boot_sector)
         .map_err(|_| InstallError::BootWriteFailed)?;
 
-    write_core_image(core_image)?;
+    write_core_image(partition.device, core_image)?;
 
     // Учётные записи и домашний каталог. Без них установленная система
     // загрузилась бы в режиме root без входа.
@@ -588,6 +674,16 @@ pub fn install_with_format(
         .write_file_path(REPO_LIST_PATH, REPO_LIST_CONTENT)
         .map_err(|_| InstallError::SystemFilesWriteFailed)?;
 
+    // Базовый пакет perfix: установленная система сразу знает, что ядро
+    // /perfix.elf принадлежит пакету perfix 0.2.9 от Densikasrv.
+    filesystem
+        .ensure_directory_path(PERFIX_PACKAGE_DIR)
+        .map_err(|_| InstallError::SystemFilesWriteFailed)?;
+
+    filesystem
+        .write_file_path(PERFIX_MANIFEST_PATH, PERFIX_MANIFEST)
+        .map_err(|_| InstallError::SystemFilesWriteFailed)?;
+
     // Корневые сертификаты: ядро доверяет встроенному набору, а этот
     // PEM-бандл нужен остальным программам на установленной системе.
     filesystem
@@ -626,7 +722,7 @@ pub fn install_with_format(
         .write_file_path(SUCCESS_MARKER, SUCCESS_TEXT)
         .map_err(|_| InstallError::MarkerWriteFailed)?;
 
-    let _ = crate::ata::flush();
+    let _ = crate::block::flush(partition.device);
 
     Ok(())
 }

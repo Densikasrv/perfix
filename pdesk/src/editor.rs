@@ -114,6 +114,9 @@ pub struct Editor {
     len: usize,
     cursor: usize,
     top_offset: usize,
+    /// Сколько столбцов и строк текста помещается в текущем окне.
+    view_columns: usize,
+    view_rows: usize,
     /// Абсолютный путь к файлу (для dock-запуска — `untitled`).
     name: [u8; PATH_CAPACITY],
     name_len: usize,
@@ -144,6 +147,8 @@ impl Editor {
             len: 0,
             cursor: 0,
             top_offset: 0,
+            view_columns: COLUMNS,
+            view_rows: ROWS,
             name: [0; PATH_CAPACITY],
             name_len: 0,
             dirty: false,
@@ -222,10 +227,22 @@ impl Editor {
     /// логической строки не ограничена видимой шириной окна.
     fn columns(&self) -> usize {
         if self.wrap {
-            COLUMNS
+            self.view_columns
         } else {
             MAX_TEXT * 2
         }
+    }
+
+    /// Запоминает, сколько знакомест текста помещается в окне.
+    ///
+    /// Вызывается при каждой отрисовке: окно можно растянуть или сжать
+    /// мышью, и перенос строк должен следовать за его шириной.
+    fn set_viewport(&mut self, area: Rect) {
+        self.view_columns = (((area.width - TEXT_LEFT - TEXT_RIGHT - SCROLLBAR_WIDTH)
+            / CHAR_WIDTH)
+            .clamp(1, COLUMNS as i32)) as usize;
+        self.view_rows = (((area.height - MENU_HEIGHT - STATUS_HEIGHT) / CHAR_HEIGHT)
+            .clamp(1, ROWS as i32)) as usize;
     }
 
     /// Просит закрыть редактор: при изменениях сначала показывает вопрос.
@@ -246,12 +263,21 @@ impl Editor {
         }
     }
 
-    /// Открывает диалог Save As. Поле заранее заполняется домашним
-    /// каталогом пользователя, чтобы новые файлы сохранялись туда.
+    /// Открывает диалог Save As. Поле заранее заполняется текущим путём
+    /// файла, чтобы его можно было сохранить поверх, не набирая имя
+    /// заново. Для документа без пути используется домашний каталог.
     fn request_save_as(&mut self, platform: &mut dyn Platform) {
         self.mode = Mode::SaveAs;
         self.menu = None;
         self.save_as_len = 0;
+
+        if self.name_len > 0 {
+            self.save_as_len = self.name_len.min(PATH_CAPACITY);
+            self.save_as_path[..self.save_as_len]
+                .copy_from_slice(&self.name[..self.save_as_len]);
+            self.set_status(b"Save as: enter a file name", false);
+            return;
+        }
 
         let mut home = [0u8; PATH_CAPACITY];
         let length = platform.home_dir(&mut home).min(PATH_CAPACITY);
@@ -498,14 +524,14 @@ impl Editor {
             }
             Key::PageUp => {
                 self.clear_status();
-                for _ in 0..ROWS.saturating_sub(1) {
+                for _ in 0..self.view_rows.saturating_sub(1) {
                     self.move_up();
                 }
                 EditorOutcome::Redraw
             }
             Key::PageDown => {
                 self.clear_status();
-                for _ in 0..ROWS.saturating_sub(1) {
+                for _ in 0..self.view_rows.saturating_sub(1) {
                     self.move_down();
                 }
                 EditorOutcome::Redraw
@@ -744,10 +770,12 @@ impl Editor {
             return ClickOutcome::Redraw;
         }
 
+        self.set_viewport(area);
+
         let text_x = area.x + TEXT_LEFT;
         let text_y = area.y + TEXT_TOP;
         let text_width = area.width - TEXT_LEFT - TEXT_RIGHT - SCROLLBAR_WIDTH;
-        let text_height = ROWS as i32 * CHAR_HEIGHT;
+        let text_height = self.view_rows as i32 * CHAR_HEIGHT;
 
         if x < text_x || x >= text_x + text_width || y < text_y || y >= text_y + text_height {
             return ClickOutcome::Ignored;
@@ -761,7 +789,7 @@ impl Editor {
             data,
             self.top_offset,
             row,
-            col.min(COLUMNS - 1),
+            col.min(self.view_columns - 1),
             self.columns(),
         );
         self.mode = Mode::Edit;
@@ -829,13 +857,14 @@ impl Editor {
         let columns = self.columns();
         let mut cursor = self.cursor;
         let mut top = self.top_offset;
-        ensure_visible_in(data, &mut cursor, &mut top, columns);
+        ensure_visible_in(data, &mut cursor, &mut top, columns, self.view_rows);
         self.cursor = cursor;
         self.top_offset = top;
     }
 
     /// Рисует редактор в клиентской области окна.
     pub fn paint(&mut self, platform: &mut dyn Platform, area: Rect) {
+        self.set_viewport(area);
         platform.fill_rect(area.x, area.y, area.width, area.height, PAPER);
 
         // Строка меню, как в «Блокноте».
@@ -882,7 +911,7 @@ impl Editor {
         let columns = self.columns();
         let mut pos = self.top_offset.min(data.len());
 
-        for row in 0..ROWS {
+        for row in 0..self.view_rows {
             let mut line = [b' '; COLUMNS];
             let mut col = 0usize;
 
@@ -900,7 +929,7 @@ impl Editor {
             platform.draw_text(
                 area.x + TEXT_LEFT,
                 area.y + TEXT_TOP + row as i32 * CHAR_HEIGHT,
-                &line,
+                &line[..self.view_columns],
                 INK,
                 PAPER,
             );
@@ -928,7 +957,7 @@ impl Editor {
         // Каретка — тонкая вертикальная черта.
         if self.mode != Mode::SaveAs {
             let (row, col) = cursor_screen(data, self.cursor, self.top_offset, columns);
-            let col = col.min(COLUMNS - 1);
+            let col = col.min(self.view_columns - 1);
 
             platform.fill_rect(
                 area.x + TEXT_LEFT + col as i32 * CHAR_WIDTH,
@@ -1089,12 +1118,12 @@ impl Editor {
     ) {
         let track_x = area.x + area.width - SCROLLBAR_WIDTH;
         let track_y = area.y + TEXT_TOP;
-        let track_height = ROWS as i32 * CHAR_HEIGHT;
+        let track_height = self.view_rows as i32 * CHAR_HEIGHT;
 
         platform.fill_rect(track_x, track_y, SCROLLBAR_WIDTH, track_height, SCROLL_TRACK);
 
         let total_rows = total_visual_rows(data, columns).max(1);
-        let visible = ROWS;
+        let visible = self.view_rows;
         let thumb_height = (track_height * visible as i32 / total_rows as i32)
             .clamp(12, track_height);
         let top_row = visual_rows_before(data, self.top_offset, columns);
@@ -1303,7 +1332,13 @@ fn next_row_start(data: &[u8], offset: usize, columns: usize) -> usize {
     data.len()
 }
 
-fn ensure_visible_in(data: &[u8], cursor: &mut usize, top: &mut usize, columns: usize) {
+fn ensure_visible_in(
+    data: &[u8],
+    cursor: &mut usize,
+    top: &mut usize,
+    columns: usize,
+    rows: usize,
+) {
     if *cursor > data.len() {
         *cursor = data.len();
     }
@@ -1321,7 +1356,7 @@ fn ensure_visible_in(data: &[u8], cursor: &mut usize, top: &mut usize, columns: 
     loop {
         let (row, _) = cursor_screen(data, *cursor, *top, columns);
 
-        if row < ROWS {
+        if row < rows {
             break;
         }
 

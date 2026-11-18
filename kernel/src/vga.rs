@@ -12,7 +12,6 @@ pub const COLOR_INVERSE: u8 = 0x70;
 
 const GLYPH_WIDTH: usize = 8;
 const GLYPH_HEIGHT: usize = 16;
-const BYTES_PER_PIXEL: usize = 4;
 
 const VGA: *mut u8 = 0xb8000 as *mut u8;
 const FONT_RAM: *mut u8 = 0xa0000 as *mut u8;
@@ -30,6 +29,13 @@ pub struct FramebufferInfo {
     pub height: u32,
     pub bpp: u8,
     pub kind: u8,
+    /// Позиции и размеры цветовых полей (из Multiboot).
+    pub red_position: u8,
+    pub red_size: u8,
+    pub green_position: u8,
+    pub green_size: u8,
+    pub blue_position: u8,
+    pub blue_size: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,7 +49,16 @@ static mut SCREEN_WIDTH: usize = 80;
 static mut SCREEN_HEIGHT: usize = 25;
 static mut FRAMEBUFFER: *mut u8 = core::ptr::null_mut();
 static mut PITCH: usize = 0;
+static mut PIXEL_WIDTH: usize = 0;
 static mut PIXEL_HEIGHT: usize = 0;
+/// Байт на пиксель: 2 для 15/16 бит, 3 для 24, 4 для 32.
+static mut PIXEL_BYTES: usize = 4;
+static mut RED_POSITION: u8 = 16;
+static mut RED_SIZE: u8 = 8;
+static mut GREEN_POSITION: u8 = 8;
+static mut GREEN_SIZE: u8 = 8;
+static mut BLUE_POSITION: u8 = 0;
+static mut BLUE_SIZE: u8 = 8;
 static mut CURSOR: Option<(usize, usize)> = None;
 static mut CONSOLE: [u8; MAX_WIDTH * MAX_HEIGHT * 2] =
     [0; MAX_WIDTH * MAX_HEIGHT * 2];
@@ -61,7 +76,7 @@ const PALETTE: [u32; 16] = [
 pub fn init(info: Option<FramebufferInfo>) {
     if let Some(info) = info {
         if info.kind == 1
-            && info.bpp == 32
+            && matches!(info.bpp, 15 | 16 | 24 | 32)
             && info.address != 0
             && info.address <= u32::MAX as u64
         {
@@ -77,7 +92,41 @@ pub fn init(info: Option<FramebufferInfo>) {
                         .max(25);
                     FRAMEBUFFER = info.address as *mut u8;
                     PITCH = info.pitch as usize;
+                    PIXEL_WIDTH = info.width as usize;
                     PIXEL_HEIGHT = info.height as usize;
+                    PIXEL_BYTES = if info.bpp <= 16 {
+                        2
+                    } else if info.bpp <= 24 {
+                        3
+                    } else {
+                        4
+                    };
+
+                    if info.red_size > 0 && info.green_size > 0 && info.blue_size > 0 {
+                        RED_POSITION = info.red_position;
+                        RED_SIZE = info.red_size;
+                        GREEN_POSITION = info.green_position;
+                        GREEN_SIZE = info.green_size;
+                        BLUE_POSITION = info.blue_position;
+                        BLUE_SIZE = info.blue_size;
+                    } else {
+                        // Старые загрузчики не заполняют поля — берём
+                        // стандартные раскладки VBE.
+                        let (red, green, blue, red_size, green_size, blue_size) =
+                            match info.bpp {
+                                15 => (10, 5, 0, 5, 5, 5),
+                                16 => (11, 5, 0, 5, 6, 5),
+                                _ => (16, 8, 0, 8, 8, 8),
+                            };
+
+                        RED_POSITION = red;
+                        RED_SIZE = red_size;
+                        GREEN_POSITION = green;
+                        GREEN_SIZE = green_size;
+                        BLUE_POSITION = blue;
+                        BLUE_SIZE = blue_size;
+                    }
+
                     MODE = Mode::Framebuffer;
                     CURSOR = None;
                 }
@@ -92,6 +141,8 @@ pub fn init(info: Option<FramebufferInfo>) {
         MODE = Mode::Text;
         SCREEN_WIDTH = 80;
         SCREEN_HEIGHT = 25;
+        PIXEL_WIDTH = 0;
+        PIXEL_HEIGHT = 0;
         CURSOR = None;
     }
 }
@@ -196,6 +247,84 @@ fn console_load(row: usize, col: usize) -> (u8, u8) {
     unsafe { (CONSOLE[index], CONSOLE[index + 1]) }
 }
 
+/// Переводит 8-битную компоненту в поле заданной ширины.
+fn scale_component(value: u32, bits: u8) -> u32 {
+    if bits >= 8 {
+        value << (bits - 8).min(24)
+    } else if bits == 0 {
+        0
+    } else {
+        value >> (8 - bits)
+    }
+}
+
+/// Собирает цвет `0x00RRGGBB` в аппаратный формат framebuffer.
+fn pack_color(color: u32) -> u32 {
+    let (red_position, red_size) = unsafe { (RED_POSITION, RED_SIZE) };
+    let (green_position, green_size) = unsafe { (GREEN_POSITION, GREEN_SIZE) };
+    let (blue_position, blue_size) = unsafe { (BLUE_POSITION, BLUE_SIZE) };
+
+    (scale_component((color >> 16) & 0xff, red_size) << red_position)
+        | (scale_component((color >> 8) & 0xff, green_size) << green_position)
+        | (scale_component(color & 0xff, blue_size) << blue_position)
+}
+
+/// Разбирает аппаратный пиксель обратно в `0x00RRGGBB`.
+fn unpack_color(raw: u32) -> u32 {
+    let (red_position, red_size) = unsafe { (RED_POSITION, RED_SIZE) };
+    let (green_position, green_size) = unsafe { (GREEN_POSITION, GREEN_SIZE) };
+    let (blue_position, blue_size) = unsafe { (BLUE_POSITION, BLUE_SIZE) };
+
+    fn component(raw: u32, position: u8, bits: u8) -> u32 {
+        if bits == 0 {
+            return 0;
+        }
+
+        let mask = if bits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << bits) - 1
+        };
+        let value = (raw >> position) & mask;
+
+        if bits >= 8 {
+            value >> (bits - 8).min(24)
+        } else {
+            value << (8 - bits)
+        }
+    }
+
+    (component(raw, red_position, red_size) << 16)
+        | (component(raw, green_position, green_size) << 8)
+        | component(raw, blue_position, blue_size)
+}
+
+fn read_pixel_raw(framebuffer: *const u8, offset: usize) -> u32 {
+    unsafe {
+        match PIXEL_BYTES {
+            2 => (framebuffer.add(offset) as *const u16).read_volatile() as u32,
+            3 => framebuffer.add(offset).read_volatile() as u32
+                | ((framebuffer.add(offset + 1).read_volatile() as u32) << 8)
+                | ((framebuffer.add(offset + 2).read_volatile() as u32) << 16),
+            _ => (framebuffer.add(offset) as *const u32).read_volatile(),
+        }
+    }
+}
+
+fn store_pixel_raw(framebuffer: *mut u8, offset: usize, value: u32) {
+    unsafe {
+        match PIXEL_BYTES {
+            2 => (framebuffer.add(offset) as *mut u16).write_volatile(value as u16),
+            3 => {
+                framebuffer.add(offset).write_volatile(value as u8);
+                framebuffer.add(offset + 1).write_volatile((value >> 8) as u8);
+                framebuffer.add(offset + 2).write_volatile((value >> 16) as u8);
+            }
+            _ => (framebuffer.add(offset) as *mut u32).write_volatile(value),
+        }
+    }
+}
+
 fn fb_pixel(x: usize, y: usize, color: u32) {
     let pitch = unsafe { PITCH };
     let framebuffer = unsafe { FRAMEBUFFER };
@@ -204,11 +333,8 @@ fn fb_pixel(x: usize, y: usize, color: u32) {
         return;
     }
 
-    let offset = y * pitch + x * BYTES_PER_PIXEL;
-
-    unsafe {
-        (framebuffer.add(offset) as *mut u32).write_volatile(color);
-    }
+    let offset = y * pitch + x * unsafe { PIXEL_BYTES };
+    store_pixel_raw(framebuffer, offset, pack_color(color));
 }
 
 fn draw_cell(row: usize, col: usize, byte: u8, color: u8) {
@@ -502,17 +628,13 @@ pub fn scroll_screen_lines(lines: usize) {
                     let shift_bytes = lines * row_pitch_bytes;
                     let total_bytes = (height - lines) * row_pitch_bytes;
 
-                    copy_dwords(
+                    copy_bytes(
                         framebuffer.add(shift_bytes) as usize,
                         framebuffer as usize,
-                        total_bytes / 4,
+                        total_bytes,
                     );
                     // Нижние строки очищаем одним быстрым заполнением.
-                    fill_dwords(
-                        framebuffer.add(total_bytes) as usize,
-                        shift_bytes / 4,
-                        0,
-                    );
+                    fill_bytes(framebuffer.add(total_bytes) as usize, shift_bytes, 0);
                 }
 
                 CURSOR = None;
@@ -735,12 +857,21 @@ pub fn is_graphics() -> bool {
 
 /// Ширина экрана в пикселях (0 в текстовом режиме).
 pub fn pixel_width() -> usize {
-    unsafe { PITCH / BYTES_PER_PIXEL }
+    unsafe { PIXEL_WIDTH }
 }
 
 /// Высота экрана в пикселях (0 в текстовом режиме).
 pub fn pixel_height() -> usize {
     unsafe { PIXEL_HEIGHT }
+}
+
+/// Глубина цвета framebuffer в битах (0 в текстовом режиме).
+pub fn bits_per_pixel() -> usize {
+    if mode() == Mode::Framebuffer {
+        unsafe { PIXEL_BYTES * 8 }
+    } else {
+        0
+    }
 }
 
 /// Отсекает прямоугольник по границам экрана.
@@ -788,9 +919,9 @@ pub fn get_pixel(x: i32, y: i32) -> u32 {
         return 0;
     }
 
-    let offset = y as usize * pitch + x as usize * BYTES_PER_PIXEL;
+    let offset = y as usize * pitch + x as usize * unsafe { PIXEL_BYTES };
 
-    unsafe { (framebuffer.add(offset) as *const u32).read_volatile() }
+    unpack_color(read_pixel_raw(framebuffer, offset))
 }
 
 /// Заливает `count` 32-битных слов значением `color`.
@@ -812,6 +943,83 @@ fn fill_dwords(destination: usize, count: usize, color: u32) {
             inout("ecx") count as u32 => _,
             options(nostack)
         );
+    }
+}
+
+/// Заливает `count` 16-битных слов значением `color`.
+fn fill_words(destination: usize, count: usize, color: u16) {
+    if count == 0 {
+        return;
+    }
+
+    unsafe {
+        asm!(
+            "cld",
+            "rep stosw",
+            in("edi") destination as u32,
+            in("eax") color as u32,
+            inout("ecx") count as u32 => _,
+            options(nostack)
+        );
+    }
+}
+
+/// Заливает `count` байт значением `value`.
+fn fill_bytes(destination: usize, count: usize, value: u8) {
+    if count == 0 {
+        return;
+    }
+
+    unsafe {
+        asm!(
+            "cld",
+            "rep stosb",
+            in("edi") destination as u32,
+            in("eax") value as u32,
+            inout("ecx") count as u32 => _,
+            options(nostack)
+        );
+    }
+}
+
+/// Копирует `count` байт вперёд (src > dst).
+fn copy_bytes(source: usize, destination: usize, count: usize) {
+    if count == 0 {
+        return;
+    }
+
+    unsafe {
+        asm!(
+            "push esi",
+            "push edi",
+            "mov esi, eax",
+            "mov edi, edx",
+            "cld",
+            "rep movsb",
+            "pop edi",
+            "pop esi",
+            in("eax") source as u32,
+            in("edx") destination as u32,
+            inout("ecx") count as u32 => _,
+        );
+    }
+}
+
+/// Заливает `count` пикселей заданным цветом.
+fn fill_pixels(destination: usize, count: usize, color: u32) {
+    let packed = pack_color(color);
+
+    match unsafe { PIXEL_BYTES } {
+        2 => fill_words(destination, count, packed as u16),
+        4 => fill_dwords(destination, count, packed),
+        _ => {
+            let framebuffer = destination as *mut u8;
+            let pixel_bytes = unsafe { PIXEL_BYTES };
+
+            for index in 0..count {
+                store_pixel_raw(framebuffer, index * pixel_bytes, packed);
+            }
+        }
     }
 }
 
@@ -842,9 +1050,9 @@ fn fb_span(x: i32, y: i32, width: i32, color: u32) {
         return;
     }
 
-    let offset = y as usize * pitch + x0 * BYTES_PER_PIXEL;
+    let offset = y as usize * pitch + x0 * unsafe { PIXEL_BYTES };
 
-    fill_dwords(framebuffer as usize + offset, x1 - x0, color);
+    fill_pixels(framebuffer as usize + offset, x1 - x0, color);
 }
 
 /// Заливает прямоугольник сплошным цветом.
@@ -896,13 +1104,33 @@ pub fn read_rect(x: i32, y: i32, width: i32, height: i32, out: &mut [u32]) {
 
     for row in y0..y1 {
         let source = unsafe {
-            framebuffer.add(row as usize * pitch + x0 as usize * BYTES_PER_PIXEL)
+            framebuffer.add(row as usize * pitch + x0 as usize * PIXEL_BYTES)
         } as usize;
         let destination = out
             .as_mut_ptr()
             .wrapping_add((row - y) as usize * stride + (x0 - x) as usize) as usize;
 
-        copy_dwords(source, destination, (x1 - x0) as usize);
+        if unsafe { PIXEL_BYTES } == 4 {
+            copy_bytes(source, destination, (x1 - x0) as usize * 4);
+        } else {
+            // Буфер фона в pdesk хранит по одному `u32` на пиксель, поэтому
+            // для 16- и 24-битных режимов распаковываем цвет в 0x00RRGGBB.
+            // Иначе байты пикселя «съезжали» относительно шага строки, и
+            // после перетаскивания окна фон восстанавливался мусором.
+            let out = out.as_mut_ptr();
+
+            for column in x0..x1 {
+                let raw = read_pixel_raw(
+                    framebuffer,
+                    row as usize * pitch + column as usize * unsafe { PIXEL_BYTES },
+                );
+                let index = (row - y) as usize * stride + (column - x) as usize;
+
+                unsafe {
+                    out.add(index).write_volatile(unpack_color(raw));
+                }
+            }
+        }
     }
 }
 
@@ -941,10 +1169,26 @@ pub fn write_rect(x: i32, y: i32, width: i32, height: i32, data: &[u32]) {
             .as_ptr()
             .wrapping_add((row - y) as usize * stride + (x0 - x) as usize) as usize;
         let destination = unsafe {
-            framebuffer.add(row as usize * pitch + x0 as usize * BYTES_PER_PIXEL)
+            framebuffer.add(row as usize * pitch + x0 as usize * PIXEL_BYTES)
         } as usize;
 
-        copy_dwords(source, destination, (x1 - x0) as usize);
+        if unsafe { PIXEL_BYTES } == 4 {
+            copy_bytes(source, destination, (x1 - x0) as usize * 4);
+        } else {
+            // Обратное преобразование: из 0x00RRGGBB в аппаратный пиксель.
+            let data = data.as_ptr();
+
+            for column in x0..x1 {
+                let index = (row - y) as usize * stride + (column - x) as usize;
+                let color = unsafe { data.add(index).read_volatile() };
+
+                store_pixel_raw(
+                    framebuffer,
+                    row as usize * pitch + column as usize * unsafe { PIXEL_BYTES },
+                    pack_color(color),
+                );
+            }
+        }
     }
 }
 
@@ -957,6 +1201,16 @@ pub fn draw_glyph(x: i32, y: i32, byte: u8, foreground: u32, background: u32) {
     let glyph = &font_8x16::GLYPHS[byte as usize];
     let screen_width = pixel_width() as i32;
     let screen_height = pixel_height() as i32;
+    let framebuffer = unsafe { FRAMEBUFFER };
+    let pitch = unsafe { PITCH };
+    let pixel_bytes = unsafe { PIXEL_BYTES };
+    let foreground = pack_color(foreground);
+    let background = pack_color(background);
+
+    if framebuffer.is_null() {
+        return;
+    }
+
     let inside = x >= 0
         && y >= 0
         && x + GLYPH_WIDTH as i32 <= screen_width
@@ -979,52 +1233,60 @@ pub fn draw_glyph(x: i32, y: i32, byte: u8, foreground: u32, background: u32) {
                     continue;
                 }
 
-                let color = if bits & (0x80 >> column) != 0 {
+                let value = if bits & (0x80 >> column) != 0 {
+                    foreground
+                } else {
+                    background
+                };
+                let offset = row_y as usize * pitch + pixel_x as usize * pixel_bytes;
+
+                store_pixel_raw(framebuffer, offset, value);
+            }
+        }
+
+        return;
+    }
+
+    // Для 32-битного режима строка глифа — ровно 8 пикселей (32 байта).
+    // Собираем её в два 128-битных значения и записываем двумя store
+    // вместо десятков вызовов fb_span. Это заметно ускоряет текст и в
+    // консоли, и в pdesk. Для 16/24 бит пишем пиксели по одному.
+    for (row_index, bits) in glyph.iter().enumerate() {
+        let offset = (y + row_index as i32) as usize * pitch + x as usize * pixel_bytes;
+
+        if pixel_bytes == 4 {
+            let mut colors = [background; GLYPH_WIDTH];
+
+            for column in 0..GLYPH_WIDTH {
+                if bits & (0x80 >> column) != 0 {
+                    colors[column] = foreground;
+                }
+            }
+
+            let first = colors[0] as u128
+                | ((colors[1] as u128) << 32)
+                | ((colors[2] as u128) << 64)
+                | ((colors[3] as u128) << 96);
+            let second = colors[4] as u128
+                | ((colors[5] as u128) << 32)
+                | ((colors[6] as u128) << 64)
+                | ((colors[7] as u128) << 96);
+            let destination = unsafe { framebuffer.add(offset) as *mut u128 };
+
+            unsafe {
+                destination.write_unaligned(first);
+                destination.add(1).write_unaligned(second);
+            }
+        } else {
+            for column in 0..GLYPH_WIDTH {
+                let value = if bits & (0x80 >> column) != 0 {
                     foreground
                 } else {
                     background
                 };
 
-                fb_pixel(pixel_x as usize, row_y as usize, color);
+                store_pixel_raw(framebuffer, offset + column * pixel_bytes, value);
             }
-        }
-
-        return;
-    }
-
-    let pitch = unsafe { PITCH };
-    let framebuffer = unsafe { FRAMEBUFFER };
-
-    if framebuffer.is_null() {
-        return;
-    }
-
-    // Строка глифа — ровно 8 пикселей (32 байта). Собираем её в два
-    // 128-битных значения и записываем двумя store вместо десятков
-    // вызовов fb_span. Это заметно ускоряет текст и в консоли, и в pdesk.
-    for (row_index, bits) in glyph.iter().enumerate() {
-        let mut colors = [background; GLYPH_WIDTH];
-
-        for column in 0..GLYPH_WIDTH {
-            if bits & (0x80 >> column) != 0 {
-                colors[column] = foreground;
-            }
-        }
-
-        let first = colors[0] as u128
-            | ((colors[1] as u128) << 32)
-            | ((colors[2] as u128) << 64)
-            | ((colors[3] as u128) << 96);
-        let second = colors[4] as u128
-            | ((colors[5] as u128) << 32)
-            | ((colors[6] as u128) << 64)
-            | ((colors[7] as u128) << 96);
-        let offset = (y + row_index as i32) as usize * pitch + x as usize * BYTES_PER_PIXEL;
-        let destination = unsafe { framebuffer.add(offset) as *mut u128 };
-
-        unsafe {
-            destination.write_unaligned(first);
-            destination.add(1).write_unaligned(second);
         }
     }
 }
