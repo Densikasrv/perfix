@@ -95,7 +95,12 @@ fn send_segment(flags: u8, payload: &[u8]) -> bool {
     put_u32(&mut segment, 8, unsafe { RCV_NXT });
     segment[12] = 5 << 4;
     segment[13] = flags;
-    put_u16(&mut segment, 14, 64240);
+
+    // Окно должно отражать реальное свободное место в RX_BUFFER.
+    // Раньше здесь всегда стояло 64240 при буфере 32 КиБ: сервер мог
+    // отправить больше, чем помещается, и хвост большого ответа терялся.
+    let window = unsafe { RX_CAPACITY - RX_LENGTH };
+    put_u16(&mut segment, 14, window.min(u16::MAX as usize) as u16);
     put_u16(&mut segment, 16, 0);
     put_u16(&mut segment, 18, 0);
     segment[20..length].copy_from_slice(payload);
@@ -331,6 +336,17 @@ pub fn read(out: &mut [u8]) -> usize {
 
     unsafe {
         RX_LENGTH = length - count;
+    }
+
+    // Освободили место в приёмном буфере — сообщаем об этом серверу.
+    // Без такого обновления окна отправитель может навсегда остаться
+    // с нулевым окном после заполнения RX_BUFFER.
+    let state = unsafe { STATE };
+    if state == STATE_ESTABLISHED
+        || state == STATE_FIN_WAIT
+        || state == STATE_CLOSED_BY_PEER
+    {
+        send_ack();
     }
 
     count

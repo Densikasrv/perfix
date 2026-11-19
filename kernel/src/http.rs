@@ -384,6 +384,7 @@ pub fn fetch(
         timeout_seconds
     };
     let deadline = crate::timer::deadline(timeout);
+    let mut closed_by_peer = false;
 
     loop {
         net::poll();
@@ -396,14 +397,20 @@ pub fn fetch(
 
         body_length += count;
 
-        let closed = if url.secure {
-            crate::tls::peer_closed() || tcp::peer_closed()
-        } else {
-            tcp::peer_closed()
-        };
+        // Признак FIN сам по себе ещё не значит, что все данные прочитаны:
+        // последние сегменты могут лежать в приёмном буфере. Завершаем
+        // чтение только когда очередная попытка не дала ни байта.
+        if count == 0 {
+            let closed = if url.secure {
+                crate::tls::peer_closed() || tcp::peer_closed()
+            } else {
+                tcp::peer_closed()
+            };
 
-        if closed {
-            break;
+            if closed {
+                closed_by_peer = true;
+                break;
+            }
         }
 
         if body_length >= out.len() {
@@ -433,6 +440,10 @@ pub fn fetch(
         crate::tls::close();
     } else {
         tcp::close();
+    }
+
+    if !closed_by_peer && !allow_truncate {
+        return Err(b"response timed out");
     }
 
     if body_length == 0 {
